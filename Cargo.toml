@@ -1,0 +1,51 @@
+[package]
+name = "tg-digest"
+version = "0.1.0"
+edition = "2021"
+description = "Читает список Telegram-каналов, суммаризирует их через Claude и постит дайджест обратно в Telegram по расписанию"
+license = "MIT"
+
+[dependencies]
+# Telegram MTProto (личный аккаунт, не Bot API). Crate pre-1.0 — API меняется между
+# минорами, сверять сигнатуры с https://docs.rs/grammers-client/0.10.0/
+grammers-client  = { version = "0.10", features = ["html", "parse_invite_link"] }
+grammers-session = "0.10"
+
+# Асинхронный рантайм
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "fs", "signal", "sync"] }
+
+# HTTP-клиент к Anthropic Messages API (официального Rust SDK нет)
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# База: каналы, курсоры, журнал прогонов и доставки. Версия та же, что тянет
+# grammers-session, — второй SQLite в бинарник не добавляем.
+libsql = { version = "0.9", default-features = false, features = ["core"] }
+
+# Конфиг и сериализация
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml       = "0.8"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Расписание
+croner    = "4"
+chrono    = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10"
+
+# Прочее
+anyhow             = "1"
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+rpassword          = "7"
+rand               = "0.10"
+
+[profile.release]
+lto = true
+codegen-units = 1
+
+[dev-dependencies]
+# Поддельный HTTP-сервер для тестов map-reduce: гоняем оркестрацию запросов
+# без сети и без ключа. В боевой бинарник эти фичи не попадают.
+tokio = { version = "1", features = ["net", "io-util"] }

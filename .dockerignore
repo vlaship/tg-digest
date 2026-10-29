@@ -1,0 +1,9 @@
+target/
+out/
+data/
+.git/
+config.toml
+tg.session*
+*.db
+PLAN.md
+README.md
