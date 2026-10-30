@@ -335,19 +335,32 @@ impl Runner {
         }
 
         let dest_label = self.cfg.telegram.destination.clone();
+        // Who gets the digest is fixed now: the first one is the main destination,
+        // the rest get copies.
         let resolved = match self.bot() {
-            Ok(bot) => publish::resolve_destination(bot, &dest_label).await,
+            Ok(bot) => publish::recipients(bot, &self.db, &dest_label).await,
             Err(e) => Err(e),
         };
-        let dest = match resolved {
-            Ok(dest) => dest,
+        let mut recipients = match resolved {
+            Ok(recipients) => recipients,
             Err(e) => return self.fail(run_id, e).await,
         };
-        // The other allowed users get copies; fixed now, like the main destination.
-        let extra_dests = match self.bot() {
-            Ok(bot) => publish::extra_destinations(bot, &self.db, &dest_label).await,
-            Err(_) => Vec::new(),
-        };
+        // Everybody sent /stop: nothing to send, but the posts were read.
+        if recipients.is_empty() {
+            tracing::info!(
+                run = run_id,
+                "everybody turned the digest off, nothing is sent"
+            );
+            return self
+                .finish_empty(
+                    run_id,
+                    &collected,
+                    (summary.input_tokens, summary.output_tokens),
+                )
+                .await;
+        }
+        let dest = recipients.remove(0);
+        let extra_dests = recipients;
 
         let journal: Vec<(String, i64)> = chunks
             .iter()

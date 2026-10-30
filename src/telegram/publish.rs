@@ -76,30 +76,33 @@ pub async fn resolve_destination(bot: &Bot, destination: &str) -> Result<Destina
     })
 }
 
-/// Other users who also get the digest: the allowed users except the owner. Only for
-/// the chat with the bot — a channel already reaches everyone who follows it.
+/// Everybody who gets the digest. The first one is the main destination of the
+/// delivery journal, the rest get copies.
 ///
-/// A user who never wrote to the bot cannot get messages from it, so they are skipped
-/// with a warning instead of failing the run.
-pub async fn extra_destinations(bot: &Bot, db: &Db, destination: &str) -> Vec<Destination> {
+/// For a channel this is only the channel: it already reaches everyone who follows it.
+/// For the chat with the bot: the owner, then the other allowed users — except those
+/// who sent `/stop`. The list may be empty: then nobody wants the digest.
+///
+/// The owner who did not write to the bot yet is an error, as before. Another user
+/// who never wrote to the bot cannot get messages from it, so they are skipped with a
+/// warning instead of failing the run.
+pub async fn recipients(bot: &Bot, db: &Db, destination: &str) -> Result<Vec<Destination>> {
     if !matches!(destination, "bot" | "me") {
-        return Vec::new();
+        return Ok(vec![resolve_destination(bot, destination).await?]);
     }
-    // Users who sent /stop do not get the digest.
-    let muted = db.muted_users().await.unwrap_or_else(|e| {
-        tracing::warn!(error = %format!("{e:#}"), "could not read muted users");
-        Vec::new()
-    });
+
+    let muted = db.muted_users().await?;
+    let is_muted = |user: grammers_session::types::PeerId| {
+        user.bare_id().is_some_and(|id| muted.contains(&id))
+    };
+
     let mut out = Vec::new();
-    for user in bot.others() {
-        if user.bare_id().is_some_and(|id| muted.contains(&id)) {
-            continue;
-        }
+    if !is_muted(bot.owner) {
+        out.push(to_destination(bot.owner_ref().await?));
+    }
+    for user in bot.others().filter(|&u| !is_muted(u)) {
         match bot.user_ref(user).await {
-            Ok(peer) => out.push(Destination {
-                peer_id: peer.id.bot_api_dialog_id_unchecked(),
-                access_hash: peer.auth.hash(),
-            }),
+            Ok(peer) => out.push(to_destination(peer)),
             Err(e) => tracing::warn!(
                 user = ?user.bare_id(),
                 error = %format!("{e:#}"),
@@ -107,7 +110,14 @@ pub async fn extra_destinations(bot: &Bot, db: &Db, destination: &str) -> Vec<De
             ),
         }
     }
-    out
+    Ok(out)
+}
+
+fn to_destination(peer: PeerRef) -> Destination {
+    Destination {
+        peer_id: peer.id.bot_api_dialog_id_unchecked(),
+        access_hash: peer.auth.hash(),
+    }
 }
 
 /// The `random_id` of a copy for another recipient: different for each recipient, but

@@ -209,20 +209,9 @@ where
     action.await
 }
 
-/// `/start` and `/stop`: turn the digest on or off for the user who wrote. Commands
-/// keep working either way. The owner cannot turn it off: the owner is the main
-/// destination, and the delivery journal is kept for that chat.
+/// `/start` and `/stop`: turn the digest on or off for the user who wrote, the owner
+/// too. Commands and (for the owner) notifications keep working either way.
 async fn subscribe(runner: &Arc<Runner>, user: PeerId, on: bool) -> Result<String> {
-    let bot = runner.bot()?;
-    if user == bot.owner {
-        return Ok(if on {
-            HELP.into()
-        } else {
-            "you are the owner: the digest always comes to you. To stop it, change \
-             telegram.destination or stop the service"
-                .into()
-        });
-    }
     let id = user.bare_id().unwrap_or_default();
     runner.db.set_muted(id, !on).await?;
     Ok(if on {
@@ -386,21 +375,18 @@ async fn last(runner: &Arc<Runner>) -> Result<String> {
     }
 
     let bot = runner.bot()?;
-    let dest = publish::resolve_destination(bot, &runner.cfg.telegram.destination).await?;
-    publish::resend(
-        &bot.client,
-        publish::destination_ref(dest)?,
-        &chunks,
-        runner.cancellation(),
-    )
-    .await?;
-    // The other allowed users get it too; a failure for one of them is only logged.
-    for extra in
-        publish::extra_destinations(bot, &runner.db, &runner.cfg.telegram.destination).await
-    {
-        let peer = publish::destination_ref(extra)?;
+    let recipients = publish::recipients(bot, &runner.db, &runner.cfg.telegram.destination).await?;
+    if recipients.is_empty() {
+        return Ok("everybody turned the digest off with /stop: nothing is sent".into());
+    }
+    // A failure for one recipient does not stop the others; it is only logged.
+    for dest in recipients {
+        let peer = publish::destination_ref(dest)?;
         if let Err(e) = publish::resend(&bot.client, peer, &chunks, runner.cancellation()).await {
-            tracing::warn!(error = %format!("{e:#}"), "copy of /last for an allowed user failed");
+            if crate::telegram::client::is_fatal(&e) {
+                return Err(e);
+            }
+            tracing::warn!(error = %format!("{e:#}"), "/last for one recipient failed");
         }
     }
 
