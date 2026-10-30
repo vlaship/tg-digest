@@ -533,7 +533,19 @@ impl Runner {
         self.db.fail_run(run_id, &reason).await?;
 
         if !self.cancel.is_cancelled() {
-            self.notify(&format!("digest not built: {reason}")).await;
+            let limit = error
+                .chain()
+                .find_map(|e| e.downcast_ref::<crate::summarize::LimitReached>());
+            let text = match limit {
+                Some(limit) => format!(
+                    "⚠️ the {} API limit is used up, the digest is not built.\n\
+                     The posts are kept and go into the next run. \
+                     Wait for the limit to reset, or switch the model in the config.\n\n{}",
+                    limit.api, limit.details
+                ),
+                None => format!("digest not built: {reason}"),
+            };
+            self.notify(&text).await;
         }
         Ok(Outcome::Failed(run_id, reason))
     }

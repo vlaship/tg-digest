@@ -18,6 +18,29 @@ const MAX_ATTEMPTS: u32 = 4;
 /// How many times we ask the model when its answer is broken (`Digest::defect`).
 const MAX_BROKEN_ANSWERS: u32 = 2;
 
+/// The API limit is used up: requests per minute or per day, or money on the account.
+/// It is a separate type, so the owner gets a clear message, not a JSON dump.
+#[derive(Debug)]
+pub struct LimitReached {
+    pub api: &'static str,
+    pub details: String,
+}
+
+impl std::fmt::Display for LimitReached {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the {} API limit is used up: {}", self.api, self.details)
+    }
+}
+
+impl std::error::Error for LimitReached {}
+
+/// The answer says the limit or the balance is used up.
+fn is_limit(status: reqwest::StatusCode, text: &str) -> bool {
+    status.as_u16() == 429
+        || text.contains("RESOURCE_EXHAUSTED")
+        || text.contains("credit balance is too low")
+}
+
 /// Above this size we switch to map-reduce: we condense the input in parts, then
 /// reduce the summaries into one digest. The model context is 1M tokens, so the limit
 /// has a margin — but we must never silently cut the tail, whatever the size.
@@ -458,6 +481,10 @@ impl Summarizer {
                 continue;
             }
 
+            if is_limit(status, &text) {
+                let details: String = text.chars().take(300).collect();
+                return Err(LimitReached { api, details }.into());
+            }
             bail!("the {api} API returned {status}: {text}");
         }
     }
