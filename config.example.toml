@@ -1,87 +1,88 @@
-# tg-digest — единая точка настройки.
+# tg-digest — all settings in one place.
 #
-# Штатное место файла — volume контейнера: ./data/config.toml на хосте,
-# /data/config.toml внутри. Локально запускать так:
+# The normal place for this file is the container volume: ./data/config.toml on
+# the host, /data/config.toml inside. To run locally:
 #     cargo run -- --config config.toml preview
 #
-# config.toml в .gitignore — в репозиторий он не попадает.
-# Любое из секретных значений можно вместо файла задать переменной окружения,
-# она имеет приоритет над TOML:
+# config.toml is in .gitignore — it never goes into the repository.
+# Any secret value can be set with an environment variable instead of the file.
+# The variable wins over the TOML:
 #     TG_API_ID, TG_API_HASH, TG_PHONE, ANTHROPIC_API_KEY
 
-# База: каналы, курсоры, журнал прогонов и частей дайджеста.
-# Лежит в том же volume, что сессия: незавершённый прогон обязан пережить
-# перезапуск контейнера вместе с текстом частей и их random_id.
+# Database: channels, cursors, journal of runs and digest parts.
+# It is in the same volume as the session: an unfinished run must survive
+# a container restart, together with the text of its parts and their random_id.
 db_file = "/data/digest.db"
 
-# ---------------------------------------------------------------- расписание --
+# ------------------------------------------------------------------ schedule --
 [schedule]
-# Стандартный cron из 5 полей: минута час день месяц день_недели
-cron = "0 9 * * *"          # каждый день в 09:00
+# Standard 5-field cron: minute hour day month weekday
+cron = "0 9 * * *"          # every day at 09:00
 
-# IANA-имя таймзоны, в которой считается cron и в которой ставится дата в
-# заголовке дайджеста. Без него "09:00" уедет в UTC.
+# IANA time zone name. The cron is calculated in it, and the date in the digest
+# title uses it. Without it "09:00" means UTC.
 timezone = "America/New_York"
 
-# Если слот был пропущен (контейнер был остановлен, машина спала) — прогнать
-# сразу при старте, не дожидаясь следующего. В контейнере это штатный режим.
+# If a slot was missed (the container was stopped, the computer was asleep),
+# run at once on start, do not wait for the next one. This is normal in a container.
 catch_up = true
 
-# Прогнать один раз сразу при запуске `serve`. Удобно для отладки.
+# Run once right after `serve` starts. Useful for debugging.
 run_on_start = false
 
 # ----------------------------------------------------------------- telegram --
 [telegram]
-# Получить на https://my.telegram.org → API development tools
+# Get them at https://my.telegram.org → API development tools
 api_id   = 0
 api_hash = ""
-# Номер аккаунта в международном формате. Дефисы, пробелы и скобки можно
-# оставить — сервис вычищает их сам перед обращением к Telegram.
+# Account phone number in international format. You can keep dashes, spaces and
+# brackets — the service removes them before it calls Telegram.
 phone    = "+1-000-00-00"
 
-# Файл сессии (SQLite). Создаётся командой `tg-digest login`.
-# ВНИМАНИЕ: это полный доступ к аккаунту — не коммитить и не копировать наружу.
+# Session file (SQLite). The `tg-digest login` command creates it.
+# WARNING: it gives full access to the account — do not commit it or copy it anywhere.
 session_file = "/data/tg.session"
 
-# Имя папки в Telegram, которая задаёт список каналов. Папку собираете руками
-# в приложении: добавить канал = перетащить его в папку, убрать = вытащить.
-# Папка с авто-правилами («Каналы», «Непрочитанные» и т.п.) отклоняется:
-# у неё состав вычисляемый, и синхронизация выключила бы всё разом.
-# Ключ можно убрать — тогда каналами управляют только команды /add и /rm.
+# Name of the Telegram folder that holds the channel list. You fill the folder by
+# hand in the app: to add a channel, drag it into the folder; to remove it, drag it out.
+# A folder with automatic rules ("Channels", "Unread" and so on) is refused:
+# its content is calculated, and a sync would turn everything off at once.
+# You can remove this key — then only the /add and /rm commands manage channels.
 folder = "Digest"
 
-# Куда постить дайджест: "me" = «Избранное», либо "@my_channel"
+# Where to post the digest: "me" = Saved Messages, or "@my_channel"
 destination = "me"
 
-# Окно для нового канала (у которого ещё нет курсора) и для канала после
-# /reset. У остальных граница — курсор: канал, который три дня падал, при
-# восстановлении отдаст все три дня.
+# Time window for a new channel (one with no cursor yet) and for a channel after
+# /reset. For other channels the limit is the cursor: a channel that failed for
+# three days gives all three days when it works again.
 lookback_hours = 24
 
-# ПРЕДОХРАНИТЕЛЬ от чтения всей истории, а не отсечка дайджеста. Если канал
-# упёрся в лимит, не дойдя до курсора, он исключается из прогона целиком,
-# курсор не двигается и приходит уведомление. Постов молча не теряем.
+# A SAFETY LIMIT against reading the whole history, not a cut of the digest. If a
+# channel hits the limit before it reaches the cursor, it is excluded from the run
+# completely, its cursor does not move and you get a notification. No posts are
+# lost silently.
 max_posts_per_channel = 1000
 
-# Посты короче этого — отбрасываем (стикеры, «только медиа», реакции одним словом)
+# Posts shorter than this are dropped (stickers, "media only", one-word reactions)
 min_post_chars = 30
 
-# Пауза между каналами, чтобы не ловить FLOOD_WAIT
+# Pause between channels, to avoid FLOOD_WAIT
 pause_between_channels_ms = 1500
 
-# Сколько часов демон сам добивает недоставленный дайджест. Это политика
-# повтора, а не граница безопасности: срок дедупликации random_id у Telegram
-# не документирован. За пределами окна повтор делает владелец — /resume.
+# For how many hours the daemon itself retries an undelivered digest. This is a
+# retry policy, not a safety limit: Telegram does not document how long it keeps
+# random_id for deduplication. After this window the owner retries with /resume.
 publish_retry_window_hours = 2
 
 # ---------------------------------------------------------------- anthropic --
 [anthropic]
 api_key = "sk-ant-..."
 
-# Не дописывать к id суффикс с датой — строка используется как есть.
+# Do not add a date suffix to the id — the string is used as is.
 model  = "claude-opus-5"
 
-# low | medium | high | xhigh | max — глубина рассуждений и расход токенов
+# low | medium | high | xhigh | max — how deeply the model thinks, and token use
 effort = "high"
 
 max_tokens = 16000
@@ -89,57 +90,57 @@ max_tokens = 16000
 api_url              = "https://api.anthropic.com/v1/messages"
 request_timeout_secs = 600
 
-# ------------------------------------------------------------------ промпты --
-# Правятся здесь, без пересборки. Плейсхолдеры в user_template:
+# ------------------------------------------------------------------ prompts --
+# Edit them here, no rebuild needed. Placeholders in user_template:
 #   {{now}} {{lookback_hours}} {{post_count}} {{channel_count}} {{posts}}
 [prompts]
 system = """
-Ты — редактор ежедневного новостного дайджеста по Telegram-каналам.
+You are the editor of a daily news digest made from Telegram channels.
 
-Правила:
-1. Сгруппируй материалы по темам, а не по каналам.
-2. Если несколько каналов пишут об ОДНОМ И ТОМ ЖЕ событии — объедини их в ОДИН
-   пункт и перечисли все источники в sources. Это главное требование.
-3. Не повторяй одну новость в разных темах.
-4. Темы упорядочи по значимости: сначала самое важное.
-5. Пиши по-русски, по факту, без воды, оценок и рекламных формулировок.
-6. В sources указывай только те ссылки, которые реально были во входных данных.
-   Не придумывай URL: чужие адреса сервис всё равно выбросит.
-7. Пост, помеченный «репост из: …», и пост первоисточника — ОДНА новость.
-8. tldr — 5–10 самых важных пунктов одной строкой каждый.
+Rules:
+1. Group the material by topic, not by channel.
+2. If several channels write about THE SAME event, merge them into ONE item and
+   list all sources in sources. This is the main rule.
+3. Do not repeat one news item in different topics.
+4. Order topics by importance: the most important first.
+5. Write in English, stick to the facts, no filler, no opinions, no advertising language.
+6. In sources, use only links that were really in the input.
+   Do not make up URLs: the service drops unknown addresses anyway.
+7. A post marked "repost from: …" and the original post are ONE news item.
+8. tldr — the 5–10 most important points, one line each.
 """
 
 user_template = """
-Дайджест за период: последние {{lookback_hours}} ч (по состоянию на {{now}}).
-Собрано {{post_count}} постов из {{channel_count}} каналов.
+Digest for the period: the last {{lookback_hours}} h (as of {{now}}).
+Collected {{post_count}} posts from {{channel_count}} channels.
 
 {{posts}}
 """
 
-# Заголовки в опубликованном сообщении. {{date}} — дата в таймзоне из [schedule].
-digest_title = "📰 Дайджест за {{date}}"
-tldr_title   = "Коротко"
+# Titles in the posted message. {{date}} is the date in the time zone from [schedule].
+digest_title = "📰 Digest for {{date}}"
+tldr_title   = "In short"
 
-# Инструкция для шага map: когда постов слишком много для одного запроса, они
-# сжимаются частями, а потом сводятся этим же system-промптом. Ключ
-# необязательный — без него берётся встроенный текст (summarize.rs).
+# Instruction for the map step: when there are too many posts for one request,
+# they are condensed in parts, and then the parts are merged with the same system
+# prompt. This key is optional — without it the built-in text is used (summarize.rs).
 # map_system = """
-# Ты сжимаешь ЧАСТЬ ленты каналов — её потом сведут с другими частями.
-# Переноси все ссылки из входных данных в sources дословно, ничего не выбрасывай.
+# You condense a PART of the channel feed — it will be merged with other parts later.
+# Copy all links from the input into sources exactly, do not drop anything.
 # """
 
-# ------------------------------------------------------------------- каналы --
-# ТОЛЬКО SEED для пустой базы: при первом запуске эти каналы переносятся в
-# базу, дальше правда — в папке Telegram и в базе. Правки здесь после этого
-# ничего не меняют; каналами управляют папка, /add, /rm и /sync.
+# ----------------------------------------------------------------- channels --
+# ONLY A SEED for an empty database: on the first start these channels are copied
+# to the database. After that the truth is in the Telegram folder and the database.
+# Edits here change nothing; channels are managed by the folder, /add, /rm and /sync.
 #
-# username — без @; для приватного канала вместо username указывается id
-# (аккаунт должен быть на него подписан).
+# username — without @; for a private channel use id instead of username
+# (the account must follow it).
 
 # [[channels]]
 # username = "durov"
-# title    = "Дуров"          # необязательно: подпись в дайджесте
+# title    = "Durov"          # optional: the label in the digest
 
 # [[channels]]
-# id    = -1001234567890      # приватный канал
-# title = "Закрытый канал"
+# id    = -1001234567890      # private channel
+# title = "Private channel"

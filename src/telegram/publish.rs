@@ -1,14 +1,14 @@
-//! Отправка дайджеста и журнал доставки.
+//! Sending the digest and the delivery journal.
 //!
-//! Идемпотентность даёт сам Telegram: `messages.sendMessage` принимает
-//! `random_id` «для предотвращения повторной отправки». `random_id` выдаётся
-//! один раз при записи части в журнал и переиспользуется во всех повторах,
-//! включая повторы после рестарта контейнера. Срок серверного окна дедупликации
-//! не документирован, поэтому это снижение риска, а не гарантия: за пределами
-//! `publish_retry_window_hours` повтор делает только владелец (`/resume`).
+//! Telegram itself gives idempotency: `messages.sendMessage` accepts
+//! `random_id` "to prevent sending the same message twice". `random_id` is issued
+//! once when a part is written to the journal and is reused in all retries,
+//! including retries after a container restart. The length of the server dedup window
+//! is not documented, so this lowers the risk but is not a guarantee: outside
+//! `publish_retry_window_hours` only the owner retries (`/resume`).
 //!
-//! Высокоуровневый `Client::send_message` `random_id` не принимает — шлём через
-//! `invoke(messages::SendMessage { … })`, разметку берём из того же HTML-парсера.
+//! The high-level `Client::send_message` does not accept `random_id` — we send through
+//! `invoke(messages::SendMessage { … })` and take the markup from the same HTML parser.
 
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
@@ -22,81 +22,81 @@ use crate::cancel::Cancel;
 use crate::db::{Db, Destination, Run};
 use crate::telegram::client::{flood_wait, is_auth_error};
 
-/// Пауза между частями длинного дайджеста, чтобы Telegram не считал это флудом.
+/// Pause between parts of a long digest, so Telegram does not see it as flooding.
 const PAUSE_BETWEEN_CHUNKS: Duration = Duration::from_millis(700);
-/// Сколько раз повторяем часть с неясным исходом, прежде чем оставить прогон
-/// в статусе `publishing` и позвать владельца.
+/// How many times we retry a part with an unclear result before we leave the run
+/// in `publishing` status and call the owner.
 const MAX_ATTEMPTS: u32 = 4;
 
-/// Исход одной попытки отправки. Разделение на «неясно» и «отказ» — главное:
-/// неясный исход повторяется с тем же `random_id`, отказ повторять бесполезно.
+/// The result of one send attempt. The split into "unclear" and "refused" is the key:
+/// an unclear result is retried with the same `random_id`, a refusal is useless to retry.
 #[derive(Debug)]
 pub enum SendOutcome {
-    /// Часть у Telegram есть. `sent_msg_id` может отсутствовать — для части
-    /// пиров id в ответе не приходит, и это нормально.
+    /// Telegram has the part. `sent_msg_id` can be missing — for some
+    /// peers the answer has no id, and that is normal.
     Delivered { sent_msg_id: Option<i32> },
-    /// Таймаут, обрыв, ошибка без кода: в базу ничего не пишем, повторяем.
+    /// Timeout, broken connection, error without a code: we save nothing, we retry.
     Unclear(String),
-    /// FLOOD_WAIT: столько просят подождать.
+    /// FLOOD_WAIT: how long they ask us to wait.
     Wait(Duration, String),
-    /// `CHAT_WRITE_FORBIDDEN`, `PEER_ID_INVALID` и прочее, что повтор не лечит.
+    /// `CHAT_WRITE_FORBIDDEN`, `PEER_ID_INVALID` and others that a retry does not fix.
     Rejected(String),
-    /// Сессия недействительна — это не ошибка прогона, а конец работы демона.
+    /// The session is not valid — this is not a run error, but the end of the daemon's work.
     Auth(InvocationError),
 }
 
-/// Куда постим: `"me"` — «Избранное» текущего аккаунта, иначе `@username`.
+/// Where we post: `"me"` is Saved Messages of the current account, otherwise `@username`.
 ///
-/// Резолвится один раз, при записи частей в журнал: смена `destination` в
-/// конфиге и рестарт не уводят хвост недоставленного дайджеста в другой чат.
+/// Resolved once, when the parts are written to the journal: changing `destination` in
+/// the config and restarting does not send the rest of an undelivered digest to another chat.
 pub async fn resolve_destination(client: &Client, destination: &str) -> Result<Destination> {
     let peer = if destination == "me" {
         client
             .get_me()
             .await
-            .context("не удалось получить свой профиль")?
+            .context("could not get own profile")?
             .to_ref()
             .await
-            .map_err(|e| anyhow!("не удалось получить ссылку на свой профиль: {e}"))?
-            .ok_or_else(|| anyhow!("свой профиль недоступен для отправки"))?
+            .map_err(|e| anyhow!("could not get a reference to own profile: {e}"))?
+            .ok_or_else(|| anyhow!("own profile is not available for sending"))?
     } else {
         let username = destination.trim_start_matches('@');
         client
             .resolve_username(username)
             .await
-            .with_context(|| format!("не удалось разрешить {destination}"))?
-            .ok_or_else(|| anyhow!("канал {destination} не найден"))?
+            .with_context(|| format!("could not resolve {destination}"))?
+            .ok_or_else(|| anyhow!("channel {destination} not found"))?
             .to_ref()
             .await
-            .map_err(|e| anyhow!("не удалось получить ссылку на {destination}: {e}"))?
-            .ok_or_else(|| anyhow!("канал {destination} недоступен для отправки"))?
+            .map_err(|e| anyhow!("could not get a reference to {destination}: {e}"))?
+            .ok_or_else(|| anyhow!("channel {destination} is not available for sending"))?
     };
 
     Ok(Destination {
         peer_id: peer
             .id
             .bot_api_dialog_id()
-            .ok_or_else(|| anyhow!("у адресата {destination} нет идентификатора"))?,
+            .ok_or_else(|| anyhow!("destination {destination} has no id"))?,
         access_hash: peer.auth.hash(),
     })
 }
 
 pub fn destination_ref(dest: Destination) -> Result<PeerRef> {
     let id = PeerId::from_bot_api_dialog_id(dest.peer_id)
-        .ok_or_else(|| anyhow!("{} не похож на идентификатор чата", dest.peer_id))?;
+        .ok_or_else(|| anyhow!("{} does not look like a chat id", dest.peer_id))?;
     Ok(PeerRef {
         id,
         auth: PeerAuth::from_hash(dest.access_hash),
     })
 }
 
-/// Одна попытка отправки части.
+/// One attempt to send a part.
 pub async fn send_chunk(client: &Client, peer: PeerRef, html: &str, random_id: i64) -> SendOutcome {
     let (message, entities) = parse_html_message(html);
 
     let request = tl::functions::messages::SendMessage {
-        // link_preview выключен: иначе Telegram растянет превью первой ссылки
-        // источника на весь пост и дайджест поедет.
+        // link_preview is off: otherwise Telegram stretches the preview of the first
+        // source link over the whole post and the digest layout breaks.
         no_webpage: true,
         silent: false,
         background: false,
@@ -127,8 +127,8 @@ pub async fn send_chunk(client: &Client, peer: PeerRef, html: &str, random_id: i
         },
         Err(e) if is_auth_error(&e) => SendOutcome::Auth(e),
         Err(InvocationError::Rpc(rpc)) if rpc.is("RANDOM_ID_DUPLICATE") => {
-            // Сообщение с этим random_id у Telegram уже есть, id он не отдаёт.
-            // Это доставка, а не ошибка.
+            // Telegram already has a message with this random_id, it does not give the id.
+            // This is a delivery, not an error.
             SendOutcome::Delivered { sent_msg_id: None }
         }
         Err(e) => match flood_wait(&e) {
@@ -143,10 +143,10 @@ pub async fn send_chunk(client: &Client, peer: PeerRef, html: &str, random_id: i
     }
 }
 
-/// Доставить все части прогона, у которых нет `delivered_at`.
+/// Deliver all parts of the run that have no `delivered_at`.
 ///
-/// Возвращает `Ok(None)`, если доставлено всё; `Ok(Some(причина))` — если
-/// прогон остаётся в `publishing` и ждёт следующего триггера или владельца.
+/// Returns `Ok(None)` if everything is delivered; `Ok(Some(reason))` if the
+/// run stays in `publishing` and waits for the next trigger or for the owner.
 pub async fn deliver_pending(
     client: &Client,
     db: &Db,
@@ -156,7 +156,7 @@ pub async fn deliver_pending(
 ) -> Result<Option<String>> {
     let dest = run
         .destination()
-        .ok_or_else(|| anyhow!("у прогона #{} не зафиксирован адресат", run.id))?;
+        .ok_or_else(|| anyhow!("run #{} has no fixed destination", run.id))?;
     let peer = destination_ref(dest)?;
 
     db.mark_publishing(run.id).await?;
@@ -165,26 +165,26 @@ pub async fn deliver_pending(
     let mut first_send_at = run.first_send_at;
 
     for chunk in chunks.iter().filter(|c| c.delivered_at.is_none()) {
-        // Токен остановки проверяем МЕЖДУ частями: сама отправка не отменяется,
-        // иначе не понять, ушла часть или нет.
+        // We check the shutdown token BETWEEN parts: sending itself is not cancelled,
+        // or we cannot know whether the part went out or not.
         if cancel.is_cancelled() {
             return Ok(Some(format!(
-                "остановка сигналом: доставлено {} из {total} частей",
+                "stopped by signal: delivered {} of {total} parts",
                 chunk.idx
             )));
         }
         if chunk.idx > 0 && cancel.sleep(PAUSE_BETWEEN_CHUNKS).await.is_err() {
-            return Ok(Some("остановка сигналом".into()));
+            return Ok(Some("stopped by signal".into()));
         }
 
         let mut attempt = 0;
         loop {
             if cancel.is_cancelled() {
-                return Ok(Some("остановка сигналом".into()));
+                return Ok(Some("stopped by signal".into()));
             }
             if first_send_at.is_some_and(|first| retry_expired(first, retry_window, Utc::now())) {
                 return Ok(Some(format!(
-                    "окно автоповтора вышло: /resume {} или /abandon {}",
+                    "auto-retry window is over: /resume {} or /abandon {}",
                     run.id, run.id
                 )));
             }
@@ -199,16 +199,16 @@ pub async fn deliver_pending(
                         part = chunk.idx + 1,
                         of = total,
                         msg_id = ?sent_msg_id,
-                        "часть доставлена"
+                        "part delivered"
                     );
                     break;
                 }
                 SendOutcome::Auth(e) => {
-                    return Err(anyhow::Error::new(e).context("сессия Telegram недействительна"))
+                    return Err(anyhow::Error::new(e).context("Telegram session is not valid"))
                 }
                 SendOutcome::Rejected(reason) => {
                     return Ok(Some(format!(
-                        "часть {}/{total} отклонена: {reason}",
+                        "part {}/{total} refused: {reason}",
                         chunk.idx + 1
                     )))
                 }
@@ -216,9 +216,9 @@ pub async fn deliver_pending(
                     if attempt >= MAX_ATTEMPTS {
                         return Ok(Some(give_up(chunk.idx, total, attempt, &reason)));
                     }
-                    tracing::warn!(run = run.id, part = chunk.idx + 1, ?wait, %reason, "FLOOD_WAIT, ждём");
+                    tracing::warn!(run = run.id, part = chunk.idx + 1, ?wait, %reason, "FLOOD_WAIT, waiting");
                     if cancel.sleep(wait).await.is_err() {
-                        return Ok(Some("остановка сигналом".into()));
+                        return Ok(Some("stopped by signal".into()));
                     }
                 }
                 SendOutcome::Unclear(reason) => {
@@ -226,16 +226,16 @@ pub async fn deliver_pending(
                         return Ok(Some(give_up(chunk.idx, total, attempt, &reason)));
                     }
                     let delay = Duration::from_secs(2u64.pow(attempt));
-                    tracing::warn!(run = run.id, part = chunk.idx + 1, ?delay, %reason, "неясный исход, повтор с тем же random_id");
+                    tracing::warn!(run = run.id, part = chunk.idx + 1, ?delay, %reason, "unclear result, retry with the same random_id");
                     if cancel.sleep(delay).await.is_err() {
-                        return Ok(Some("остановка сигналом".into()));
+                        return Ok(Some("stopped by signal".into()));
                     }
                 }
             }
         }
     }
 
-    // Критерий завершения — delivered_at у всех частей, а не sent_msg_id.
+    // The completion rule is delivered_at for all parts, not sent_msg_id.
     let pending = db
         .chunks(run.id)
         .await?
@@ -246,7 +246,7 @@ pub async fn deliver_pending(
     if pending == 0 {
         Ok(None)
     } else {
-        Ok(Some(format!("не доставлено частей: {pending} из {total}")))
+        Ok(Some(format!("parts not delivered: {pending} of {total}")))
     }
 }
 
@@ -258,8 +258,8 @@ fn retry_expired(
     window.is_some_and(|window| now - first_send > window)
 }
 
-/// Отправить готовые части заново, с новыми `random_id`: осознанный повтор
-/// (`/last`), а не восстановление.
+/// Send ready parts again with new `random_id`: a deliberate repeat
+/// (`/last`), not a recovery.
 pub async fn resend(
     client: &Client,
     peer: PeerRef,
@@ -269,18 +269,18 @@ pub async fn resend(
     for (index, html) in chunks.iter().enumerate() {
         if cancel.is_cancelled() || (index > 0 && cancel.sleep(PAUSE_BETWEEN_CHUNKS).await.is_err())
         {
-            anyhow::bail!("повторная отправка остановлена сигналом");
+            anyhow::bail!("resending stopped by signal");
         }
         match send_chunk(client, peer, html, rand::random()).await {
             SendOutcome::Delivered { .. } => {}
             SendOutcome::Auth(e) => {
-                return Err(anyhow::Error::new(e).context("сессия Telegram недействительна"))
+                return Err(anyhow::Error::new(e).context("Telegram session is not valid"))
             }
             SendOutcome::Rejected(reason)
             | SendOutcome::Unclear(reason)
             | SendOutcome::Wait(_, reason) => {
                 return Err(anyhow!(
-                    "не удалось отправить часть {}/{}: {reason}",
+                    "could not send part {}/{}: {reason}",
                     index + 1,
                     chunks.len()
                 ))
@@ -292,13 +292,13 @@ pub async fn resend(
 
 fn give_up(idx: i64, total: usize, attempt: u32, reason: &str) -> String {
     format!(
-        "часть {}/{total} не отправлена после {attempt} попыток: {reason}",
+        "part {}/{total} not sent after {attempt} attempts: {reason}",
         idx + 1
     )
 }
 
-/// Id отправленного сообщения, если Telegram его вернул. Нигде не участвует в
-/// логике — только в `/status` для справки.
+/// Id of the sent message, if Telegram returned it. It takes no part in the
+/// logic — only in `/status` for information.
 fn sent_message_id(updates: &tl::enums::Updates) -> Option<i32> {
     use tl::enums::Updates;
 
@@ -355,8 +355,8 @@ mod tests {
 
     #[test]
     fn saved_destination_restores_the_same_peer() {
-        // Адресат зафиксирован на момент `summarized`: восстановление обязано
-        // попасть в тот же чат, а не в тот, что сейчас в конфиге.
+        // The destination is fixed at `summarized` time: recovery must go to
+        // the same chat, not to the one that is in the config now.
         let channel = Destination {
             peer_id: -1001234567890,
             access_hash: 42,
@@ -402,8 +402,8 @@ mod tests {
 
     #[test]
     fn missing_id_is_not_an_error_for_the_journal() {
-        // Для части пиров Telegram id не возвращает: критерий доставки —
-        // delivered_at, а не sent_msg_id.
+        // For some peers Telegram does not return an id: the delivery rule is
+        // delivered_at, not sent_msg_id.
         let updates = tl::enums::Updates::TooLong;
         assert_eq!(sent_message_id(&updates), None);
     }

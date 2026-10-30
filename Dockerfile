@@ -1,21 +1,21 @@
-# Сборка и рантайм разнесены: в финальный образ едет один бинарник.
+# Build and runtime are separate stages: the final image has only one binary.
 #
-# Alpine/musl не берём осознанно: libsql компилирует C-шный SQLite, и с musl
-# это лишние приключения. rustls уже в зависимостях, поэтому OpenSSL в образе
-# не нужен — хватает ca-certificates.
+# We do not use Alpine/musl on purpose: libsql compiles SQLite from C, and with
+# musl that causes extra trouble. rustls is already a dependency, so the image
+# does not need OpenSSL — ca-certificates is enough.
 FROM rust:1-bookworm AS build
 WORKDIR /src
 
-# Сначала только манифесты: слой с зависимостями переживает правки в src/.
-# Cargo.lock копируется обязательно — в нём закреплён glass_pumpkin 2.0.0-rc0,
-# без него сборка падает внутри grammers-crypto.
+# Copy only the manifests first: the dependency layer survives changes in src/.
+# Cargo.lock must be copied — it pins glass_pumpkin 2.0.0-rc0,
+# without it the build fails inside grammers-crypto.
 COPY Cargo.toml Cargo.lock ./
 RUN mkdir src && echo "fn main() {}" > src/main.rs \
     && cargo build --release --locked \
     && rm -rf src
 
 COPY src ./src
-# Дата файла должна поменяться, иначе cargo переиспользует заглушку.
+# The file time must change, or cargo reuses the stub.
 RUN touch src/main.rs && cargo build --release --locked
 
 FROM debian:bookworm-slim
@@ -23,13 +23,13 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# Все рабочие файлы — в volume: config.toml, tg.session, digest.db.
+# All working files are in the volume: config.toml, tg.session, digest.db.
 VOLUME /data
 WORKDIR /data
 
 COPY --from=build /src/target/release/tg-digest /usr/local/bin/tg-digest
 
-# Логи собирает Docker, поэтому пишем в stdout без буферизации.
+# Docker collects the logs, so we write to stdout without buffering.
 ENV RUST_LOG=tg_digest=info,warn
 ENTRYPOINT ["tg-digest"]
 CMD ["serve"]

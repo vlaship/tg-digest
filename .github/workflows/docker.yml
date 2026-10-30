@@ -1,4 +1,4 @@
-# Проверка, что образ собирается. Только сборка: в реестр ничего не пушится.
+# Checks that the image builds. Build only: nothing is pushed to a registry.
 name: docker
 
 on:
@@ -28,7 +28,7 @@ jobs:
           context: .
           push: false
           tags: tg-digest:ci
-          # Кэш слоёв в GitHub Actions: слой с зависимостями cargo
-          # пересобирается только при изменении Cargo.toml / Cargo.lock.
+          # Layer cache in GitHub Actions: the cargo dependency layer
+          # is rebuilt only when Cargo.toml or Cargo.lock changes.
           cache-from: type=gha
           cache-to: type=gha,mode=max

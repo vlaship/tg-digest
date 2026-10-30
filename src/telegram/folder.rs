@@ -1,11 +1,11 @@
-//! Список каналов = вручную собранная папка в Telegram.
+//! The channel list = a Telegram folder built by hand.
 //!
-//! Папка (`dialogFilter`) — это не только `include_peers`: у неё есть флаги
-//! автовключения (`contacts`, `broadcasts`, …) и исключения (`exclude_muted`,
-//! …). Папка «все каналы» (`broadcasts = true`, `include_peers = []`) при
-//! наивном чтении выглядит пустой — и выключила бы все каналы разом. Поэтому
-//! поддерживаем **только явно собранную папку** и проверяем это перед каждым
-//! синхронизацией: любой флаг → отказ, база остаётся как есть.
+//! A folder (`dialogFilter`) is not only `include_peers`: it has flags for
+//! automatic inclusion (`contacts`, `broadcasts`, …) and exclusion (`exclude_muted`,
+//! …). An "all channels" folder (`broadcasts = true`, `include_peers = []`) looks
+//! empty when read naively — and would turn off all channels at once. So
+//! we support **only a folder built by hand** and check this before every
+//! sync: any flag → refusal, the database stays as it is.
 
 use anyhow::{anyhow, Context, Result};
 use grammers_client::client::Client;
@@ -16,26 +16,26 @@ use std::collections::HashMap;
 use crate::db::{Channel, Db};
 use crate::telegram::client::peer_ref;
 
-/// Канал в папке: `access_hash` приходит вместе с пиром, отдельный резолв не
-/// нужен — за счёт этого работают приватные каналы.
+/// A channel in the folder: `access_hash` comes together with the peer, no separate
+/// resolve is needed — this is why private channels work.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChannelPeer {
     pub id: i64,
     pub access_hash: i64,
 }
 
-/// Папка, пригодная к использованию.
+/// A folder that can be used.
 pub enum Folder {
-    /// Обычная папка без авто-правил: и читаем, и правим.
+    /// A normal folder without automatic rules: we read it and edit it.
     Editable(Box<tl::types::DialogFilter>),
-    /// Общая папка (`dialogFilterChatlist`): состав явный, но правку её списка
-    /// оставляем владельцу — у общих папок свои правила.
+    /// A shared folder (`dialogFilterChatlist`): the list is explicit, but we leave
+    /// editing it to the owner — shared folders have their own rules.
     Shared(Vec<ChannelPeer>),
 }
 
 impl Folder {
-    /// Состав = `pinned_peers ∪ include_peers` минус `exclude_peers`, только
-    /// каналы.
+    /// Content = `pinned_peers ∪ include_peers` minus `exclude_peers`, channels
+    /// only.
     pub fn members(&self) -> Vec<ChannelPeer> {
         match self {
             Folder::Shared(peers) => peers.clone(),
@@ -59,25 +59,25 @@ impl Folder {
 
 pub enum Lookup {
     Found(Folder),
-    /// Папка есть, но с авто-правилами: синхронизацию не выполняем.
+    /// The folder exists, but it has automatic rules: we do not sync.
     Invalid(String),
     Missing,
 }
 
-/// Найти папку по имени и проверить, что она собрана руками.
+/// Find the folder by name and check that it was built by hand.
 pub async fn find(client: &Client, title: &str) -> Result<Lookup> {
     let tl::enums::messages::DialogFilters::Filters(filters) = client
         .invoke(&tl::functions::messages::GetDialogFilters {})
         .await
-        .context("не удалось получить список папок Telegram")?;
+        .context("could not get the list of Telegram folders")?;
 
     for filter in filters.filters {
         match filter {
             tl::enums::DialogFilter::Filter(f) if filter_title(&f.title) == title => {
                 return Ok(match auto_rules(&f) {
                     Some(rule) => Lookup::Invalid(format!(
-                        "папка {title:?} содержит авто-правило ({rule}) — уберите его, \
-                         синхронизация отключена"
+                        "folder {title:?} has an automatic rule ({rule}) — remove it, \
+                         sync is turned off"
                     )),
                     None => Lookup::Found(Folder::Editable(Box::new(f))),
                 });
@@ -98,7 +98,7 @@ pub async fn find(client: &Client, title: &str) -> Result<Lookup> {
     Ok(Lookup::Missing)
 }
 
-/// Первый включённый флаг автовключения или исключения, если он есть.
+/// The first automatic inclusion or exclusion flag that is on, if there is one.
 fn auto_rules(filter: &tl::types::DialogFilter) -> Option<&'static str> {
     let flags = [
         (filter.contacts, "contacts"),
@@ -131,20 +131,20 @@ fn channels_of(peers: &[tl::enums::InputPeer]) -> Vec<ChannelPeer> {
         .collect()
 }
 
-/// Что дал sync — этим же текстом отвечаем на `/sync`.
+/// What the sync did — we reply to `/sync` with the same text.
 #[derive(Debug, Default)]
 pub struct SyncReport {
     pub added: Vec<String>,
     pub disabled: Vec<String>,
     pub total: usize,
-    /// Папка не прошла проверку или её нет: база не тронута.
+    /// The folder failed the check or does not exist: the database is not touched.
     pub refused: Option<String>,
 }
 
-/// Синхронизировать базу с папкой.
+/// Sync the database with the folder.
 ///
-/// Есть в папке → upsert и `enabled = 1` (0 → 1 сбрасывает курсор);
-/// есть в базе, нет в папке → `enabled = 0`. Не удаляем.
+/// In the folder → upsert and `enabled = 1` (0 → 1 resets the cursor);
+/// in the database but not in the folder → `enabled = 0`. We do not delete.
 pub async fn sync(client: &Client, db: &Db, title: &str) -> Result<SyncReport> {
     let folder = match find(client, title).await? {
         Lookup::Found(folder) => folder,
@@ -157,7 +157,7 @@ pub async fn sync(client: &Client, db: &Db, title: &str) -> Result<SyncReport> {
         Lookup::Missing => {
             return Ok(SyncReport {
                 refused: Some(format!(
-                    "папки {title:?} в аккаунте нет — работаем по списку из базы"
+                    "there is no folder {title:?} in the account — working from the database list"
                 )),
                 ..Default::default()
             })
@@ -170,19 +170,19 @@ pub async fn sync(client: &Client, db: &Db, title: &str) -> Result<SyncReport> {
         ..Default::default()
     };
 
-    // Названия и username перечитываем на каждом sync: канал могли переименовать
-    // или увести в приватные, и тогда ссылки в дайджесте вели бы в никуда.
-    // Стоит это один запрос на всю папку, а не по запросу на канал.
+    // We read titles and usernames again on every sync: a channel could be renamed
+    // or made private, and then the links in the digest would lead nowhere.
+    // This costs one request for the whole folder, not one request per channel.
     let fresh = describe_all(client, &members).await?;
 
     for peer in &members {
         let known = db.channel(peer.id).await?;
-        // Канал, которого Telegram не вернул (забанен, удалён), оставляем с тем,
-        // что уже знаем: пропажа имени — не повод терять канал и его курсор.
+        // A channel that Telegram did not return (banned, deleted) keeps what we
+        // already know: a lost name is no reason to lose the channel and its cursor.
         let (username, title) = match (fresh.get(&peer.id), &known) {
             (Some(fresh), _) => fresh.clone(),
             (None, Some(channel)) => (channel.username.clone(), channel.title.clone()),
-            (None, None) => (None, format!("канал id {}", peer.id)),
+            (None, None) => (None, format!("channel id {}", peer.id)),
         };
 
         if let Some(channel) = &known {
@@ -209,25 +209,25 @@ pub async fn sync(client: &Client, db: &Db, title: &str) -> Result<SyncReport> {
         total = report.total,
         added = report.added.len(),
         disabled = report.disabled.len(),
-        "папка синхронизирована"
+        "folder synced"
     );
     Ok(report)
 }
 
-/// Приватный канал по числовому id: `access_hash` у нас его нет, а без него
-/// `channels.getChannels` не ответит. Берём пир из списка диалогов — он там
-/// есть, если аккаунт на канал подписан.
+/// A private channel by numeric id: we do not have its `access_hash`, and without it
+/// `channels.getChannels` does not answer. We take the peer from the dialog list — it
+/// is there if the account follows the channel.
 pub async fn find_in_dialogs(client: &Client, id: i64) -> Result<Option<ChannelPeer>> {
     let mut dialogs = client.iter_dialogs();
     while let Some(dialog) = dialogs
         .next()
         .await
-        .context("не удалось прочитать список диалогов")?
+        .context("could not read the dialog list")?
     {
         let reference = dialog.peer_ref();
-        // Тип пира проверяем обязательно: «голые» id у пользователя, группы и
-        // канала живут в разных пространствах и вполне могут совпасть, а
-        // читать мы умеем только каналы.
+        // We must check the peer type: "bare" ids of a user, a group and a
+        // channel live in different spaces and can easily be the same, and
+        // we can read only channels.
         if reference.id.kind() == PeerKind::Channel && reference.id.bare_id() == Some(id) {
             return Ok(Some(ChannelPeer {
                 id,
@@ -238,11 +238,11 @@ pub async fn find_in_dialogs(client: &Client, id: i64) -> Result<Option<ChannelP
     Ok(None)
 }
 
-/// Обновить названия и username включённых каналов, не трогая состав.
+/// Update titles and usernames of the enabled channels without changing the list.
 ///
-/// Нужно тем, кто живёт без папки: там `sync` не вызывается, и канал,
-/// переименованный или ушедший в приватные, навсегда остался бы со старой
-/// ссылкой в дайджесте. Возвращает число каналов, у которых что-то изменилось.
+/// Needed for those who live without a folder: there `sync` is not called, and a
+/// channel that was renamed or made private would stay with a stale link in the
+/// digest forever. Returns the number of channels where something changed.
 pub async fn refresh_names(client: &Client, db: &Db) -> Result<usize> {
     let channels = db.enabled_channels().await?;
     if channels.is_empty() {
@@ -260,7 +260,7 @@ pub async fn refresh_names(client: &Client, db: &Db) -> Result<usize> {
 
     let mut changed = 0;
     for channel in &channels {
-        // Канала нет в ответе — он недоступен; имя из базы не трогаем.
+        // The channel is not in the answer — it is not available; we keep the name from the database.
         let Some((username, title)) = fresh.get(&channel.id) else {
             continue;
         };
@@ -274,7 +274,7 @@ pub async fn refresh_names(client: &Client, db: &Db) -> Result<usize> {
     }
 
     if changed > 0 {
-        tracing::info!(changed, "названия каналов обновлены");
+        tracing::info!(changed, "channel titles updated");
     }
     Ok(changed)
 }
@@ -285,18 +285,18 @@ fn log_rename(channel: &Channel, username: &Option<String>) {
             id = channel.id,
             was = ?channel.username,
             now = ?username,
-            "у канала сменился username — ссылки в дайджесте пересчитаны"
+            "channel username changed — digest links recalculated"
         );
     }
 }
 
-/// Сколько каналов Telegram отдаёт за один `channels.getChannels`.
+/// How many channels Telegram returns in one `channels.getChannels`.
 const CHANNELS_PER_REQUEST: usize = 100;
 
-/// Названия и username всей папки одним запросом (на каждую сотню каналов).
+/// Titles and usernames of the whole folder in one request (per hundred channels).
 ///
-/// Каналы, которых Telegram не вернул, в карту не попадают — вызывающая сторона
-/// решает, чем их заменить.
+/// Channels that Telegram did not return are not in the map — the caller
+/// decides what to use instead.
 async fn describe_all(
     client: &Client,
     peers: &[ChannelPeer],
@@ -317,7 +317,7 @@ async fn describe_all(
         let chats = match client
             .invoke(&tl::functions::channels::GetChannels { id })
             .await
-            .context("не удалось получить данные каналов папки")?
+            .context("could not get data of the folder channels")?
         {
             tl::enums::messages::Chats::Chats(chats) => chats.chats,
             tl::enums::messages::Chats::Slice(slice) => slice.chats,
@@ -333,7 +333,7 @@ async fn describe_all(
     Ok(out)
 }
 
-/// `(id, username, title)` канала — у недоступного канала имени может не быть.
+/// `(id, username, title)` of a channel — an unavailable channel may have no name.
 fn channel_names(chat: &tl::enums::Chat) -> Option<(i64, Option<String>, String)> {
     match chat {
         tl::enums::Chat::Channel(c) => Some((c.id, c.username.clone(), c.title.clone())),
@@ -342,26 +342,26 @@ fn channel_names(chat: &tl::enums::Chat) -> Option<(i64, Option<String>, String)
     }
 }
 
-/// Название и username одного канала по пиру.
+/// Title and username of one channel by peer.
 pub async fn describe(client: &Client, peer: ChannelPeer) -> Result<(Option<String>, String)> {
     let reference = peer_ref(peer.id, peer.access_hash)?;
     let resolved = client
         .resolve_peer(reference)
         .await
-        .with_context(|| format!("не удалось получить данные канала id {}", peer.id))?;
+        .with_context(|| format!("could not get data of channel id {}", peer.id))?;
 
     Ok((
         resolved.username().map(str::to_string),
-        resolved.name().unwrap_or("без названия").to_string(),
+        resolved.name().unwrap_or("no title").to_string(),
     ))
 }
 
-/// Добавить канал в папку. Единый источник правды — папка, поэтому `/add`
-/// правит её, а не базу: иначе следующий sync откатил бы правку.
+/// Add a channel to the folder. The folder is the single source of truth, so `/add`
+/// edits it, not the database: otherwise the next sync would undo the edit.
 pub async fn add_peer(client: &Client, folder: &Folder, peer: ChannelPeer) -> Result<()> {
     let Folder::Editable(filter) = folder else {
         return Err(anyhow!(
-            "это общая папка (chatlist) — добавьте канал в неё вручную, из приложения"
+            "this is a shared folder (chatlist) — add the channel to it by hand in the app"
         ));
     };
 
@@ -372,11 +372,11 @@ pub async fn add_peer(client: &Client, folder: &Folder, peer: ChannelPeer) -> Re
     update(client, filter).await
 }
 
-/// Добавить канал в состав папки. `false` — папку менять не нужно.
+/// Add a channel to the folder content. `false` — the folder does not need a change.
 ///
-/// Исключение снимаем всегда, даже если канал уже лежит в `include_peers`:
-/// `exclude_peers` сильнее, и ранний выход оставил бы `/add` с бодрым ответом
-/// и выключенным каналом.
+/// We always remove the exclusion, even if the channel is already in `include_peers`:
+/// `exclude_peers` is stronger, and an early return would leave `/add` with a happy answer
+/// and a disabled channel.
 fn include(filter: &mut tl::types::DialogFilter, peer: ChannelPeer) -> bool {
     let listed = filter
         .include_peers
@@ -399,11 +399,11 @@ fn is_channel(peer: &tl::enums::InputPeer, id: i64) -> bool {
     matches!(peer, tl::enums::InputPeer::Channel(c) if c.channel_id == id)
 }
 
-/// Убрать канал из папки.
+/// Remove a channel from the folder.
 pub async fn remove_peer(client: &Client, folder: &Folder, channel_id: i64) -> Result<()> {
     let Folder::Editable(filter) = folder else {
         return Err(anyhow!(
-            "это общая папка (chatlist) — уберите канал из неё вручную, из приложения"
+            "this is a shared folder (chatlist) — remove the channel from it by hand in the app"
         ));
     };
 
@@ -421,7 +421,7 @@ async fn update(client: &Client, filter: Box<tl::types::DialogFilter>) -> Result
             filter: Some(tl::enums::DialogFilter::Filter(*filter)),
         })
         .await
-        .context("не удалось обновить папку Telegram")?;
+        .context("could not update the Telegram folder")?;
     Ok(())
 }
 
@@ -432,8 +432,8 @@ fn input_peer(peer: ChannelPeer) -> tl::enums::InputPeer {
     })
 }
 
-/// Занести каналы из `[[channels]]` в пустую базу. Дальше правда — в папке и
-/// в базе, конфиг больше не смотрим.
+/// Copy the channels from `[[channels]]` to an empty database. After that the truth is in
+/// the folder and the database, we do not look at the config any more.
 pub async fn seed(
     client: &Client,
     db: &Db,
@@ -446,25 +446,27 @@ pub async fn seed(
                 let resolved = client
                     .resolve_username(username.trim_start_matches('@'))
                     .await
-                    .with_context(|| format!("не удалось разрешить @{username}"))?
-                    .ok_or_else(|| anyhow!("канал @{username} не найден"))?;
+                    .with_context(|| format!("could not resolve @{username}"))?
+                    .ok_or_else(|| anyhow!("channel @{username} not found"))?;
                 let reference = resolved
                     .to_ref()
                     .await
-                    .map_err(|e| anyhow!("канал @{username} недоступен: {e}"))?
-                    .ok_or_else(|| anyhow!("канал @{username} недоступен"))?;
+                    .map_err(|e| anyhow!("channel @{username} is not available: {e}"))?
+                    .ok_or_else(|| anyhow!("channel @{username} is not available"))?;
                 ChannelPeer {
                     id: reference
                         .id
                         .bare_id()
-                        .ok_or_else(|| anyhow!("у канала @{username} нет идентификатора"))?,
+                        .ok_or_else(|| anyhow!("channel @{username} has no id"))?,
                     access_hash: reference.auth.hash(),
                 }
             }
             (None, Some(id)) => {
                 let id = crate::db::bare_channel_id(id);
                 find_in_dialogs(client, id).await?.ok_or_else(|| {
-                    anyhow!("канала id {id} нет среди диалогов — аккаунт на него подписан?")
+                    anyhow!(
+                        "channel id {id} is not among the dialogs — does the account follow it?"
+                    )
                 })?
             }
             (None, None) => continue,
@@ -475,7 +477,7 @@ pub async fn seed(
         db.upsert_channel(peer.id, peer.access_hash, username.as_deref(), &title)
             .await?;
         added += 1;
-        tracing::info!(channel = %title, id = peer.id, "канал перенесён из конфига в базу");
+        tracing::info!(channel = %title, id = peer.id, "channel copied from the config to the database");
     }
     Ok(added)
 }
@@ -574,22 +576,25 @@ mod tests {
     #[test]
     fn adding_a_channel_already_in_the_folder_changes_nothing() {
         let mut f = filter(vec![3], vec![1], vec![]);
-        assert!(!include(&mut f, peer(1)), "канал уже в include_peers");
-        assert!(!include(&mut f, peer(3)), "канал уже в pinned_peers");
+        assert!(
+            !include(&mut f, peer(1)),
+            "channel already in include_peers"
+        );
+        assert!(!include(&mut f, peer(3)), "channel already in pinned_peers");
         assert_eq!(channels_of(&f.include_peers).len(), 1);
     }
 
     #[test]
     fn adding_a_channel_lifts_its_exclusion() {
-        // exclude_peers сильнее include_peers: без снятия исключения /add
-        // отвечал бы «добавлен», а канал оставался бы выключенным.
+        // exclude_peers is stronger than include_peers: without removing the exclusion /add
+        // would answer "added", but the channel would stay disabled.
         let mut f = filter(vec![], vec![1], vec![1]);
         assert!(include(&mut f, peer(1)));
         assert!(channels_of(&f.exclude_peers).is_empty());
         assert_eq!(
             channels_of(&f.include_peers).len(),
             1,
-            "дубля быть не должно"
+            "there must be no duplicate"
         );
 
         let folder = Folder::Editable(Box::new(f));
@@ -665,8 +670,8 @@ mod tests {
             Some((7, Some("news".to_string()), "News".to_string()))
         );
 
-        // Канал, ставший недоступным, отдаёт только название — username в базе
-        // должен обнулиться, иначе ссылки поведут в никуда.
+        // A channel that became unavailable gives only the title — the username in the
+        // database must become empty, or the links lead nowhere.
         let forbidden = tl::enums::Chat::ChannelForbidden(tl::types::ChannelForbidden {
             broadcast: true,
             megagroup: false,

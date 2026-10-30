@@ -1,7 +1,7 @@
-//! Вызов Anthropic Messages API.
+//! Calls to the Anthropic Messages API.
 //!
-//! Официального Rust SDK нет, поэтому дёргаем HTTP напрямую через reqwest —
-//! это штатный путь для языков без SDK.
+//! There is no official Rust SDK, so we call HTTP directly with reqwest —
+//! this is the normal way for languages without an SDK.
 
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
@@ -16,45 +16,45 @@ use crate::digest::{self, Digest, Post};
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 const MAX_ATTEMPTS: u32 = 4;
 
-/// Выше этого объёма переходим на map-reduce: сжимаем вход частями, затем
-/// сводим сводки в один дайджест. Контекст модели 1M токенов, так что порог
-/// с запасом — но молча обрезать хвост нельзя ни при каком объёме.
+/// Above this size we switch to map-reduce: we condense the input in parts, then
+/// reduce the summaries into one digest. The model context is 1M tokens, so the limit
+/// has a margin — but we must never silently cut the tail, whatever the size.
 const LARGE_INPUT_CHARS: usize = 400_000;
 
-/// Бюджет одной части на шаге map. Половина порога: если вход только-только
-/// перевалил за него, получаются две сопоставимые части, а не «почти всё
-/// и кусочек».
+/// Budget of one part in the map step. Half of the limit: if the input is just
+/// over it, we get two similar parts, not "almost everything
+/// and a small piece".
 const MAP_BATCH_CHARS: usize = LARGE_INPUT_CHARS / 2;
 
-/// Сколько раз сводки можно сводить промежуточно, прежде чем идти в финальный
-/// запрос как есть. Каждый заход стоит денег, а на разумных объёмах хватает
-/// одного: ограничение нужно, чтобы цикл не крутился на патологическом входе.
+/// How many times summaries can be reduced in between before we go to the final
+/// request as they are. Every round costs money, and for normal sizes one is
+/// enough: the limit is needed so the loop does not spin on a pathological input.
 const MAX_REDUCE_STAGES: usize = 3;
 
-/// Инструкция для шага map. Живёт в коде, но перекрывается `[prompts].map_system`:
-/// это не часть контракта парсинга, а обычный текст.
+/// Instruction for the map step. It lives in the code, but `[prompts].map_system` overrides it:
+/// it is not part of the parsing contract, just normal text.
 pub const DEFAULT_MAP_SYSTEM: &str = "\
-Ты сжимаешь ЧАСТЬ ленты Telegram-каналов — её потом сведут с другими частями в общий дайджест.
+You condense a PART of a Telegram channel feed — it will be merged with other parts into one digest later.
 
-Правила:
-1. Сгруппируй материалы по темам, а не по каналам; одинаковые новости из разных каналов — один пункт.
-2. В sources переноси ССЫЛКИ ИЗ ВХОДНЫХ ДАННЫХ дословно, все до одной: на следующем шаге взять их будет неоткуда.
-3. Ничего не выдумывай и не выбрасывай значимое — это сжатие, а не отбор лучшего.
-4. Помеченные как репост считай той же новостью, что и оригинал.
-5. tldr оставь пустым: короткая выжимка делается на сведении.";
+Rules:
+1. Group the material by topic, not by channel; the same news from different channels is one item.
+2. Copy the LINKS FROM THE INPUT into sources exactly, every one of them: the next step has no other place to get them.
+3. Do not make anything up and do not drop anything important — this is condensing, not picking the best.
+4. Treat posts marked as a repost as the same news as the original.
+5. Leave tldr empty: the short summary is made in the reduce step.";
 
-/// Пороги map-reduce.
+/// Map-reduce limits.
 ///
-/// В бою это константы выше; отдельным типом они стали, чтобы тесты могли
-/// гонять ту же оркестрацию на коротких входах. Иначе проверка «сводки сводятся
-/// промежуточно» стоила бы мегабайтов текста и сотни запросов к моку.
+/// In production these are the constants above; they became a separate type so tests can
+/// run the same flow on short inputs. Otherwise the check "summaries are reduced
+/// in between" would cost megabytes of text and hundreds of requests to the mock.
 #[derive(Debug, Clone, Copy)]
 struct Limits {
-    /// Больше этого — вход не идёт в один запрос.
+    /// Above this, the input does not go in one request.
     input: usize,
-    /// Бюджет одной части на шаге map и одной группы на промежуточном сведении.
+    /// Budget of one part in the map step and of one group in an intermediate reduce.
     batch: usize,
-    /// Сколько промежуточных заходов допустимо.
+    /// How many intermediate rounds are allowed.
     stages: usize,
 }
 
@@ -74,7 +74,7 @@ pub struct Summarizer {
     limits: Limits,
 }
 
-/// Копия настроек без времени жизни ссылки на весь Config.
+/// A copy of the settings without a lifetime tied to the whole Config.
 struct AnthropicSettings {
     api_key: String,
     api_url: String,
@@ -83,8 +83,8 @@ struct AnthropicSettings {
     max_tokens: u32,
 }
 
-/// Ответ модели вместе с расходом токенов: без него ориентир «$0.6–0.8 за
-/// прогон» не с чем сверить, а `/status` нечего показывать.
+/// The model answer together with token usage: without it there is nothing to check the
+/// "$0.6–0.8 per run" estimate against, and `/status` has nothing to show.
 #[cfg_attr(test, derive(Debug))]
 pub struct Summary {
     pub digest: Digest,
@@ -97,7 +97,7 @@ impl Summarizer {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(cfg.request_timeout_secs))
             .build()
-            .context("не удалось создать HTTP-клиент")?;
+            .context("could not create the HTTP client")?;
 
         Ok(Self {
             http,
@@ -118,9 +118,9 @@ impl Summarizer {
         self
     }
 
-    /// Запрос прерываемый: при остановке токены потрачены зря, но в базе ничего
-    /// нет и повтор безопасен. Ждать окончания нельзя — при `effort = "high"`
-    /// ответ идёт минуты, никакой разумный `stop_grace_period` это не покроет.
+    /// The request can be stopped: on shutdown the tokens are wasted, but the database
+    /// has nothing and a retry is safe. We cannot wait for the end — with `effort = "high"`
+    /// the answer takes minutes, no sensible `stop_grace_period` covers that.
     #[allow(clippy::too_many_arguments)]
     pub async fn summarize(
         &self,
@@ -157,11 +157,11 @@ impl Summarizer {
         self.ask(&prompts.system, &user_prompt, cancel).await
     }
 
-    /// Вход не помещается в один запрос: сжимаем его частями, потом сводим.
+    /// The input does not fit in one request: we condense it in parts, then reduce.
     ///
-    /// Это дороже одного запроса (N+1 вызовов), но альтернатива — отрезать
-    /// хвост, а этого делать нельзя. Ссылки на посты переносятся через сводки,
-    /// так что итоговая проверка `sources[].url` продолжает работать.
+    /// This costs more than one request (N+1 calls), but the other option is to cut
+    /// the tail, and we must not do that. Post links are carried through the summaries,
+    /// so the final check of `sources[].url` still works.
     async fn map_reduce(
         &self,
         prompts: &Prompts,
@@ -176,7 +176,7 @@ impl Summarizer {
         tracing::info!(
             posts = posts.len(),
             batches = batches.len(),
-            "вход большой: сжимаем частями, затем сводим"
+            "large input: condensing in parts, then reducing"
         );
 
         let map_system = prompts.map_system.as_deref().unwrap_or(DEFAULT_MAP_SYSTEM);
@@ -185,8 +185,8 @@ impl Summarizer {
         let mut output_tokens = None;
 
         for (index, batch) in batches.iter().enumerate() {
-            // В части каналов меньше, чем в прогоне: подставляем её счёт, иначе
-            // промпт обещает модели материалы, которых в этой части нет.
+            // A part has fewer channels than the run: we use its count, otherwise
+            // the prompt promises the model material that is not in this part.
             let prompt = digest::render_prompt_with(
                 &prompts.user_template,
                 &digest::format_posts(batch),
@@ -201,7 +201,7 @@ impl Summarizer {
                 .ask(map_system, &prompt, cancel)
                 .await
                 .with_context(|| {
-                    format!("не удалось сжать часть {} из {}", index + 1, batches.len())
+                    format!("could not condense part {} of {}", index + 1, batches.len())
                 })?;
 
             tracing::info!(
@@ -209,16 +209,16 @@ impl Summarizer {
                 of = batches.len(),
                 posts = batch.len(),
                 topics = summary.digest.topics.len(),
-                "часть сжата"
+                "part condensed"
             );
             input_tokens = add(input_tokens, summary.input_tokens);
             output_tokens = add(output_tokens, summary.output_tokens);
             partials.push(summary.digest);
         }
 
-        // Сводки тоже могут не влезть в один запрос: на сотне каналов их сумма
-        // снова выходит за порог, и финальный вызов упал бы уже после того, как
-        // все map-запросы оплачены. Поэтому сводим в несколько заходов.
+        // Summaries may also not fit in one request: with a hundred channels their total
+        // goes over the limit again, and the final call would fail after
+        // all map requests are paid for. So we reduce in several rounds.
         for stage in 1..=self.limits.stages {
             let groups = match plan_reduce(&partials, stage, self.limits) {
                 ReduceStep::Ready => break,
@@ -227,7 +227,7 @@ impl Summarizer {
                         stage,
                         partials = partials.len(),
                         chars = digest::partials_size(&partials),
-                        "сводки не дробятся дальше"
+                        "summaries cannot be split further"
                     );
                     break;
                 }
@@ -238,7 +238,7 @@ impl Summarizer {
                 stage,
                 from = partials.len(),
                 to = groups.len(),
-                "сводки не влезают в один запрос, сводим промежуточно"
+                "summaries do not fit in one request, reducing in between"
             );
 
             let mut merged = Vec::with_capacity(groups.len());
@@ -257,7 +257,7 @@ impl Summarizer {
                     .await
                     .with_context(|| {
                         format!(
-                            "не удалось свести группу {} из {} на этапе {stage}",
+                            "could not reduce group {} of {} at stage {stage}",
                             index + 1,
                             groups.len()
                         )
@@ -278,29 +278,29 @@ impl Summarizer {
             now,
             timezone,
         );
-        // Последняя проверка — по фактическому промпту, а не по сводкам:
-        // сюда приводят и «не дробится», и исчерпанные заходы, и просто
-        // большой шаблон. Отправить заведомо не влезающий запрос значит
-        // потерять и эти токены тоже.
+        // The last check is on the real prompt, not on the summaries:
+        // we get here from "cannot be split", from used-up rounds, and from simply
+        // a big template. Sending a request that surely does not fit means
+        // losing these tokens too.
         ensure_fits(&reduce_prompt, partials.len(), self.limits)?;
 
         let mut summary = self
             .ask(&prompts.system, &reduce_prompt, cancel)
             .await
-            .context("не удалось свести сводки частей в дайджест")?;
+            .context("could not reduce the part summaries into a digest")?;
 
         summary.input_tokens = add(input_tokens, summary.input_tokens);
         summary.output_tokens = add(output_tokens, summary.output_tokens);
         Ok(summary)
     }
 
-    /// Один запрос к модели. Прерываемый: при остановке токены потрачены зря,
-    /// но в базе ничего нет и повтор безопасен. Ждать окончания нельзя — при
-    /// `effort = "high"` ответ идёт минуты, никакой разумный `stop_grace_period`
-    /// это не покроет.
+    /// One request to the model. It can be stopped: on shutdown the tokens are wasted,
+    /// but the database has nothing and a retry is safe. We cannot wait for the end — with
+    /// `effort = "high"` the answer takes minutes, no sensible `stop_grace_period`
+    /// covers that.
     async fn ask(&self, system: &str, user: &str, cancel: &Cancel) -> Result<Summary> {
-        // thinking на claude-opus-5 включён по умолчанию — параметр не передаём.
-        // temperature и budget_tokens на этой модели возвращают 400.
+        // thinking is on by default on claude-opus-5 — we do not pass the parameter.
+        // temperature and budget_tokens return 400 on this model.
         let body = json!({
             "model": self.cfg.model,
             "max_tokens": self.cfg.max_tokens,
@@ -313,16 +313,16 @@ impl Summarizer {
         });
 
         let response = tokio::select! {
-            _ = cancel.cancelled() => bail!("запрос к модели прерван сигналом остановки"),
+            _ = cancel.cancelled() => bail!("model request stopped by the shutdown signal"),
             result = self.post_with_retries(&body) => result?,
         };
 
         parse_summary(response)
     }
 
-    /// Ретраим только то, что имеет смысл ретраить: 429 (по `retry-after`),
-    /// 5xx и сетевые сбои. 400/401/403 — это ошибка конфигурации, повтор её
-    /// не вылечит, падаем сразу с текстом от API.
+    /// We retry only what makes sense to retry: 429 (by `retry-after`),
+    /// 5xx and network failures. 400/401/403 are config errors, a retry does not
+    /// fix them, we fail at once with the text from the API.
     async fn post_with_retries(&self, body: &Value) -> Result<Value> {
         let mut attempt = 0;
 
@@ -343,11 +343,11 @@ impl Summarizer {
                 Ok(r) => r,
                 Err(e) if attempt < MAX_ATTEMPTS => {
                     let delay = backoff(attempt);
-                    tracing::warn!(error = %e, attempt, ?delay, "сетевая ошибка, повтор");
+                    tracing::warn!(error = %e, attempt, ?delay, "network error, retrying");
                     tokio::time::sleep(delay).await;
                     continue;
                 }
-                Err(e) => return Err(e).context("запрос к Anthropic API не удался"),
+                Err(e) => return Err(e).context("request to the Anthropic API failed"),
             };
 
             let status = response.status();
@@ -356,7 +356,7 @@ impl Summarizer {
                 return response
                     .json()
                     .await
-                    .context("ответ Anthropic API — не JSON");
+                    .context("the Anthropic API answer is not JSON");
             }
 
             let retry_after = response
@@ -371,28 +371,28 @@ impl Summarizer {
             let retryable = status.as_u16() == 429 || status.is_server_error();
             if retryable && attempt < MAX_ATTEMPTS {
                 let delay = retry_after.unwrap_or_else(|| backoff(attempt));
-                tracing::warn!(%status, attempt, ?delay, "API вернул временную ошибку, повтор");
+                tracing::warn!(%status, attempt, ?delay, "the API returned a temporary error, retrying");
                 tokio::time::sleep(delay).await;
                 continue;
             }
 
-            bail!("Anthropic API вернул {status}: {text}");
+            bail!("the Anthropic API returned {status}: {text}");
         }
     }
 }
 
-/// Что делать со сводками перед финальным сведением.
+/// What to do with the summaries before the final reduce.
 #[derive(Debug)]
 enum ReduceStep<'a> {
-    /// Влезают в один запрос — сводим.
+    /// They fit in one request — reduce.
     Ready,
-    /// Ещё один промежуточный заход такими группами.
+    /// One more intermediate round with these groups.
     Compress(Vec<&'a [Digest]>),
-    /// Дробить дальше нечем или заходы исчерпаны: решает `ensure_fits`.
+    /// Nothing more to split or the rounds are used up: `ensure_fits` decides.
     Stuck,
 }
 
-/// Чистое решение одного шага сведения — без сети, поэтому проверяемое.
+/// A pure decision for one reduce step — without the network, so it can be tested.
 fn plan_reduce(partials: &[Digest], stage: usize, limits: Limits) -> ReduceStep<'_> {
     if digest::partials_size(partials) <= limits.input {
         return ReduceStep::Ready;
@@ -402,34 +402,34 @@ fn plan_reduce(partials: &[Digest], stage: usize, limits: Limits) -> ReduceStep<
     }
 
     let groups = digest::split_partials(partials, limits.batch);
-    // Групп столько же, сколько сводок, — заход ничего не сожмёт, только
-    // потратит по запросу на каждую сводку.
+    // As many groups as summaries — the round condenses nothing, it only
+    // spends one request per summary.
     if groups.len() >= partials.len() {
         return ReduceStep::Stuck;
     }
     ReduceStep::Compress(groups)
 }
 
-/// Финальный запрос обязан помещаться в окно.
+/// The final request must fit in the window.
 ///
-/// Если нет — честнее упасть, чем отправлять заведомо негодный запрос или
-/// выбрасывать темы: курсоры не сдвинуты, посты останутся на следующий прогон,
-/// а владелец увидит, что именно упёрлось.
+/// If not, it is more honest to fail than to send a request that surely does not fit or
+/// to drop topics: the cursors have not moved, the posts stay for the next run,
+/// and the owner sees what exactly hit the limit.
 fn ensure_fits(prompt: &str, partials: usize, limits: Limits) -> Result<()> {
     let chars = prompt.chars().count();
     if chars <= limits.input {
         return Ok(());
     }
     bail!(
-        "сводки {partials} частей не помещаются в один запрос: {chars} символов при пороге {}. \
-         Курсоры не сдвинуты, посты войдут в следующий прогон; \
-         уменьшите lookback_hours или число каналов",
+        "summaries of {partials} parts do not fit in one request: {chars} characters with a limit of {}. \
+         Cursors not moved, the posts go into the next run; \
+         lower lookback_hours or the number of channels",
         limits.input
     )
 }
 
-/// Сколько разных каналов в части. Посты идут подряд по каналам, поэтому
-/// достаточно посчитать смены `channel_id`.
+/// How many different channels are in a part. Posts come in a row by channel, so
+/// it is enough to count changes of `channel_id`.
 fn distinct_channels(posts: &[Post]) -> usize {
     let mut count = 0;
     let mut current = None;
@@ -442,8 +442,8 @@ fn distinct_channels(posts: &[Post]) -> usize {
     count
 }
 
-/// Сумма расхода токенов по всем запросам прогона. `None` только если ни один
-/// ответ счётчиков не прислал: иначе показывали бы прочерк там, где расход был.
+/// Total token usage over all requests of the run. `None` only if no
+/// answer sent the counters: otherwise we would show a dash where there was usage.
 fn add(total: Option<u64>, next: Option<u64>) -> Option<u64> {
     match (total, next) {
         (None, next) => next,
@@ -456,8 +456,8 @@ fn backoff(attempt: u32) -> Duration {
     Duration::from_secs(2u64.pow(attempt))
 }
 
-/// `stop_reason` проверяем ДО чтения `content`: на отказ модель отвечает
-/// HTTP 200 с `stop_reason: "refusal"` и пустым содержимым.
+/// We check `stop_reason` BEFORE reading `content`: on a refusal the model answers
+/// HTTP 200 with `stop_reason: "refusal"` and empty content.
 fn parse_summary(response: Value) -> Result<Summary> {
     let stop_reason = response
         .get("stop_reason")
@@ -466,10 +466,10 @@ fn parse_summary(response: Value) -> Result<Summary> {
 
     if stop_reason == "refusal" {
         let details = response.get("stop_details").cloned().unwrap_or(Value::Null);
-        bail!("модель отклонила запрос (stop_reason=refusal): {details}");
+        bail!("the model refused the request (stop_reason=refusal): {details}");
     }
     if stop_reason == "max_tokens" {
-        bail!("ответ обрезан по max_tokens — увеличьте anthropic.max_tokens в конфиге");
+        bail!("the answer was cut at max_tokens — raise anthropic.max_tokens in the config");
     }
 
     let usage = |field: &str| {
@@ -493,18 +493,18 @@ fn parse_summary(response: Value) -> Result<Summary> {
         .unwrap_or_default();
 
     if text.trim().is_empty() {
-        bail!("ответ Anthropic API не содержит текстовых блоков: {response}");
+        bail!("the Anthropic API answer has no text blocks: {response}");
     }
 
     let digest: Digest = serde_json::from_str(&text)
-        .with_context(|| format!("не удалось разобрать ответ модели как дайджест: {text}"))?;
+        .with_context(|| format!("could not parse the model answer as a digest: {text}"))?;
 
     tracing::info!(
         input_tokens = usage("input_tokens"),
         output_tokens = usage("output_tokens"),
         %stop_reason,
         topics = digest.topics.len(),
-        "ответ модели получен"
+        "model answer received"
     );
 
     Ok(Summary {
@@ -531,20 +531,20 @@ mod tests {
         Post {
             channel_id,
             channel: format!("@c{channel_id}"),
-            title: format!("Канал {channel_id}"),
+            title: format!("Channel {channel_id}"),
             date: Utc::now(),
-            text: "текст".into(),
+            text: "text".into(),
             url: format!("https://t.me/c{channel_id}/1"),
             origin: None,
         }
     }
 
-    /// Ответ Anthropic с готовым дайджестом внутри текстового блока.
+    /// An Anthropic answer with a ready digest inside a text block.
     fn api_reply(summary_chars: usize, topics: usize) -> Value {
         let digest = json!({
             "topics": (0..topics).map(|i| json!({
-                "title": format!("тема {i}"),
-                "summary": "я".repeat(summary_chars),
+                "title": format!("topic {i}"),
+                "summary": "x".repeat(summary_chars),
                 "sources": [{ "channel": "@c1", "url": "https://t.me/c1/1" }]
             })).collect::<Vec<_>>(),
             "tldr": []
@@ -556,9 +556,9 @@ mod tests {
         })
     }
 
-    /// Поддельный Anthropic на localhost: считает запросы и отвечает заранее
-    /// заготовленным. Нужен, чтобы проверить саму оркестрацию map-reduce —
-    /// сколько запросов ушло и ушёл ли финальный вообще.
+    /// A fake Anthropic on localhost: counts requests and answers with ready
+    /// answers. It is needed to test the map-reduce flow itself —
+    /// how many requests went out and whether the final one went out at all.
     struct FakeApi {
         url: String,
         requests: Arc<AtomicUsize>,
@@ -578,8 +578,8 @@ mod tests {
                 };
                 let index = counter.fetch_add(1, Ordering::SeqCst);
 
-                // Запрос вычитываем целиком: иначе клиент получит обрыв
-                // на записи тела вместо ответа.
+                // We read the whole request: otherwise the client gets a broken
+                // connection while writing the body instead of an answer.
                 let mut data = Vec::new();
                 let mut chunk = vec![0u8; 16 * 1024];
                 while let Ok(read) = socket.read(&mut chunk).await {
@@ -643,16 +643,16 @@ mod tests {
 
     fn prompts() -> Prompts {
         Prompts {
-            system: "сведи".into(),
-            user_template: "{{post_count}} постов\n{{posts}}".into(),
+            system: "reduce".into(),
+            user_template: "{{post_count}} posts\n{{posts}}".into(),
             map_system: None,
-            digest_title: "Дайджест за {{date}}".into(),
-            tldr_title: "Коротко".into(),
+            digest_title: "Digest for {{date}}".into(),
+            tldr_title: "In short".into(),
         }
     }
 
-    /// Вход, который гарантированно уходит в map-reduce: `channels` каналов
-    /// по `per_channel` постов, каждый пост на `chars` символов.
+    /// Input that surely goes to map-reduce: `channels` channels
+    /// with `per_channel` posts each, each post `chars` characters long.
     fn big_input(channels: i64, per_channel: usize, chars: usize) -> Vec<Post> {
         let mut posts = Vec::new();
         for channel in 1..=channels {
@@ -660,9 +660,9 @@ mod tests {
                 posts.push(Post {
                     channel_id: channel,
                     channel: format!("@c{channel}"),
-                    title: format!("Канал {channel}"),
+                    title: format!("Channel {channel}"),
                     date: Utc::now(),
-                    text: "я".repeat(chars),
+                    text: "x".repeat(chars),
                     url: format!("https://t.me/c{channel}/{index}"),
                     origin: None,
                 });
@@ -680,8 +680,8 @@ mod tests {
     fn partial(summary_chars: usize) -> Digest {
         Digest {
             topics: vec![crate::digest::Topic {
-                title: "тема".into(),
-                summary: "я".repeat(summary_chars),
+                title: "topic".into(),
+                summary: "x".repeat(summary_chars),
                 sources: vec![],
             }],
             tldr: vec![],
@@ -699,7 +699,7 @@ mod tests {
 
     #[test]
     fn oversized_partials_are_compressed_in_groups() {
-        // Восемь сводок по ~60k: вместе 480k, но по три в группу влезают.
+        // Eight summaries of ~60k: 480k together, but three fit in a group.
         let partials: Vec<Digest> = (0..8).map(|_| partial(60_000)).collect();
         match plan_reduce(&partials, 1, Limits::default()) {
             ReduceStep::Compress(groups) => {
@@ -708,14 +708,14 @@ mod tests {
                     .iter()
                     .all(|g| digest::partials_size(g) <= MAP_BATCH_CHARS));
             }
-            other => panic!("ожидали промежуточное сведение, получили {other:?}"),
+            other => panic!("expected an intermediate reduce, got {other:?}"),
         }
     }
 
     #[test]
     fn partials_that_cannot_be_paired_stop_the_loop() {
-        // Четыре сводки по 120k: каждая влезает в бюджет, но даже две вместе —
-        // уже нет. Группировка ничего не даст, крутить заходы бессмысленно.
+        // Four summaries of 120k: each fits in the budget, but even two together
+        // do not. Grouping gives nothing, there is no point in spinning rounds.
         let partials: Vec<Digest> = (0..4).map(|_| partial(120_000)).collect();
         assert!(matches!(
             plan_reduce(&partials, 1, Limits::default()),
@@ -734,18 +734,18 @@ mod tests {
 
     #[test]
     fn an_oversized_final_prompt_is_an_error_not_a_request() {
-        assert!(ensure_fits("коротко", 2, Limits::default()).is_ok());
+        assert!(ensure_fits("short", 2, Limits::default()).is_ok());
 
-        let error = ensure_fits(&"я".repeat(LARGE_INPUT_CHARS + 1), 4, Limits::default())
+        let error = ensure_fits(&"x".repeat(LARGE_INPUT_CHARS + 1), 4, Limits::default())
             .unwrap_err()
             .to_string();
-        assert!(error.contains("не помещаются в один запрос"), "{error}");
-        assert!(error.contains("Курсоры не сдвинуты"), "{error}");
+        assert!(error.contains("do not fit in one request"), "{error}");
+        assert!(error.contains("Cursors not moved"), "{error}");
     }
 
     #[tokio::test]
     async fn map_reduce_sends_one_request_per_part_plus_the_reduce() {
-        // 3 канала по 180k символов: в один запрос не влезает, в три — да.
+        // 3 channels of 180k characters: they do not fit in one request, but fit in three.
         let posts = big_input(3, 45, 3_800);
         let api = fake_api(vec![api_reply(100, 2)]).await;
 
@@ -757,18 +757,18 @@ mod tests {
         assert_eq!(
             api.requests.load(Ordering::SeqCst),
             4,
-            "три сжатия и одно сведение"
+            "three condense calls and one reduce"
         );
         assert_eq!(summary.digest.topics.len(), 2);
-        // Токены суммируются по всем запросам, а не берутся от последнего.
+        // Tokens are summed over all requests, not taken from the last one.
         assert_eq!(summary.input_tokens, Some(40));
         assert_eq!(summary.output_tokens, Some(12));
     }
 
     #[tokio::test]
     async fn an_unshrinkable_reduce_fails_before_spending_the_final_request() {
-        // Каждая сводка сама по 150k: пары не складываются, промежуточное
-        // сведение не поможет.
+        // Each summary alone is 150k: pairs do not fit together, an intermediate
+        // reduce does not help.
         let posts = big_input(3, 45, 3_800);
         let api = fake_api(vec![api_reply(150_000, 1)]).await;
 
@@ -778,17 +778,17 @@ mod tests {
             .unwrap_err()
             .to_string();
 
-        assert!(error.contains("не помещаются в один запрос"), "{error}");
+        assert!(error.contains("do not fit in one request"), "{error}");
         assert_eq!(
             api.requests.load(Ordering::SeqCst),
             3,
-            "финальный запрос не отправляется, раз он заведомо не влезет"
+            "the final request is not sent, because it surely does not fit"
         );
     }
 
-    /// Уменьшенные пороги: та же оркестрация, но вход измеряется сотнями
-    /// символов, а не сотнями тысяч. Соотношение `input = 2 × batch` — как
-    /// в бою, иначе тест проверял бы не ту арифметику.
+    /// Smaller limits: the same flow, but the input is measured in hundreds of
+    /// characters, not hundreds of thousands. The ratio `input = 2 × batch` is the same as
+    /// in production, or the test would check the wrong arithmetic.
     fn tiny_limits(stages: usize) -> Limits {
         Limits {
             input: 2_000,
@@ -797,28 +797,28 @@ mod tests {
         }
     }
 
-    /// Сводка, которую вернёт мок на такой ответ: считаем ожидания тем же
-    /// кодом, что и прод, а не арифметикой в уме.
+    /// The summary the mock returns for such an answer: we calculate expectations with the
+    /// same code as production, not in our heads.
     fn partial_from(reply: &Value) -> Digest {
         parse_summary(reply.clone()).unwrap().digest
     }
 
     #[tokio::test]
     async fn partials_that_do_not_fit_are_compressed_before_the_final_reduce() {
-        // Шесть каналов по два поста: каждый канал — своя часть (бюджет 1000).
+        // Six channels with two posts each: each channel is its own part (budget 1000).
         let posts = big_input(6, 2, 240);
         let map_reply = api_reply(400, 1);
         let limits = tiny_limits(3);
 
-        // Предпосылки теста: сводки шести частей вместе не влезают, но
-        // группируются — значит промежуточный заход обязан состояться.
+        // Test preconditions: the summaries of six parts do not fit together, but
+        // can be grouped — so an intermediate round must happen.
         let partials: Vec<Digest> = (0..6).map(|_| partial_from(&map_reply)).collect();
         assert!(digest::partials_size(&partials) > limits.input);
         let groups = digest::split_partials(&partials, limits.batch).len();
         assert!(groups < partials.len());
 
-        // Первые шесть ответов — крупные сводки, дальше мок отдаёт короткую:
-        // после промежуточного захода всё влезает в финальный запрос.
+        // The first six answers are large summaries, then the mock returns a short one:
+        // after the intermediate round everything fits in the final request.
         let mut bodies = vec![map_reply; 6];
         bodies.push(api_reply(50, 1));
         let api = fake_api(bodies).await;
@@ -833,21 +833,21 @@ mod tests {
         assert_eq!(
             requests,
             6 + groups + 1,
-            "шесть сжатий, промежуточные группы и одно сведение"
+            "six condense calls, intermediate groups and one reduce"
         );
         assert_eq!(summary.digest.topics.len(), 1);
         assert_eq!(
             summary.input_tokens,
             Some(10 * requests as u64),
-            "токены считаются по всем запросам, включая промежуточные"
+            "tokens are counted over all requests, including intermediate ones"
         );
     }
 
     #[tokio::test]
     async fn stages_run_out_and_the_final_prompt_is_still_checked() {
-        // Шестнадцать частей и ровно один разрешённый заход: после него сводок
-        // всё ещё слишком много. Заходы исчерпаны — но финальная проверка
-        // обязана сработать и не дать отправить негодный запрос.
+        // Sixteen parts and exactly one allowed round: after it there are still
+        // too many summaries. The rounds are used up — but the final check
+        // must work and not let a bad request go out.
         let posts = big_input(16, 2, 240);
         let map_reply = api_reply(400, 1);
         let limits = tiny_limits(1);
@@ -857,7 +857,7 @@ mod tests {
         let after_stage: Vec<Digest> = (0..groups).map(|_| partial_from(&map_reply)).collect();
         assert!(
             digest::partials_size(&after_stage) > limits.input,
-            "после единственного захода сводки всё ещё не влезают"
+            "after the only round the summaries still do not fit"
         );
 
         let api = fake_api(vec![map_reply]).await;
@@ -869,11 +869,11 @@ mod tests {
             .unwrap_err()
             .to_string();
 
-        assert!(error.contains("не помещаются в один запрос"), "{error}");
+        assert!(error.contains("do not fit in one request"), "{error}");
         assert_eq!(
             api.requests.load(Ordering::SeqCst),
             16 + groups,
-            "шестнадцать сжатий и один заход; финальный запрос не отправлен"
+            "sixteen condense calls and one round; the final request not sent"
         );
     }
 
@@ -945,12 +945,12 @@ mod tests {
             "content": [
                 { "type": "thinking", "thinking": "…" },
                 { "type": "text", "text": "{\"topics\":[],\"tl" },
-                { "type": "text", "text": "dr\":[\"раз\"]}" }
+                { "type": "text", "text": "dr\":[\"one\"]}" }
             ]
         })))
         .unwrap();
 
-        assert_eq!(summary.digest.tldr, vec!["раз".to_string()]);
+        assert_eq!(summary.digest.tldr, vec!["one".to_string()]);
         assert_eq!(summary.input_tokens, Some(10));
         assert_eq!(summary.output_tokens, Some(20));
     }
@@ -959,10 +959,10 @@ mod tests {
     fn invalid_json_from_the_model_is_reported_with_its_text() {
         let error = parse_summary(response(json!({
             "stop_reason": "end_turn",
-            "content": [{ "type": "text", "text": "не json" }]
+            "content": [{ "type": "text", "text": "not json" }]
         })))
         .unwrap_err()
         .to_string();
-        assert!(error.contains("не json"), "{error}");
+        assert!(error.contains("not json"), "{error}");
     }
 }

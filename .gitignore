@@ -1,28 +1,28 @@
 /target
 
-# Cargo.lock коммитим: в нём закреплён glass_pumpkin 2.0.0-rc0 (см. CLAUDE.md),
-# без этого пина сборка ломается
+# Cargo.lock is committed: it pins glass_pumpkin 2.0.0-rc0 (see AGENTS.md),
+# without this pin the build breaks
 
-# Рабочий конфиг содержит API-ключи и телефон — в репозиторий идёт только
-# config.example.toml
+# The working config has API keys and the phone number — only
+# config.example.toml goes into the repository
 config.toml
 
-# Файл сессии Telegram = ПОЛНЫЙ ДОСТУП К АККАУНТУ. Никогда не коммитить.
+# Telegram session file = FULL ACCESS TO THE ACCOUNT. Never commit it.
 tg.session
 tg.session-journal
 tg.session-wal
 tg.session-shm
 *.session
 
-# Volume контейнера: там же лежат config.toml, tg.session и база
+# Container volume: config.toml, tg.session and the database are also here
 /data
 
-# База: каналы, курсоры, журнал прогонов и частей дайджеста
+# Database: channels, cursors, journal of runs and digest parts
 *.db
 *.db-journal
 *.db-wal
 *.db-shm
 
-# Вывод dry-run
+# Dry-run output
 /out
 /logs
