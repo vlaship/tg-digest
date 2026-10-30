@@ -163,4 +163,5 @@ state. There is no coverage target.
 Write short commit subjects in the imperative mood. A PR should explain the change,
 related issues, the effect on the config, and how you checked it. For rendering
 changes, add sample output. CI (`.github/workflows/docker.yml`) builds the Docker
-image on every push and PR, but does not push it anywhere.
+image on every push and PR. Pushes to `main` and `v*` tags also publish it to
+`ghcr.io/vlaship/tg-digest`; PRs only build it.
