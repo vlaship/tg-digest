@@ -17,11 +17,21 @@ and posts the digest back to Telegram on a schedule.
 
 ## Run in Docker (the normal way)
 
-All state is in one volume folder: the config, the session and the database.
+Two things live outside the image:
+
+- **`.env`** next to `compose.yaml` — the secrets (`TG_API_ID`, `TG_API_HASH`,
+  `TG_PHONE`, `ANTHROPIC_API_KEY`). Compose passes them to the container.
+- **`data/`** — a host folder mounted as `/data`: `config.toml` (schedule, prompts,
+  limits), `tg.session` and the database `digest.db`. It survives image updates
+  and `docker compose down`. Back it up, and keep it private: `tg.session` gives
+  full access to your Telegram account.
+
+Both are in `.gitignore`.
 
 ```powershell
+# Do not overwrite existing files: they already have your secrets and state.
+if (-not (Test-Path .env)) { Copy-Item .env.example .env }   # then fill in .env
 New-Item -ItemType Directory -Force data | Out-Null
-# Do not overwrite an existing config: it already has your secrets.
 if (-not (Test-Path data\config.toml)) { Copy-Item config.example.toml data\config.toml }
 
 docker compose build                          # build the image first, or login runs in the old one
@@ -106,8 +116,10 @@ Fill in `config.toml`:
 3. `anthropic.api_key`;
 4. `telegram.folder` — the name of the Telegram folder with the channel list.
 
-You do not have to keep secrets in the file: `TG_API_ID`, `TG_API_HASH`,
-`TG_PHONE` and `ANTHROPIC_API_KEY` override the values from the TOML.
+With Docker, put items 1–3 into `.env` instead (see `.env.example`): `TG_API_ID`,
+`TG_API_HASH`, `TG_PHONE` and `ANTHROPIC_API_KEY` override the values from the TOML,
+so `config.toml` can keep its empty placeholders. An empty value in `.env` keeps
+the one from `config.toml`.
 
 ### Channels
 
