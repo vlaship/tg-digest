@@ -2,10 +2,12 @@
 # The same check as before a commit: cargo fmt && cargo clippy --all-targets && cargo test.
 name: cargo
 
+# Only push, no pull_request: a PR branch is already checked by its push. A second,
+# skipped `check` on the same commit would count as passed for the required check
+# on main and could let a broken PR merge.
 on:
   push:
     branches: ["**"]
-  pull_request:
   workflow_dispatch:
 
 permissions:
@@ -20,9 +22,6 @@ env:
 
 jobs:
   check:
-    # A PR from a branch of this repo is already checked by its push.
-    # Run on pull_request only for PRs from forks.
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
