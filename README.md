@@ -153,9 +153,11 @@ every run, so a renamed channel keeps correct links.
 | `/status` | last run: status, posts, topics, tokens, parts |
 | `/last` | send the last digest again |
 | `/resume N` · `/abandon N` | deliver or cancel an undelivered run |
+| `/stop` · `/start` | stop or start getting digests for yourself (commands still work) |
 | `/help` | list of commands |
 
-Notifications also come there: a failed run, an excluded channel, an undelivered
+Each digest goes to you and to every user in `bot.allowed_users` who has started
+the bot and has not sent `/stop`. Notifications come only to you: a failed run, an excluded channel, an undelivered
 digest.
 
 ## Security

@@ -343,6 +343,11 @@ impl Runner {
             Ok(dest) => dest,
             Err(e) => return self.fail(run_id, e).await,
         };
+        // The other allowed users get copies; fixed now, like the main destination.
+        let extra_dests = match self.bot() {
+            Ok(bot) => publish::extra_destinations(bot, &self.db, &dest_label).await,
+            Err(_) => Vec::new(),
+        };
 
         let journal: Vec<(String, i64)> = chunks
             .iter()
@@ -358,6 +363,7 @@ impl Runner {
                 &collected.cursors,
                 &dest_label,
                 dest,
+                &extra_dests,
                 &journal,
             )
             .await?;

@@ -71,6 +71,11 @@ const MIGRATIONS: &[&str] = &[
         sent_msg_id  INTEGER,
         PRIMARY KEY (run_id, idx)
     )",
+    // 4: other recipients of the digest (JSON list of `Destination`), fixed at
+    // `summarized` time like the main destination.
+    "ALTER TABLE runs ADD COLUMN extra_dests TEXT",
+    // 5: users who turned the digest off with /stop.
+    "CREATE TABLE muted_users (user_id INTEGER PRIMARY KEY)",
 ];
 
 /// A channel in the database. `id` is the "bare" Telegram channel id (positive,
@@ -122,6 +127,8 @@ pub struct Run {
     pub dest_peer_id: Option<i64>,
     pub dest_access_hash: Option<i64>,
     pub stale_notified_at: Option<DateTime<Utc>>,
+    /// Other users who also get the digest (`bot.allowed_users` who started the bot).
+    pub extra_dests: Vec<Destination>,
 }
 
 impl Run {
@@ -158,7 +165,7 @@ pub struct Chunk {
 
 /// Where the digest went (or will go). Resolved once, when the parts are written.
 /// `peer_id` is a Bot API dialog id, so the peer type is restored without doubt.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Destination {
     pub peer_id: i64,
     pub access_hash: i64,
@@ -408,6 +415,32 @@ impl Db {
         }))
     }
 
+    // ------------------------------------------------------------------ users
+
+    /// `/stop` (`muted = true`) and `/start` (`muted = false`) for one user.
+    pub async fn set_muted(&self, user_id: i64, muted: bool) -> Result<()> {
+        let sql = if muted {
+            "INSERT OR IGNORE INTO muted_users (user_id) VALUES (?1)"
+        } else {
+            "DELETE FROM muted_users WHERE user_id = ?1"
+        };
+        self.conn.execute(sql, params![user_id]).await?;
+        Ok(())
+    }
+
+    /// Users who do not want the digest.
+    pub async fn muted_users(&self) -> Result<Vec<i64>> {
+        let mut rows = self
+            .conn
+            .query("SELECT user_id FROM muted_users", ())
+            .await?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            out.push(row.get(0)?);
+        }
+        Ok(out)
+    }
+
     // ------------------------------------------------------------------- runs
 
     pub async fn start_run(&self, trigger: &str) -> Result<i64> {
@@ -495,13 +528,15 @@ impl Db {
         cursors: &BTreeMap<i64, i32>,
         dest_label: &str,
         dest: Destination,
+        extra_dests: &[Destination],
         chunks: &[(String, i64)],
     ) -> Result<()> {
         let tx = self.conn.transaction().await?;
         tx.execute(
             "UPDATE runs
              SET status = ?2, posts = ?3, topics = ?4, input_tokens = ?5, output_tokens = ?6,
-                 cursors = ?7, dest_label = ?8, dest_peer_id = ?9, dest_access_hash = ?10
+                 cursors = ?7, dest_label = ?8, dest_peer_id = ?9, dest_access_hash = ?10,
+                 extra_dests = ?11
              WHERE id = ?1",
             params![
                 run_id,
@@ -514,6 +549,7 @@ impl Db {
                 dest_label,
                 dest.peer_id,
                 dest.access_hash,
+                serde_json::to_string(extra_dests)?,
             ],
         )
         .await?;
@@ -715,9 +751,11 @@ async fn collect_channels(mut rows: libsql::Rows) -> Result<Vec<Channel>> {
     Ok(out)
 }
 
-/// `SELECT *` on `runs` — the column order is set by migration #2.
+/// `SELECT *` on `runs` — the column order is set by migration #2, plus
+/// `extra_dests` from migration #4 at the end.
 fn row_to_run(row: &libsql::Row) -> Result<Run> {
     let cursors: Option<String> = row.get(10)?;
+    let extra_dests: Option<String> = row.get(16)?;
     Ok(Run {
         id: row.get(0)?,
         started_at: parse_time(row.get::<Option<String>>(1)?)?.unwrap_or_else(Utc::now),
@@ -740,6 +778,12 @@ fn row_to_run(row: &libsql::Row) -> Result<Run> {
         dest_peer_id: row.get(13)?,
         dest_access_hash: row.get(14)?,
         stale_notified_at: parse_time(row.get::<Option<String>>(15)?)?,
+        extra_dests: match extra_dests {
+            Some(raw) => {
+                serde_json::from_str(&raw).context("run recipients in the database are damaged")?
+            }
+            None => Vec::new(),
+        },
     })
 }
 

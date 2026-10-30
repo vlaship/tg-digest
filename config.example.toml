@@ -86,7 +86,8 @@ token = ""
 session_file = "/data/bot.session"
 
 # Other Telegram user ids that may give commands, for example [123456789]. Your own
-# account is always allowed. To find an id: the person writes to the bot, and the log
+# account is always allowed. They also get every digest, unless they send /stop.
+# To find an id: the person writes to the bot, and the log
 # shows "message ignored: user is not in bot.allowed_users" with their id.
 allowed_users = []
 

@@ -12,6 +12,7 @@ use grammers_client::client::UpdatesConfiguration;
 use grammers_client::message::InputMessage;
 use grammers_client::peer::Peer;
 use grammers_client::update::Update;
+use grammers_session::types::PeerId;
 use grammers_session::updates::UpdatesLike;
 use std::sync::Arc;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -34,6 +35,8 @@ Commands:
 /last — send the last digest again
 /resume N — deliver an old run (a duplicate is possible)
 /abandon N — cancel an undelivered run
+/stop — stop getting digests (commands still work)
+/start — get digests again
 /help — this help";
 
 /// Run the updates loop until the shutdown signal comes.
@@ -116,7 +119,7 @@ pub async fn listen(
         let runner = runner.clone();
         let cancel = cancel.clone();
         commands.spawn(async move {
-            let reply = match handle(&runner, &text).await {
+            let reply = match handle(&runner, user, &text).await {
                 Ok(reply) => reply,
                 Err(e) if crate::telegram::client::is_fatal(&e) => return Err(e),
                 // We show a command error to the owner, we do not hide it in the log.
@@ -146,7 +149,7 @@ pub async fn listen(
     }
 }
 
-async fn handle(runner: &Arc<Runner>, text: &str) -> Result<String> {
+async fn handle(runner: &Arc<Runner>, user: PeerId, text: &str) -> Result<String> {
     let mut parts = text.splitn(2, char::is_whitespace);
     // Telegram may add the bot name: `/list@my_digest_bot`.
     let command = parts
@@ -158,7 +161,9 @@ async fn handle(runner: &Arc<Runner>, text: &str) -> Result<String> {
     let arg = parts.next().unwrap_or("").trim();
 
     match command {
-        "/help" | "/start" => Ok(HELP.into()),
+        "/help" => Ok(HELP.into()),
+        "/start" => subscribe(runner, user, true).await,
+        "/stop" => subscribe(runner, user, false).await,
         "/list" => list(runner).await,
         "/status" => status(runner).await,
         "/run" => Ok(runner.trigger(TRIGGER_MANUAL).await?.to_string()),
@@ -202,6 +207,29 @@ where
         ));
     }
     action.await
+}
+
+/// `/start` and `/stop`: turn the digest on or off for the user who wrote. Commands
+/// keep working either way. The owner cannot turn it off: the owner is the main
+/// destination, and the delivery journal is kept for that chat.
+async fn subscribe(runner: &Arc<Runner>, user: PeerId, on: bool) -> Result<String> {
+    let bot = runner.bot()?;
+    if user == bot.owner {
+        return Ok(if on {
+            HELP.into()
+        } else {
+            "you are the owner: the digest always comes to you. To stop it, change \
+             telegram.destination or stop the service"
+                .into()
+        });
+    }
+    let id = user.bare_id().unwrap_or_default();
+    runner.db.set_muted(id, !on).await?;
+    Ok(if on {
+        format!("digests are on for you.\n\n{HELP}")
+    } else {
+        "digests are off for you. Send /start to turn them on again.".into()
+    })
 }
 
 async fn list(runner: &Arc<Runner>) -> Result<String> {
@@ -366,6 +394,15 @@ async fn last(runner: &Arc<Runner>) -> Result<String> {
         runner.cancellation(),
     )
     .await?;
+    // The other allowed users get it too; a failure for one of them is only logged.
+    for extra in
+        publish::extra_destinations(bot, &runner.db, &runner.cfg.telegram.destination).await
+    {
+        let peer = publish::destination_ref(extra)?;
+        if let Err(e) = publish::resend(&bot.client, peer, &chunks, runner.cancellation()).await {
+            tracing::warn!(error = %format!("{e:#}"), "copy of /last for an allowed user failed");
+        }
+    }
 
     Ok(format!(
         "run #{} sent again to {} ({} parts)",
