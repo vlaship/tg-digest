@@ -1,8 +1,8 @@
-//! Один прогон: сбор → модель → публикация, и восстановление недоставленного.
+//! One run: collect → model → publish, and recovery of undelivered runs.
 //!
-//! Здесь же живёт единственная блокировка на всё, что трогает курсоры и статус
-//! прогона. Она берётся через `try_lock` — никто не ждёт в очереди: отложенный
-//! `/reset`, сработавший через пять минут, удивит сильнее, чем отказ.
+//! The single lock for everything that touches cursors and run status also lives
+//! here. It is taken with `try_lock` — nobody waits in a queue: a delayed
+//! `/reset` that fires five minutes later is more surprising than a refusal.
 
 use anyhow::Result;
 use chrono::{Duration as ChronoDuration, Utc};
@@ -22,15 +22,15 @@ pub const TRIGGER_CRON: &str = "cron";
 pub const TRIGGER_CATCH_UP: &str = "catch_up";
 pub const TRIGGER_MANUAL: &str = "manual";
 
-/// Чем закончился триггер. Тем же текстом отвечаем на `/run`.
+/// How a trigger ended. We reply to `/run` with the same text.
 pub enum Outcome {
-    /// Блокировка занята: прогон уже идёт.
+    /// The lock is taken: a run is already going.
     Busy(i64),
-    /// Есть недоставленный прогон, но окно повтора вышло — ждём владельца.
+    /// There is an undelivered run, but the retry window is over — waiting for the owner.
     Stale(i64),
-    /// Недоставленный прогон добит.
+    /// The undelivered run is now delivered.
     Delivered(i64),
-    /// Прогон остаётся в `publishing`: часть не ушла.
+    /// The run stays in `publishing`: a part was not sent.
     Pending(i64, String),
     Finished {
         run: i64,
@@ -38,22 +38,22 @@ pub enum Outcome {
         posts: usize,
         topics: usize,
     },
-    /// Прогон не состоялся; курсоры на месте.
+    /// The run did not happen; the cursors are in place.
     Failed(i64, String),
-    /// `/abandon`: блокировка снята, курсоры не применены.
+    /// `/abandon`: the lock is released, the cursors are not applied.
     Abandoned(i64),
 }
 
 impl std::fmt::Display for Outcome {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Outcome::Busy(id) => write!(f, "идёт прогон #{id}, повторите после"),
+            Outcome::Busy(id) => write!(f, "run #{id} is going, try again later"),
             Outcome::Stale(id) => write!(
                 f,
-                "есть недоставленный прогон #{id}, окно автоповтора вышло: /resume {id} или /abandon {id}"
+                "there is an undelivered run #{id}, the auto-retry window is over: /resume {id} or /abandon {id}"
             ),
-            Outcome::Delivered(id) => write!(f, "прогон #{id} доставлен"),
-            Outcome::Pending(id, reason) => write!(f, "прогон #{id} не доставлен: {reason}"),
+            Outcome::Delivered(id) => write!(f, "run #{id} delivered"),
+            Outcome::Pending(id, reason) => write!(f, "run #{id} not delivered: {reason}"),
             Outcome::Finished {
                 run,
                 status,
@@ -61,12 +61,12 @@ impl std::fmt::Display for Outcome {
                 topics,
             } => write!(
                 f,
-                "прогон #{run}: {status}, постов {posts}, тем {topics}"
+                "run #{run}: {status}, posts {posts}, topics {topics}"
             ),
-            Outcome::Failed(id, reason) => write!(f, "прогон #{id} упал: {reason}"),
+            Outcome::Failed(id, reason) => write!(f, "run #{id} failed: {reason}"),
             Outcome::Abandoned(id) => write!(
                 f,
-                "прогон #{id} снят, курсоры не сдвинуты — посты войдут в следующий дайджест"
+                "run #{id} cancelled, cursors not moved — the posts go into the next digest"
             ),
         }
     }
@@ -77,10 +77,10 @@ pub struct Runner {
     pub db: Arc<Db>,
     pub client: Client,
     cancel: Cancel,
-    /// Одна блокировка на прогон и на команды, которые трогают курсоры.
-    /// Заменяет lock-файл: процесс в контейнере один.
+    /// One lock for the run and for commands that touch cursors.
+    /// It replaces a lock file: there is one process in the container.
     lock: Mutex<()>,
-    /// Последняя жалоба на папку — чтобы не слать её в «Избранное» каждый час.
+    /// The last folder complaint — so we do not send it to Saved Messages every hour.
     folder_warning: Mutex<Option<String>>,
 }
 
@@ -96,7 +96,7 @@ impl Runner {
         }
     }
 
-    /// Блокировка для команд, которые трогают курсоры и статус прогона.
+    /// The lock for commands that touch cursors and run status.
     pub fn try_lock(&self) -> Option<MutexGuard<'_, ()>> {
         self.lock.try_lock().ok()
     }
@@ -109,15 +109,15 @@ impl Runner {
         &self.cancel
     }
 
-    /// Точка входа любого триггера: cron, догон, `/run`, старт демона.
+    /// Entry point of every trigger: cron, catch-up, `/run`, daemon start.
     pub async fn trigger(&self, trigger: &str) -> Result<Outcome> {
         let Some(_guard) = self.try_lock() else {
             let busy = self.db.last_run().await?.map(|r| r.id).unwrap_or_default();
             return Ok(Outcome::Busy(busy));
         };
 
-        // Проверка незавершённого прогона выполняется на КАЖДОМ триггере, а не
-        // только при запуске: иначе второй дайджест уедет поверх первого.
+        // The check for an unfinished run happens on EVERY trigger, not only
+        // on start: otherwise a second digest would go on top of the first one.
         if let Some(run) = self.db.unfinished_run().await? {
             return self.finish_unfinished(run).await;
         }
@@ -125,19 +125,19 @@ impl Runner {
         self.fresh_run(trigger).await
     }
 
-    /// `/resume`: владелец принимает риск дубля. Доставка идёт с сохранёнными
-    /// `random_id` — лучший шанс на дедупликацию, если срок ещё не вышел.
+    /// `/resume`: the owner accepts the risk of a duplicate. Delivery uses the saved
+    /// `random_id` — the best chance of deduplication if the time has not run out yet.
     pub async fn resume(&self, run_id: i64) -> Result<Outcome> {
         let Some(_guard) = self.try_lock() else {
             return Ok(Outcome::Busy(self.running_id().await?));
         };
         let Some(run) = self.db.run(run_id).await? else {
-            return Ok(Outcome::Failed(run_id, "такого прогона нет".into()));
+            return Ok(Outcome::Failed(run_id, "no such run".into()));
         };
         if !run.is_unfinished() {
             return Ok(Outcome::Failed(
                 run_id,
-                format!("прогон в статусе {}, доставлять нечего", run.status),
+                format!("run has status {}, nothing to deliver", run.status),
             ));
         }
         self.deliver(&run, true).await
@@ -148,24 +148,24 @@ impl Runner {
             return Ok(Outcome::Busy(self.running_id().await?));
         };
         let Some(run) = self.db.run(run_id).await? else {
-            return Ok(Outcome::Failed(run_id, "такого прогона нет".into()));
+            return Ok(Outcome::Failed(run_id, "no such run".into()));
         };
         if !run.is_unfinished() {
             return Ok(Outcome::Failed(
                 run_id,
-                format!("прогон в статусе {}, снимать нечего", run.status),
+                format!("run has status {}, nothing to cancel", run.status),
             ));
         }
         self.db.abandon_run(run_id).await?;
         Ok(Outcome::Abandoned(run_id))
     }
 
-    /// Номер прогона, который сейчас держит блокировку: последний в журнале.
+    /// Number of the run that holds the lock now: the last one in the journal.
     async fn running_id(&self) -> Result<i64> {
         Ok(self.db.last_run().await?.map(|r| r.id).unwrap_or_default())
     }
 
-    /// Что делать с найденным незавершённым прогоном, решает его возраст.
+    /// The age of a found unfinished run decides what to do with it.
     async fn finish_unfinished(&self, run: Run) -> Result<Outcome> {
         let window = ChronoDuration::hours(self.cfg.telegram.publish_retry_window_hours);
         let age = Utc::now() - run.age_reference();
@@ -173,18 +173,18 @@ impl Runner {
         if age <= window {
             tracing::info!(
                 run = run.id,
-                "недоставленный прогон в окне повтора, добиваем"
+                "undelivered run inside the retry window, delivering it"
             );
             return self.deliver(&run, false).await;
         }
 
-        // За пределами окна автоповтор не выполняется: срок дедупликации у
-        // Telegram не документирован, рискнуть может только владелец.
+        // Outside the window there is no auto-retry: Telegram does not document
+        // the deduplication time, so only the owner can take the risk.
         if run.stale_notified_at.is_none() {
             let text = format!(
-                "прогон #{} не доставлен с {}, безопасность повтора не гарантирована:\n\
-                 /resume {} — доставить недоставленные части (возможен дубль),\n\
-                 /abandon {} — снять",
+                "run #{} not delivered since {}, a retry is not guaranteed to be safe:\n\
+                 /resume {} — deliver the undelivered parts (a duplicate is possible),\n\
+                 /abandon {} — cancel",
                 run.id,
                 run.age_reference().format("%Y-%m-%d %H:%M UTC"),
                 run.id,
@@ -195,7 +195,7 @@ impl Runner {
         }
         tracing::warn!(
             run = run.id,
-            "недоставленный прогон устарел, ждём решения владельца"
+            "undelivered run is too old, waiting for the owner to decide"
         );
         Ok(Outcome::Stale(run.id))
     }
@@ -212,7 +212,7 @@ impl Runner {
                 if !self.cancel.is_cancelled() {
                     notify(
                         &self.client,
-                        &format!("дайджест не доставлен целиком: {reason}"),
+                        &format!("digest not fully delivered: {reason}"),
                     )
                     .await;
                 }
@@ -226,10 +226,10 @@ impl Runner {
 
         let channels = self.db.enabled_channels().await?;
         let run_id = self.db.start_run(trigger).await?;
-        tracing::info!(run = run_id, %trigger, channels = channels.len(), "прогон начат");
+        tracing::info!(run = run_id, %trigger, channels = channels.len(), "run started");
 
         if channels.is_empty() {
-            tracing::warn!("включённых каналов нет — публиковать нечего");
+            tracing::warn!("no channels enabled — nothing to post");
             self.db.complete_run(run_id, db::STATUS_EMPTY).await?;
             return Ok(Outcome::Finished {
                 run: run_id,
@@ -245,14 +245,17 @@ impl Runner {
                 Err(e) => return self.fail(run_id, e).await,
             };
 
-        // Исключённый канал — повод для уведомления: молча потерять его посты
-        // нельзя, а курсор у него не двигается и следующий прогон дочитает.
+        // An excluded channel is a reason for a notification: we cannot silently lose
+        // its posts, and its cursor does not move, so the next run reads the rest.
         let failed: Vec<i64> = collected.failures.iter().map(|(c, _)| c.id).collect();
         for (channel, reason) in &collected.failures {
             self.db.set_channel_error(channel.id, Some(reason)).await?;
             notify(
                 &self.client,
-                &format!("канал {} исключён из прогона: {reason}", channel.label()),
+                &format!(
+                    "channel {} excluded from the run: {reason}",
+                    channel.label()
+                ),
             )
             .await;
         }
@@ -263,7 +266,7 @@ impl Runner {
         }
 
         if collected.posts.is_empty() {
-            tracing::info!(run = run_id, "новых постов нет");
+            tracing::info!(run = run_id, "no new posts");
             return self.finish_empty(run_id, &collected, (None, None)).await;
         }
 
@@ -299,10 +302,10 @@ impl Runner {
             },
         );
 
-        // Пустой дайджест не публикуем, но посты прочитаны: курсоры двигаем,
-        // иначе «неважные» посты перечитывались бы каждый прогон.
+        // We do not post an empty digest, but the posts were read: we move the cursors,
+        // or "unimportant" posts would be read again on every run.
         if chunks.is_empty() {
-            tracing::info!(run = run_id, "модель не нашла ни одной темы");
+            tracing::info!(run = run_id, "the model found no topics");
             return self
                 .finish_empty(
                     run_id,
@@ -340,7 +343,7 @@ impl Runner {
             .db
             .run(run_id)
             .await?
-            .expect("только что записанный прогон");
+            .expect("a run that was just written");
 
         match self.deliver(&run, false).await? {
             Outcome::Delivered(_) => Ok(Outcome::Finished {
@@ -371,10 +374,10 @@ impl Runner {
         })
     }
 
-    /// Прогон не дошёл до ответа модели: ничего не записано, курсоры целы.
+    /// The run did not reach the model answer: nothing is saved, the cursors are safe.
     async fn fail(&self, run_id: i64, error: anyhow::Error) -> Result<Outcome> {
         if tg::is_fatal(&error) {
-            // Отозванную сессию пережидать бессмысленно — пусть падает наружу.
+            // There is no point in waiting out a revoked session — let it fail upwards.
             self.db.fail_run(run_id, &format!("{error:#}")).await?;
             return Err(error);
         }
@@ -385,20 +388,20 @@ impl Runner {
             format!("{error:#}")
         };
 
-        tracing::error!(run = run_id, %reason, "прогон завершился с ошибкой");
+        tracing::error!(run = run_id, %reason, "run finished with an error");
         self.db.fail_run(run_id, &reason).await?;
 
         if !self.cancel.is_cancelled() {
-            notify(&self.client, &format!("дайджест не собран: {reason}")).await;
+            notify(&self.client, &format!("digest not built: {reason}")).await;
         }
         Ok(Outcome::Failed(run_id, reason))
     }
 
-    /// Привести базу в соответствие с Telegram перед сбором.
+    /// Bring the database in line with Telegram before collecting.
     ///
-    /// С папкой это полный sync. Без папки составом управляют `/add` и `/rm`,
-    /// но названия и username всё равно надо перечитать: переименованный канал
-    /// иначе навсегда остался бы в дайджесте со старой ссылкой.
+    /// With a folder this is a full sync. Without a folder `/add` and `/rm` manage the
+    /// list, but titles and usernames must still be read again: a renamed channel
+    /// would otherwise stay in the digest forever with a stale link.
     pub async fn refresh_channels(&self) -> Result<()> {
         if self.cfg.telegram.folder.is_some() {
             self.sync_folder().await?;
@@ -408,17 +411,17 @@ impl Runner {
         match folder::refresh_names(&self.client, &self.db).await {
             Ok(_) => Ok(()),
             Err(e) if tg::is_fatal(&e) => Err(e),
-            // Не смогли перечитать имена — это не повод отменять прогон:
-            // ссылки останутся прежними, дайджест соберётся.
+            // We could not read the names again — this is no reason to cancel the run:
+            // the links stay the same, the digest is still built.
             Err(e) => {
-                tracing::warn!(error = %format!("{e:#}"), "не удалось обновить названия каналов");
+                tracing::warn!(error = %format!("{e:#}"), "could not update channel titles");
                 Ok(())
             }
         }
     }
 
-    /// Папка — единый источник правды по каналам, но её проблемы не должны
-    /// ронять прогон: не синхронизировались — работаем по базе.
+    /// The folder is the single source of truth about channels, but its problems must
+    /// not break the run: if the sync fails, we work from the database.
     pub async fn sync_folder(&self) -> Result<Option<folder::SyncReport>> {
         let Some(title) = self.cfg.telegram.folder.as_deref() else {
             return Ok(None);
@@ -428,7 +431,7 @@ impl Runner {
             Ok(report) => report,
             Err(e) if tg::is_fatal(&e) => return Err(e),
             Err(e) => {
-                let text = format!("папка {title:?} не синхронизирована: {e:#}");
+                let text = format!("folder {title:?} not synced: {e:#}");
                 tracing::warn!("{text}");
                 self.warn_once(text).await;
                 return Ok(None);
@@ -445,8 +448,8 @@ impl Runner {
         Ok(Some(report))
     }
 
-    /// Одна и та же жалоба на папку уходит в «Избранное» один раз, а не на
-    /// каждом триггере.
+    /// The same folder complaint goes to Saved Messages once, not on
+    /// every trigger.
     async fn warn_once(&self, text: String) {
         let mut last = self.folder_warning.lock().await;
         if last.as_deref() == Some(text.as_str()) {

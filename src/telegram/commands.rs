@@ -1,12 +1,12 @@
-//! Управление сервисом командами в «Избранном».
+//! Controlling the service with commands in Saved Messages.
 //!
-//! Слушаем updates и реагируем **только** на исходящие сообщения в чате с самим
-//! собой: никто, кроме владельца аккаунта, туда написать не может, поэтому
-//! отдельная авторизация не нужна. Бот для этого не заводится — он всё равно не
-//! умеет читать каналы, а UI для одного владельца даёт сам аккаунт.
+//! We listen to updates and react **only** to outgoing messages in the chat with
+//! ourselves: nobody except the account owner can write there, so no separate
+//! authorization is needed. We do not create a bot for this — a bot cannot read
+//! channels anyway, and the account itself gives a UI for one owner.
 //!
-//! Каналы адресуются по `@username` или по числовому `id`: у приватных каналов
-//! username нет, поэтому `/list` и ответ на `/add` всегда показывают `id`.
+//! Channels are named by `@username` or by numeric `id`: private channels have
+//! no username, so `/list` and the `/add` reply always show the `id`.
 
 use anyhow::{bail, Context, Result};
 use grammers_client::client::UpdatesConfiguration;
@@ -25,19 +25,19 @@ use crate::telegram::client::is_auth_error;
 use crate::telegram::{folder, publish};
 
 const HELP: &str = "\
-/add @канал | ссылка | id — добавить канал
-/rm @канал | id — убрать канал
-/list — каналы, курсоры, ошибки
-/reset id — перечитать канал с окна lookback_hours
-/run — прогон сейчас (или доставка недоставленного)
-/status — последний прогон: статус, посты, токены
-/last — переотправить последний дайджест
-/resume N — доставить устаревший прогон (возможен дубль)
-/abandon N — снять недоставленный прогон
-/sync — перечитать папку
-/help — эта справка";
+/add @channel | link | id — add a channel
+/rm @channel | id — remove a channel
+/list — channels, cursors, errors
+/reset id — read the channel again from the lookback_hours window
+/run — run now (or deliver an undelivered digest)
+/status — last run: status, posts, tokens
+/last — send the last digest again
+/resume N — deliver an old run (a duplicate is possible)
+/abandon N — cancel an undelivered run
+/sync — read the folder again
+/help — this help";
 
-/// Крутить цикл updates, пока не придёт сигнал остановки.
+/// Run the updates loop until the shutdown signal comes.
 pub async fn listen(
     runner: Arc<Runner>,
     updates: UnboundedReceiver<UpdatesLike>,
@@ -47,7 +47,7 @@ pub async fn listen(
         .client
         .get_me()
         .await
-        .context("не удалось получить свой профиль")?
+        .context("could not get own profile")?
         .id();
 
     let mut stream = runner
@@ -60,9 +60,9 @@ pub async fn listen(
             },
         )
         .await
-        .map_err(|e| anyhow::anyhow!("не удалось подписаться на updates: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("could not subscribe to updates: {e}"))?;
 
-    tracing::info!("слушаем команды в «Избранном», /help — список");
+    tracing::info!("listening for commands in Saved Messages, /help for the list");
     let mut commands = JoinSet::<Result<()>>::new();
 
     loop {
@@ -70,13 +70,13 @@ pub async fn listen(
             _ = cancel.cancelled() => {
                 // Let an in-flight send record its delivery before exiting.
                 while let Some(result) = commands.join_next().await {
-                    result.context("обработчик команды упал")??;
+                    result.context("command handler failed")??;
                 }
-                tracing::info!("слушатель команд остановлен");
+                tracing::info!("command listener stopped");
                 return Ok(());
             }
             result = commands.join_next(), if !commands.is_empty() => {
-                result.expect("есть обработчик").context("обработчик команды упал")??;
+                result.expect("there is a handler").context("command handler failed")??;
                 continue;
             }
             update = stream.next() => update,
@@ -84,13 +84,13 @@ pub async fn listen(
 
         let update = match update {
             Ok(update) => update,
-            // Отозванная сессия роняет цикл: это неустранимое, а не «ошибка
-            // одного update».
+            // A revoked session breaks the loop: this is fatal, not "an error
+            // of one update".
             Err(e) if is_auth_error(&e) => {
-                return Err(anyhow::Error::new(e).context("сессия Telegram недействительна"))
+                return Err(anyhow::Error::new(e).context("Telegram session is not valid"))
             }
             Err(e) => {
-                tracing::warn!(error = %e, "ошибка чтения updates");
+                tracing::warn!(error = %e, "error reading updates");
                 continue;
             }
         };
@@ -106,19 +106,19 @@ pub async fn listen(
             continue;
         }
 
-        tracing::info!(command = %text, "команда из «Избранного»");
+        tracing::info!(command = %text, "command from Saved Messages");
         let runner = runner.clone();
         let cancel = cancel.clone();
         commands.spawn(async move {
             let reply = match handle(&runner, &text).await {
                 Ok(reply) => reply,
                 Err(e) if crate::telegram::client::is_fatal(&e) => return Err(e),
-                // Ошибку команды показываем владельцу, а не прячем в лог.
-                Err(e) => format!("не получилось: {e:#}"),
+                // We show a command error to the owner, we do not hide it in the log.
+                Err(e) => format!("failed: {e:#}"),
             };
 
-            // Длинный ответ (`/list` на полусотне каналов) Telegram не обрежет,
-            // а отвергнет целиком — режем сами.
+            // Telegram does not cut a long reply (`/list` with fifty channels),
+            // it rejects it completely — so we split it ourselves.
             for piece in crate::digest::split_plain(&reply) {
                 if cancel.is_cancelled() {
                     return Ok(());
@@ -129,9 +129,9 @@ pub async fn listen(
                 {
                     if is_auth_error(&e) {
                         return Err(anyhow::Error::new(e)
-                            .context("сессия Telegram недействительна; выполните login"));
+                            .context("Telegram session is not valid; run login"));
                     }
-                    tracing::warn!(error = %e, "не удалось ответить на команду");
+                    tracing::warn!(error = %e, "could not reply to the command");
                     break;
                 }
             }
@@ -152,25 +152,25 @@ async fn handle(runner: &Arc<Runner>, text: &str) -> Result<String> {
         "/run" => Ok(runner.trigger(TRIGGER_MANUAL).await?.to_string()),
         "/resume" => match arg.parse::<i64>() {
             Ok(id) => Ok(runner.resume(id).await?.to_string()),
-            Err(_) => Ok("нужен номер прогона: /resume 12".into()),
+            Err(_) => Ok("a run number is needed: /resume 12".into()),
         },
         "/abandon" => match arg.parse::<i64>() {
             Ok(id) => Ok(runner.abandon(id).await?.to_string()),
-            Err(_) => Ok("нужен номер прогона: /abandon 12".into()),
+            Err(_) => Ok("a run number is needed: /abandon 12".into()),
         },
-        // Футуры ленивые: действие не начнётся, пока `guarded` не пропустит.
+        // Futures are lazy: the action does not start until `guarded` lets it through.
         "/sync" => guarded(runner, sync(runner)).await,
         "/add" => guarded(runner, add(runner, arg)).await,
         "/rm" => guarded(runner, remove(runner, arg)).await,
         "/reset" => guarded(runner, reset(runner, arg)).await,
         "/last" => guarded(runner, last(runner)).await,
-        other => Ok(format!("не знаю команду {other}\n\n{HELP}")),
+        other => Ok(format!("unknown command {other}\n\n{HELP}")),
     }
 }
 
-/// Команды, которые трогают курсоры, идут под той же блокировкой, что и прогон,
-/// и отклоняются, если есть недоставленный прогон: его `runs.cursors` при
-/// доставке перезапишут любой сброс.
+/// Commands that touch cursors go under the same lock as the run,
+/// and they are refused if there is an undelivered run: its `runs.cursors` would
+/// overwrite any reset on delivery.
 async fn guarded<Fut>(runner: &Arc<Runner>, action: Fut) -> Result<String>
 where
     Fut: std::future::Future<Output = Result<String>>,
@@ -182,11 +182,11 @@ where
             .await?
             .map(|r| r.id)
             .unwrap_or_default();
-        return Ok(format!("идёт прогон #{id}, повторите после"));
+        return Ok(format!("run #{id} is going, try again later"));
     };
     if let Some(run) = runner.db.unfinished_run().await? {
         return Ok(format!(
-            "есть недоставленный прогон #{} — /run для доставки или /abandon {}",
+            "there is an undelivered run #{} — /run to deliver it or /abandon {}",
             run.id, run.id
         ));
     }
@@ -196,13 +196,13 @@ where
 async fn list(runner: &Arc<Runner>) -> Result<String> {
     let channels = runner.db.channels().await?;
     if channels.is_empty() {
-        return Ok("каналов нет: соберите папку в Telegram и вызовите /sync".into());
+        return Ok("no channels: build the folder in Telegram and call /sync".into());
     }
 
     let mut out = String::new();
     for channel in &channels {
         out.push_str(&format!(
-            "{} {} — id {}, {}, курсор {}{}\n",
+            "{} {} — id {}, {}, cursor {}{}\n",
             if channel.enabled { "✅" } else { "⛔" },
             channel.title,
             channel.id,
@@ -210,12 +210,12 @@ async fn list(runner: &Arc<Runner>) -> Result<String> {
                 .username
                 .as_ref()
                 .map(|u| format!("@{u}"))
-                .unwrap_or_else(|| "приватный".into()),
+                .unwrap_or_else(|| "private".into()),
             channel.last_msg_id,
             channel
                 .last_error
                 .as_ref()
-                .map(|e| format!("\n   ошибка: {e}"))
+                .map(|e| format!("\n   error: {e}"))
                 .unwrap_or_default(),
         ));
     }
@@ -224,14 +224,14 @@ async fn list(runner: &Arc<Runner>) -> Result<String> {
 
 async fn status(runner: &Arc<Runner>) -> Result<String> {
     let Some(run) = runner.db.last_run().await? else {
-        return Ok("прогонов ещё не было".into());
+        return Ok("there were no runs yet".into());
     };
 
     let chunks = runner.db.chunks(run.id).await?;
     let delivered = chunks.iter().filter(|c| c.delivered_at.is_some()).count();
 
     let mut out = format!(
-        "прогон #{} ({}): {}\nначат {}\nзавершён {}\nпостов {}, тем {}\nтокены: {} / {}\nчасти: {delivered} из {}\nадресат: {}",
+        "run #{} ({}): {}\nstarted {}\nfinished {}\nposts {}, topics {}\ntokens: {} / {}\nparts: {delivered} of {}\ndestination: {}",
         run.id,
         run.trigger,
         run.status,
@@ -247,31 +247,31 @@ async fn status(runner: &Arc<Runner>) -> Result<String> {
         run.dest_label.as_deref().unwrap_or("—"),
     );
     if let Some(error) = &run.error {
-        out.push_str(&format!("\nошибка: {error}"));
+        out.push_str(&format!("\nerror: {error}"));
     }
 
-    // Часть с `delivered_at`, но без `sent_msg_id` — это доставка, за которую
-    // Telegram не вернул id (или ответил RANDOM_ID_DUPLICATE). Так и пишем.
+    // A part with `delivered_at` but without `sent_msg_id` is a delivery for which
+    // Telegram did not return an id (or answered RANDOM_ID_DUPLICATE). We say so.
     for chunk in &chunks {
         out.push_str(&match (&chunk.delivered_at, chunk.sent_msg_id) {
             (Some(at), Some(id)) => format!(
-                "\n  часть {}: доставлена {} (msg {id})",
+                "\n  part {}: delivered {} (msg {id})",
                 chunk.idx + 1,
                 at.format("%H:%M")
             ),
             (Some(at), None) => format!(
-                "\n  часть {}: доставлена {} (id сообщения не пришёл)",
+                "\n  part {}: delivered {} (no message id came)",
                 chunk.idx + 1,
                 at.format("%H:%M")
             ),
-            (None, _) => format!("\n  часть {}: не доставлена", chunk.idx + 1),
+            (None, _) => format!("\n  part {}: not delivered", chunk.idx + 1),
         });
     }
 
     let channels = runner.db.channels().await?;
     let broken: Vec<&Channel> = channels.iter().filter(|c| c.last_error.is_some()).collect();
     if !broken.is_empty() {
-        out.push_str("\n\nканалы с ошибками:");
+        out.push_str("\n\nchannels with errors:");
         for channel in broken {
             out.push_str(&format!(
                 "\n{} — {}",
@@ -285,16 +285,16 @@ async fn status(runner: &Arc<Runner>) -> Result<String> {
 
 async fn sync(runner: &Arc<Runner>) -> Result<String> {
     if runner.cfg.telegram.folder.is_none() {
-        return Ok("папка не настроена (telegram.folder), каналами управляют /add и /rm".into());
+        return Ok("no folder is set (telegram.folder), /add and /rm manage channels".into());
     }
     let Some(report) = runner.sync_folder().await? else {
-        return Ok("папку прочитать не удалось, подробности в логе".into());
+        return Ok("could not read the folder, details are in the log".into());
     };
     if let Some(refused) = report.refused {
         return Ok(refused);
     }
     Ok(format!(
-        "в папке каналов: {}\nдобавлено: {}\nвыключено: {}",
+        "channels in the folder: {}\nadded: {}\ndisabled: {}",
         report.total,
         or_dash(&report.added),
         or_dash(&report.disabled)
@@ -303,15 +303,15 @@ async fn sync(runner: &Arc<Runner>) -> Result<String> {
 
 async fn add(runner: &Arc<Runner>, arg: &str) -> Result<String> {
     if arg.is_empty() {
-        return Ok("нужен канал: /add @name, /add https://t.me/+инвайт или /add id".into());
+        return Ok("a channel is needed: /add @name, /add https://t.me/+invite or /add id".into());
     }
 
     let peer = resolve_new_channel(runner, arg).await?;
     let (username, title) = folder::describe(&runner.client, peer).await?;
 
     match runner.cfg.telegram.folder.as_deref() {
-        // Единый источник правды — папка: правим её, иначе следующий sync
-        // откатит правку.
+        // The folder is the single source of truth: we edit it, or the next sync
+        // undoes the edit.
         Some(name) => match folder::find(&runner.client, name).await? {
             folder::Lookup::Found(f) => {
                 folder::add_peer(&runner.client, &f, peer).await?;
@@ -319,7 +319,9 @@ async fn add(runner: &Arc<Runner>, arg: &str) -> Result<String> {
             }
             folder::Lookup::Invalid(reason) => return Ok(reason),
             folder::Lookup::Missing => {
-                return Ok(format!("папки {name:?} в аккаунте нет — создайте её"))
+                return Ok(format!(
+                    "there is no folder {name:?} in the account — create it"
+                ))
             }
         },
         None => {
@@ -330,15 +332,17 @@ async fn add(runner: &Arc<Runner>, arg: &str) -> Result<String> {
         }
     }
 
-    Ok(format!("добавлен: {title}, id {}", peer.id))
+    Ok(format!("added: {title}, id {}", peer.id))
 }
 
 async fn remove(runner: &Arc<Runner>, arg: &str) -> Result<String> {
     if arg.is_empty() {
-        return Ok("нужен канал: /rm @name или /rm id".into());
+        return Ok("a channel is needed: /rm @name or /rm id".into());
     }
     let Some(channel) = runner.db.find_channel(arg).await? else {
-        return Ok(format!("канала {arg} в базе нет, /list покажет список"));
+        return Ok(format!(
+            "channel {arg} is not in the database, /list shows the list"
+        ));
     };
 
     match runner.cfg.telegram.folder.as_deref() {
@@ -348,32 +352,36 @@ async fn remove(runner: &Arc<Runner>, arg: &str) -> Result<String> {
                 folder::sync(&runner.client, &runner.db, name).await?;
             }
             folder::Lookup::Invalid(reason) => return Ok(reason),
-            folder::Lookup::Missing => return Ok(format!("папки {name:?} в аккаунте нет")),
+            folder::Lookup::Missing => {
+                return Ok(format!("there is no folder {name:?} in the account"))
+            }
         },
         None => {
             runner.db.disable_channel(channel.id).await?;
         }
     }
 
-    Ok(format!("выключен: {}, id {}", channel.title, channel.id))
+    Ok(format!("disabled: {}, id {}", channel.title, channel.id))
 }
 
 async fn reset(runner: &Arc<Runner>, arg: &str) -> Result<String> {
     let Some(channel) = runner.db.find_channel(arg).await? else {
-        return Ok(format!("канала {arg} в базе нет, /list покажет список"));
+        return Ok(format!(
+            "channel {arg} is not in the database, /list shows the list"
+        ));
     };
     runner.db.reset_channel(channel.id).await?;
     Ok(format!(
-        "{}: курсор сброшен, следующий прогон прочитает окно в {} ч",
+        "{}: cursor reset, the next run reads a window of {} h",
         channel.title, runner.cfg.telegram.lookback_hours
     ))
 }
 
-/// Осознанный повтор, а не восстановление: части уходят в **текущий**
-/// `destination` и с новыми `random_id`.
+/// A deliberate repeat, not a recovery: the parts go to the **current**
+/// `destination` and with new `random_id`.
 async fn last(runner: &Arc<Runner>) -> Result<String> {
     let Some(run) = runner.db.last_ok_run().await? else {
-        return Ok("опубликованных дайджестов ещё не было".into());
+        return Ok("there were no published digests yet".into());
     };
     let chunks: Vec<String> = runner
         .db
@@ -383,7 +391,7 @@ async fn last(runner: &Arc<Runner>) -> Result<String> {
         .map(|c| c.html)
         .collect();
     if chunks.is_empty() {
-        return Ok(format!("у прогона #{} нет сохранённых частей", run.id));
+        return Ok(format!("run #{} has no saved parts", run.id));
     }
 
     let dest =
@@ -397,19 +405,19 @@ async fn last(runner: &Arc<Runner>) -> Result<String> {
     .await?;
 
     Ok(format!(
-        "прогон #{} отправлен заново в {} ({} частей)",
+        "run #{} sent again to {} ({} parts)",
         run.id,
         runner.cfg.telegram.destination,
         chunks.len()
     ))
 }
 
-/// `@username`, инвайт-ссылка или числовой id.
+/// `@username`, an invite link or a numeric id.
 async fn resolve_new_channel(runner: &Arc<Runner>, arg: &str) -> Result<folder::ChannelPeer> {
     let client = &runner.client;
 
-    // Числовой id — особый случай: access_hash взять неоткуда, а без него
-    // Telegram на id не отвечает. Смотрим базу, потом диалоги.
+    // A numeric id is a special case: there is nowhere to take access_hash from, and
+    // without it Telegram does not answer by id. We look in the database, then in the dialogs.
     if let Ok(id) = arg.parse::<i64>() {
         let id = crate::db::bare_channel_id(id);
         let known = runner
@@ -423,7 +431,7 @@ async fn resolve_new_channel(runner: &Arc<Runner>, arg: &str) -> Result<folder::
         return match known {
             Some(peer) => Ok(peer),
             None => folder::find_in_dialogs(client, id).await?.with_context(|| {
-                format!("канала id {id} нет среди диалогов — аккаунт на него подписан?")
+                format!("channel id {id} is not among the dialogs — does the account follow it?")
             }),
         };
     }
@@ -432,43 +440,40 @@ async fn resolve_new_channel(runner: &Arc<Runner>, arg: &str) -> Result<folder::
         client
             .accept_invite_link(arg)
             .await
-            .with_context(|| format!("не удалось присоединиться по ссылке {arg}"))?
-            .context("по ссылке не вернулся чат")?
+            .with_context(|| format!("could not join by the link {arg}"))?
+            .context("the link did not return a chat")?
     } else {
         client
             .resolve_username(arg.trim_start_matches('@'))
             .await
-            .with_context(|| format!("не удалось разрешить {arg}"))?
-            .with_context(|| format!("канал {arg} не найден"))?
+            .with_context(|| format!("could not resolve {arg}"))?
+            .with_context(|| format!("channel {arg} not found"))?
     };
 
-    // По username и по инвайту приходит что угодно: пользователь, бот, группа.
-    // Дайджест умеет читать только каналы, и `post_url` тоже рассчитан на них.
+    // A username or an invite can give anything: a user, a bot, a group.
+    // The digest can read only channels, and `post_url` is also made for them.
     if !matches!(peer, Peer::Channel(_)) {
-        bail!("{arg} — это {}, а не канал", peer_kind(&peer));
+        bail!("{arg} is a {}, not a channel", peer_kind(&peer));
     }
 
     let reference = peer
         .to_ref()
         .await
-        .map_err(|e| anyhow::anyhow!("канал недоступен: {e}"))?
-        .context("канал недоступен")?;
+        .map_err(|e| anyhow::anyhow!("channel is not available: {e}"))?
+        .context("channel is not available")?;
 
     Ok(folder::ChannelPeer {
-        id: reference
-            .id
-            .bare_id()
-            .context("у канала нет идентификатора")?,
+        id: reference.id.bare_id().context("the channel has no id")?,
         access_hash: reference.auth.hash(),
     })
 }
 
 fn peer_kind(peer: &Peer) -> &'static str {
     match peer {
-        Peer::User(user) if user.is_bot() => "бот",
-        Peer::User(_) => "пользователь",
-        Peer::Group(_) => "группа",
-        Peer::Channel(_) => "канал",
+        Peer::User(user) if user.is_bot() => "bot",
+        Peer::User(_) => "user",
+        Peer::Group(_) => "group",
+        Peer::Channel(_) => "channel",
     }
 }
 
@@ -516,7 +521,7 @@ mod tests {
             "/last",
         ] {
             let reply = handle(&runner, command).await.unwrap();
-            assert!(reply.contains("идёт прогон"), "{command}: {reply}");
+            assert!(reply.contains("is going"), "{command}: {reply}");
         }
         assert!(handle(&runner, "/list").await.is_ok());
         assert!(handle(&runner, "/status").await.is_ok());
@@ -548,12 +553,12 @@ mod tests {
         assert!(handle(&runner, "/reset 1")
             .await
             .unwrap()
-            .contains("недоставленный"));
+            .contains("undelivered"));
         handle(&runner, &format!("/abandon {id}")).await.unwrap();
         assert!(handle(&runner, "/reset 1")
             .await
             .unwrap()
-            .contains("курсор сброшен"));
+            .contains("cursor reset"));
         assert!(runner.db.unfinished_run().await.unwrap().is_none());
         assert_eq!(runner.db.channel(1).await.unwrap().unwrap().last_msg_id, 0);
     }

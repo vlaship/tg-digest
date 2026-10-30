@@ -1,35 +1,35 @@
-//! База: каналы с курсорами, журнал прогонов и журнал доставки частей дайджеста.
+//! Database: channels with cursors, journal of runs and journal of digest part delivery.
 //!
-//! Заменила `state.json`. Причина не в объёме данных, а в том, что состояние
-//! перестало быть одним числом на канал: незавершённый прогон должен пережить
-//! рестарт контейнера вместе с текстом частей и их `random_id`, иначе после
-//! падения посреди публикации восстановить доставку нечем.
+//! It replaced `state.json`. The reason is not the amount of data, but that the state
+//! is no longer one number per channel: an unfinished run must survive a container
+//! restart together with the text of its parts and their `random_id`, or after a
+//! failure in the middle of publishing there is nothing to recover delivery from.
 //!
-//! Правило, ради которого всё это есть: **курсоры каналов двигаются одной
-//! транзакцией с переводом прогона в `ok` или `empty`**. До этого они лежат в
-//! `runs.cursors` и на выборку не влияют — упавшая публикация не «съедает»
-//! посты, которых никто не увидел.
+//! The rule this all exists for: **channel cursors move in one transaction with
+//! the run status change to `ok` or `empty`**. Until then they sit in
+//! `runs.cursors` and do not affect selection — a failed publish does not "eat"
+//! posts that nobody saw.
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use libsql::{params, Connection};
 use std::collections::BTreeMap;
 
-/// Прогон идёт: посты собираются, ответа модели ещё нет.
+/// The run is going: posts are being collected, there is no model answer yet.
 pub const STATUS_COLLECTING: &str = "collecting";
-/// Ответ модели получен, части записаны в журнал, адресат зафиксирован.
+/// The model answer is received, the parts are in the journal, the destination is fixed.
 pub const STATUS_SUMMARIZED: &str = "summarized";
-/// Части отправляются.
+/// The parts are being sent.
 pub const STATUS_PUBLISHING: &str = "publishing";
-/// Дайджест доставлен целиком, курсоры применены.
+/// The digest is fully delivered, the cursors are applied.
 pub const STATUS_OK: &str = "ok";
-/// Публиковать было нечего; посты прочитаны, курсоры применены.
+/// There was nothing to post; the posts are read, the cursors are applied.
 pub const STATUS_EMPTY: &str = "empty";
-/// Прогон не состоялся; курсоры не применены.
+/// The run did not happen; the cursors are not applied.
 pub const STATUS_ERROR: &str = "error";
 
-/// Схема целиком: миграции применяются по порядку, версия хранится в
-/// `schema_version`. Добавлять только в конец списка.
+/// The full schema: migrations are applied in order, the version is stored in
+/// `schema_version`. Add only to the end of the list.
 const MIGRATIONS: &[&str] = &[
     // 1
     "CREATE TABLE channels (
@@ -73,8 +73,8 @@ const MIGRATIONS: &[&str] = &[
     )",
 ];
 
-/// Канал в базе. `id` — «голый» идентификатор канала Telegram (положительный,
-/// без префикса `-100`), как его отдаёт MTProto.
+/// A channel in the database. `id` is the "bare" Telegram channel id (positive,
+/// without the `-100` prefix), as MTProto gives it.
 #[derive(Debug, Clone)]
 pub struct Channel {
     pub id: i64,
@@ -87,7 +87,7 @@ pub struct Channel {
 }
 
 impl Channel {
-    /// Ссылка на пост: у публичных — по username, у приватных — через `/c/`.
+    /// Link to a post: for public channels by username, for private ones through `/c/`.
     pub fn post_url(&self, msg_id: i32) -> String {
         match &self.username {
             Some(name) => format!("https://t.me/{name}/{msg_id}"),
@@ -95,7 +95,7 @@ impl Channel {
         }
     }
 
-    /// Как канал адресуется в командах и логах.
+    /// How the channel is named in commands and logs.
     pub fn label(&self) -> String {
         match &self.username {
             Some(name) => format!("@{name}"),
@@ -125,20 +125,20 @@ pub struct Run {
 }
 
 impl Run {
-    /// Незавершённый прогон блокирует новый сбор: курсоры не сдвинуты, повторный
-    /// сбор дал бы те же посты и второй дайджест.
+    /// An unfinished run blocks a new collection: the cursors have not moved, a second
+    /// collection would give the same posts and a second digest.
     pub fn is_unfinished(&self) -> bool {
         self.status == STATUS_SUMMARIZED || self.status == STATUS_PUBLISHING
     }
 
-    /// От чего считается устаревание: от первой попытки отправки, а если до неё
-    /// не дошло — от начала прогона.
+    /// What the age is counted from: from the first send attempt, or if it did not
+    /// get that far — from the run start.
     pub fn age_reference(&self) -> DateTime<Utc> {
         self.first_send_at.unwrap_or(self.started_at)
     }
 
-    /// Разрешённый на момент `summarized` адресат. Восстановление шлёт сюда,
-    /// а не в то, что сейчас в конфиге.
+    /// The destination resolved at `summarized` time. Recovery sends here,
+    /// not to what is in the config now.
     pub fn destination(&self) -> Option<Destination> {
         Some(Destination {
             peer_id: self.dest_peer_id?,
@@ -156,18 +156,18 @@ pub struct Chunk {
     pub sent_msg_id: Option<i64>,
 }
 
-/// Куда ушёл (или уйдёт) дайджест. Резолвится один раз, при записи частей.
-/// `peer_id` — Bot API dialog id, чтобы тип пира восстанавливался однозначно.
+/// Where the digest went (or will go). Resolved once, when the parts are written.
+/// `peer_id` is a Bot API dialog id, so the peer type is restored without doubt.
 #[derive(Debug, Clone, Copy)]
 pub struct Destination {
     pub peer_id: i64,
     pub access_hash: i64,
 }
 
-/// Одно соединение на процесс. Пишут в базу только прогон и команды, а они
-/// ходят под одной блокировкой (`run::Runner`), поэтому две транзакции никогда
-/// не пересекаются; читающие команды (`/list`, `/status`) идут без блокировки,
-/// и для них этого достаточно.
+/// One connection per process. Only the run and the commands write to the database,
+/// and they work under one lock (`run::Runner`), so two transactions never
+/// overlap; read-only commands (`/list`, `/status`) go without the lock,
+/// and that is enough for them.
 pub struct Db {
     conn: Connection,
 }
@@ -177,12 +177,12 @@ impl Db {
         let conn = libsql::Builder::new_local(path)
             .build()
             .await
-            .with_context(|| format!("не удалось открыть базу {path}"))?
+            .with_context(|| format!("could not open the database {path}"))?
             .connect()
-            .with_context(|| format!("не удалось подключиться к базе {path}"))?;
+            .with_context(|| format!("could not connect to the database {path}"))?;
 
         let db = Self { conn };
-        db.migrate().await.context("миграция базы не удалась")?;
+        db.migrate().await.context("database migration failed")?;
         Ok(db)
     }
 
@@ -219,7 +219,7 @@ impl Db {
         for (index, sql) in MIGRATIONS.iter().enumerate().skip(current as usize) {
             tx.execute(sql, params![])
                 .await
-                .with_context(|| format!("миграция #{} не применилась", index + 1))?;
+                .with_context(|| format!("migration #{} was not applied", index + 1))?;
         }
         tx.execute(
             "UPDATE schema_version SET version = ?1",
@@ -231,12 +231,12 @@ impl Db {
         tracing::info!(
             from = current,
             to = MIGRATIONS.len(),
-            "схема базы обновлена"
+            "database schema updated"
         );
         Ok(())
     }
 
-    // ----------------------------------------------------------------- каналы
+    // --------------------------------------------------------------- channels
 
     /// Debug commands may sync folders, but must not reset daemon cursors.
     pub async fn preview_copy(&self) -> Result<Self> {
@@ -291,9 +291,9 @@ impl Db {
         Ok(collect_channels(rows).await?.pop())
     }
 
-    /// Канал из папки. Возвращает `true`, если курсор был сброшен: канал новый
-    /// или вернулся из выключенных (иначе канал, выключенный на месяц, при
-    /// возврате принесёт месяц постов).
+    /// A channel from the folder. Returns `true` if the cursor was reset: the channel is
+    /// new or came back from the disabled ones (otherwise a channel disabled for a month
+    /// would bring a month of posts when it comes back).
     pub async fn upsert_channel(
         &self,
         id: i64,
@@ -340,8 +340,8 @@ impl Db {
         }
     }
 
-    /// Каналов, которых нет в папке, не удаляем — выключаем: `/list` продолжает
-    /// показывать их вместе с последней ошибкой.
+    /// Channels that are not in the folder are not deleted but disabled: `/list` still
+    /// shows them together with the last error.
     pub async fn disable_channels_except(&self, keep: &[i64]) -> Result<Vec<Channel>> {
         let mut disabled = Vec::new();
         for channel in self.enabled_channels().await? {
@@ -368,11 +368,11 @@ impl Db {
         Ok(())
     }
 
-    /// Обновить только название и username.
+    /// Update only the title and the username.
     ///
-    /// Отдельно от `upsert_channel`, потому что тот трактует канал как
-    /// пришедший из папки и может сбросить курсор: обновление имён к составу
-    /// каналов отношения не имеет.
+    /// Separate from `upsert_channel`, because that one treats the channel as
+    /// coming from the folder and may reset the cursor: updating names has nothing
+    /// to do with the channel list.
     pub async fn update_channel_names(
         &self,
         id: i64,
@@ -388,7 +388,7 @@ impl Db {
         Ok(())
     }
 
-    /// Выключить канал вручную (`/rm` без папки).
+    /// Disable a channel by hand (`/rm` without a folder).
     pub async fn disable_channel(&self, id: i64) -> Result<bool> {
         let affected = self
             .conn
@@ -397,7 +397,7 @@ impl Db {
         Ok(affected > 0)
     }
 
-    /// `/reset`: перечитать канал с окна `lookback_hours`.
+    /// `/reset`: read the channel again from the `lookback_hours` window.
     pub async fn reset_channel(&self, id: i64) -> Result<bool> {
         let affected = self
             .conn
@@ -409,8 +409,8 @@ impl Db {
         Ok(affected > 0)
     }
 
-    /// Канал по `@username` или по числовому id — у приватных username нет.
-    /// Принимаем и `-100…`-форму: её показывают клиенты Telegram.
+    /// A channel by `@username` or by numeric id — private channels have no username.
+    /// We also accept the `-100…` form: Telegram clients show it.
     pub async fn find_channel(&self, key: &str) -> Result<Option<Channel>> {
         let key = key.trim();
         if let Ok(id) = key.parse::<i64>() {
@@ -425,7 +425,7 @@ impl Db {
         }))
     }
 
-    // ---------------------------------------------------------------- прогоны
+    // ------------------------------------------------------------------- runs
 
     pub async fn start_run(&self, trigger: &str) -> Result<i64> {
         self.conn
@@ -437,7 +437,7 @@ impl Db {
         Ok(self.conn.last_insert_rowid())
     }
 
-    /// Прогон, который блокирует новый сбор (`summarized` или `publishing`).
+    /// The run that blocks a new collection (`summarized` or `publishing`).
     pub async fn unfinished_run(&self) -> Result<Option<Run>> {
         self.query_run(
             "SELECT * FROM runs WHERE status IN ('summarized','publishing') ORDER BY id LIMIT 1",
@@ -456,9 +456,9 @@ impl Db {
             .await
     }
 
-    /// Последний прогон, дошедший до конца: от него планировщик считает догон.
-    /// Пустой прогон — тоже успешный, иначе после тихого дня каждый рестарт
-    /// гонял бы догон заново.
+    /// The last run that reached the end: the scheduler counts catch-up from it.
+    /// An empty run is also successful, or after a quiet day every restart
+    /// would run the catch-up again.
     pub async fn last_finished_run(&self) -> Result<Option<Run>> {
         self.query_run(
             "SELECT * FROM runs WHERE status IN ('ok','empty') ORDER BY started_at DESC LIMIT 1",
@@ -467,7 +467,7 @@ impl Db {
         .await
     }
 
-    /// Последний опубликованный дайджест — для `/last`.
+    /// The last published digest — for `/last`.
     pub async fn last_ok_run(&self) -> Result<Option<Run>> {
         self.query_run(
             "SELECT * FROM runs WHERE status = 'ok' ORDER BY id DESC LIMIT 1",
@@ -488,7 +488,7 @@ impl Db {
         Ok(Some(row_to_run(&row)?))
     }
 
-    /// Прогон, прерванный до ответа модели: ничего не записано, курсоры целы.
+    /// A run stopped before the model answer: nothing is saved, the cursors are safe.
     pub async fn fail_run(&self, id: i64, error: &str) -> Result<()> {
         self.conn
             .execute(
@@ -499,9 +499,9 @@ impl Db {
         Ok(())
     }
 
-    /// Ответ модели получен. Одной транзакцией: статус, метрики, курсоры,
-    /// разрешённый адресат и все части с `random_id`. С этого момента ни
-    /// дайджест, ни адресат не пересчитываются.
+    /// The model answer is received. In one transaction: status, metrics, cursors,
+    /// the resolved destination and all parts with `random_id`. From this moment
+    /// neither the digest nor the destination is calculated again.
     #[allow(clippy::too_many_arguments)]
     pub async fn save_summary(
         &self,
@@ -547,7 +547,7 @@ impl Db {
         Ok(())
     }
 
-    /// Курсоры пустого прогона: публиковать нечего, но посты прочитаны.
+    /// Cursors of an empty run: there is nothing to post, but the posts are read.
     pub async fn save_empty_cursors(
         &self,
         run_id: i64,
@@ -581,8 +581,8 @@ impl Db {
         Ok(())
     }
 
-    /// Время первой попытки отправки: от него считается устаревание, поэтому
-    /// пишется ровно один раз.
+    /// Time of the first send attempt: the age is counted from it, so it is
+    /// written exactly once.
     pub async fn mark_first_send(&self, run_id: i64) -> Result<()> {
         self.conn
             .execute(
@@ -627,8 +627,8 @@ impl Db {
         Ok(out)
     }
 
-    /// Критерий завершения — именно `delivered_at`, а не `sent_msg_id`:
-    /// для части пиров Telegram id отправленного сообщения не возвращает.
+    /// The completion rule is `delivered_at`, not `sent_msg_id`:
+    /// for some peers Telegram does not return the id of the sent message.
     pub async fn mark_delivered(
         &self,
         run_id: i64,
@@ -650,12 +650,12 @@ impl Db {
         Ok(())
     }
 
-    /// Финал прогона: статус и курсоры — одной транзакцией.
+    /// End of the run: status and cursors in one transaction.
     pub async fn complete_run(&self, run_id: i64, status: &str) -> Result<()> {
         let run = self
             .run(run_id)
             .await?
-            .with_context(|| format!("прогон #{run_id} исчез из базы"))?;
+            .with_context(|| format!("run #{run_id} disappeared from the database"))?;
 
         let tx = self.conn.transaction().await?;
         tx.execute(
@@ -664,8 +664,8 @@ impl Db {
         )
         .await?;
 
-        // Курсор двигаем только вперёд: ручной прогон за старый период не должен
-        // откатывать канал назад и приносить дубли в следующем дайджесте.
+        // We move the cursor only forward: a manual run for an old period must not
+        // move the channel back and bring duplicates into the next digest.
         for (channel_id, msg_id) in &run.cursors {
             tx.execute(
                 "UPDATE channels SET last_msg_id = MAX(last_msg_id, ?2) WHERE id = ?1",
@@ -675,12 +675,12 @@ impl Db {
         }
         tx.commit().await?;
 
-        tracing::info!(run = run_id, %status, channels = run.cursors.len(), "курсоры применены");
+        tracing::info!(run = run_id, %status, channels = run.cursors.len(), "cursors applied");
         Ok(())
     }
 
-    /// `/abandon`: снять блокировку, курсоры **не** применять — доставленные
-    /// части остаются в чате, посты войдут в следующий дайджест.
+    /// `/abandon`: release the lock, do **not** apply the cursors — the delivered
+    /// parts stay in the chat, the posts go into the next digest.
     pub async fn abandon_run(&self, run_id: i64) -> Result<()> {
         self.conn
             .execute(
@@ -691,8 +691,8 @@ impl Db {
         Ok(())
     }
 
-    /// Прогоны, оборвавшиеся на сборе (упали до ответа модели): ничего не
-    /// записано, ничего не блокируют, но висеть в `collecting` они не должны.
+    /// Runs that stopped during collection (failed before the model answer): nothing is
+    /// saved, they block nothing, but they must not stay in `collecting`.
     pub async fn close_interrupted_runs(&self) -> Result<usize> {
         let affected = self
             .conn
@@ -706,8 +706,8 @@ impl Db {
     }
 }
 
-/// `-1001234567890` из клиента Telegram и `1234567890` из MTProto — один и тот
-/// же канал.
+/// `-1001234567890` from a Telegram client and `1234567890` from MTProto are the
+/// same channel.
 pub fn bare_channel_id(id: i64) -> i64 {
     if id <= -1_000_000_000_000 {
         -id - 1_000_000_000_000
@@ -732,7 +732,7 @@ async fn collect_channels(mut rows: libsql::Rows) -> Result<Vec<Channel>> {
     Ok(out)
 }
 
-/// `SELECT *` по `runs` — порядок столбцов задан миграцией #2.
+/// `SELECT *` on `runs` — the column order is set by migration #2.
 fn row_to_run(row: &libsql::Row) -> Result<Run> {
     let cursors: Option<String> = row.get(10)?;
     Ok(Run {
@@ -747,7 +747,9 @@ fn row_to_run(row: &libsql::Row) -> Result<Run> {
         output_tokens: row.get(8)?,
         error: row.get(9)?,
         cursors: match cursors {
-            Some(raw) => serde_json::from_str(&raw).context("повреждены курсоры прогона в базе")?,
+            Some(raw) => {
+                serde_json::from_str(&raw).context("run cursors in the database are damaged")?
+            }
             None => BTreeMap::new(),
         },
         first_send_at: parse_time(row.get::<Option<String>>(11)?)?,
@@ -763,7 +765,7 @@ fn parse_time(raw: Option<String>) -> Result<Option<DateTime<Utc>>> {
         None => Ok(None),
         Some(s) => Ok(Some(
             DateTime::parse_from_rfc3339(&s)
-                .with_context(|| format!("не удалось разобрать время {s:?} из базы"))?
+                .with_context(|| format!("could not parse the time {s:?} from the database"))?
                 .with_timezone(&Utc),
         )),
     }
@@ -870,7 +872,7 @@ mod tests {
         assert!(channel.enabled);
         assert_eq!(
             channel.last_msg_id, 0,
-            "вернувшийся канал читаем с окна, а не с месяца назад"
+            "a returning channel is read from the window, not from a month ago"
         );
     }
 
@@ -912,11 +914,11 @@ mod tests {
         assert_eq!(
             db.channel(1).await.unwrap().unwrap().last_msg_id,
             0,
-            "до публикации курсор стоит на месте"
+            "before publishing the cursor stays in place"
         );
         assert!(
             db.unfinished_run().await.unwrap().is_some(),
-            "прогон блокирует новый сбор"
+            "the run blocks a new collection"
         );
 
         db.complete_run(run, STATUS_OK).await.unwrap();
@@ -1012,18 +1014,21 @@ mod tests {
     #[tokio::test]
     async fn renaming_a_channel_touches_neither_cursor_nor_enabled() {
         let db = memory_db().await;
-        db.upsert_channel(1, 7, Some("old"), "Старое имя")
+        db.upsert_channel(1, 7, Some("old"), "Old name")
             .await
             .unwrap();
         set_cursor(&db, 1, 500).await;
 
-        // Канал ушёл в приватные: username исчезает, ссылки станут /c/…
-        db.update_channel_names(1, None, "Новое имя").await.unwrap();
+        // The channel became private: the username is gone, links become /c/…
+        db.update_channel_names(1, None, "New name").await.unwrap();
 
         let channel = db.channel(1).await.unwrap().unwrap();
-        assert_eq!(channel.title, "Новое имя");
+        assert_eq!(channel.title, "New name");
         assert_eq!(channel.username, None);
-        assert_eq!(channel.last_msg_id, 500, "переименование не трогает курсор");
+        assert_eq!(
+            channel.last_msg_id, 500,
+            "renaming does not touch the cursor"
+        );
         assert!(channel.enabled);
         assert_eq!(channel.post_url(3), "https://t.me/c/1/3");
     }
@@ -1041,7 +1046,7 @@ mod tests {
         let db = memory_db().await;
         let run = db.start_run("cron").await.unwrap();
 
-        // На сборе прогон ничего не записал и никого не блокирует.
+        // During collection the run saved nothing and blocks nobody.
         assert!(!db.run(run).await.unwrap().unwrap().is_unfinished());
 
         db.save_summary(
@@ -1070,7 +1075,7 @@ mod tests {
         let db = memory_db().await;
         let run_id = db.start_run("cron").await.unwrap();
 
-        // Упали между `summarized` и первой отправкой — возраст считаем от старта.
+        // Failed between `summarized` and the first send — the age is counted from the start.
         let run = db.run(run_id).await.unwrap().unwrap();
         assert_eq!(run.age_reference(), run.started_at);
 

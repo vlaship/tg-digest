@@ -1,6 +1,6 @@
-//! Работа с Telegram через MTProto (личный аккаунт).
+//! Work with Telegram through MTProto (personal account).
 //!
-//! Bot API здесь не подходит: бот читает только те каналы, где он админ.
+//! The Bot API does not fit here: a bot reads only channels where it is an admin.
 
 pub mod client;
 pub mod commands;
@@ -10,14 +10,14 @@ pub mod publish;
 use grammers_client::client::Client;
 use grammers_client::message::InputMessage;
 
-/// Короткое уведомление владельцу в «Избранное».
+/// A short notification to the owner in Saved Messages.
 ///
-/// Клиент Telegram уже есть, поэтому это самый дешёвый мониторинг из возможных:
-/// иначе про упавший ночной прогон узнаём через неделю из логов. Само
-/// уведомление не должно ронять прогон — ошибки только в лог.
+/// We already have a Telegram client, so this is the cheapest monitoring possible:
+/// otherwise we learn about a failed night run from the logs a week later. The
+/// notification itself must not break the run — errors go only to the log.
 pub async fn notify(client: &Client, text: &str) {
     if let Err(e) = try_notify(client, text).await {
-        tracing::warn!(error = %e, %text, "не удалось отправить уведомление в Избранное");
+        tracing::warn!(error = %e, %text, "could not send a notification to Saved Messages");
     }
 }
 
@@ -27,10 +27,10 @@ async fn try_notify(client: &Client, text: &str) -> anyhow::Result<()> {
         .to_ref()
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?
-        .ok_or_else(|| anyhow::anyhow!("свой профиль недоступен"))?;
+        .ok_or_else(|| anyhow::anyhow!("own profile is not available"))?;
 
-    // Текст ошибки бывает длиннее лимита сообщения, а Telegram такое отвергает:
-    // уведомление о падении не должно теряться из-за собственного размера.
+    // An error text can be longer than the message limit, and Telegram rejects that:
+    // a failure notification must not get lost because of its own size.
     for piece in crate::digest::split_plain(text) {
         client
             .send_message(peer, InputMessage::new().text(piece).link_preview(false))

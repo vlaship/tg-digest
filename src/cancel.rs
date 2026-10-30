@@ -1,10 +1,10 @@
-//! Кооперативная остановка по SIGTERM / Ctrl+C.
+//! Cooperative shutdown on SIGTERM / Ctrl+C.
 //!
-//! Правило: **обрывать можно всё, что не записано; нельзя терять то, что
-//! записано наполовину.** Поэтому верхний уровень не оборачивает прогон в
-//! `select!` — прогон получает токен и сам проверяет его в контрольных точках:
-//! между каналами при сборе, вокруг запроса к модели, между частями при
-//! публикации. Отправку одной части токен не отменяет.
+//! Rule: **anything not yet saved can be stopped; anything half saved must not
+//! be lost.** So the top level does not wrap a run in `select!` — the run gets
+//! a token and checks it itself at checkpoints: between channels while
+//! collecting, around the model request, between parts while publishing.
+//! The token does not cancel sending of one part.
 
 use tokio::sync::watch;
 
@@ -29,11 +29,11 @@ impl CancelSource {
 }
 
 impl Cancel {
-    /// Токен, который никогда не срабатывает: для одноразовых CLI-команд.
+    /// A token that never fires: for one-time CLI commands.
     pub fn never() -> Self {
         let (_tx, rx) = watch::channel(false);
-        // Отправитель уничтожен, но `watch::Receiver` продолжает отдавать
-        // последнее значение — `false`.
+        // The sender is dropped, but `watch::Receiver` keeps returning
+        // the last value — `false`.
         Self { rx }
     }
 
@@ -41,14 +41,14 @@ impl Cancel {
         *self.rx.borrow()
     }
 
-    /// Ждёт сигнала остановки. Если он уже был, возвращается сразу.
+    /// Waits for the shutdown signal. If it already came, returns at once.
     pub async fn cancelled(&self) {
         let mut rx = self.rx.clone();
         if *rx.borrow() {
             return;
         }
-        // Ошибка означает, что отправитель уничтожен: остановки не будет
-        // никогда, и ждать здесь можно вечно — вызов всегда стоит в `select!`.
+        // An error means the sender is dropped: shutdown will never come,
+        // and we can wait here forever — the call is always inside `select!`.
         while rx.changed().await.is_ok() {
             if *rx.borrow() {
                 return;
@@ -57,7 +57,7 @@ impl Cancel {
         std::future::pending::<()>().await
     }
 
-    /// `Err(())`, если во время ожидания пришёл сигнал остановки.
+    /// `Err(())` if the shutdown signal came while waiting.
     pub async fn sleep(&self, duration: std::time::Duration) -> Result<(), ()> {
         tokio::select! {
             _ = self.cancelled() => Err(()),

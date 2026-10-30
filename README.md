@@ -1,42 +1,46 @@
 # tg-digest
 
-Читает список Telegram-каналов, собирает из них дайджест через Claude и постит
-результат обратно в Telegram по расписанию.
+tg-digest reads a list of Telegram channels, makes a digest from them with Claude,
+and posts the digest back to Telegram on a schedule.
 
-- Чтение — MTProto с личного аккаунта (`grammers`), поэтому доступен любой канал,
-  на который вы подписаны, включая приватные по инвайт-ссылке.
-- Суммаризация — Anthropic Messages API. Материалы группируются по темам, и если
-  несколько каналов пишут об одном событии, они сливаются в один пункт со списком
-  источников.
-- Публикация — тот же аккаунт: «Избранное» или ваш канал.
-- Расписание — cron-выражение в конфиге, отдельный планировщик ОС не нужен.
-- Список каналов — папка в Telegram, которую вы собираете руками с телефона.
-  Управление сервисом — команды в «Избранном» (`/run`, `/list`, `/status`).
+- **Reading.** It uses MTProto with your personal account (`grammers`). So it can
+  read any channel you follow, including private channels from an invite link.
+- **Summary.** It uses the Anthropic Messages API. Posts are grouped by topic. If
+  several channels write about the same event, they become one item with a list
+  of sources.
+- **Publishing.** The same account posts the digest: to Saved Messages or to your
+  own channel.
+- **Schedule.** A cron expression in the config. You do not need a separate OS
+  scheduler.
+- **Channel list.** A Telegram folder that you fill by hand on your phone. You
+  control the service with commands in Saved Messages (`/run`, `/list`, `/status`).
 
-## Запуск в Docker (штатный способ)
+## Run in Docker (the normal way)
 
-Всё состояние лежит в одном каталоге-volume: конфиг, сессия, база.
+All state is in one volume folder: the config, the session and the database.
 
 ```powershell
 New-Item -ItemType Directory -Force data | Out-Null
-# Существующий конфиг не трогаем: в нём уже лежат секреты.
+# Do not overwrite an existing config: it already has your secrets.
 if (-not (Test-Path data\config.toml)) { Copy-Item config.example.toml data\config.toml }
 
-docker compose build                          # сначала образ, иначе login уйдёт в старый
-docker compose run --rm -it tg-digest login   # разовый вход: код, при 2FA — пароль
+docker compose build                          # build the image first, or login runs in the old one
+docker compose run --rm -it tg-digest login   # one-time login: the code, and the password if you use 2FA
 docker compose up -d
 docker compose logs -f
 ```
 
-`restart: unless-stopped` поднимает контейнер после перезагрузки; `catch_up = true`
-в конфиге догоняет слот, пропущенный за время простоя.
+`restart: unless-stopped` starts the container again after a reboot.
+`catch_up = true` in the config runs a slot that was missed while the service
+was down.
 
-Остановка (`docker stop`) кооперативная: сбор и запрос к модели прерываются сразу,
-текущая часть дайджеста дописывается, недоставленное добивается после старта.
+Stopping (`docker stop`) is safe. Collecting posts and the model request stop at
+once. The current part of the digest is sent to the end. Anything not delivered
+is sent after the next start.
 
-## Локальная сборка
+## Local build
 
-Нужен Rust с MSVC-линкером:
+You need Rust with the MSVC linker:
 
 ```powershell
 winget install --id Rustlang.Rustup --exact
@@ -44,80 +48,82 @@ winget install --id Microsoft.VisualStudio.2022.BuildTools --exact `
   --override "--quiet --wait --norestart --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"
 ```
 
-Перезапустить терминал, затем:
+Restart the terminal, then:
 
 ```powershell
 cargo build --release
 Copy-Item config.example.toml config.toml
 ```
 
-Пути по умолчанию рассчитаны на контейнер (`/data/...`), поэтому локально нужно
-указывать конфиг явно и поправить в нём `session_file` и `db_file`:
+The default paths are for the container (`/data/...`). When you run locally,
+pass the config file and change `session_file` and `db_file` in it:
 
 ```powershell
-cargo run -- --config config.toml login          # разовый вход
-cargo run -- --config config.toml preview        # сколько постов собралось, без обращения к Claude
-cargo run -- --config config.toml run --dry-run  # дайджест в out/digest.html, без публикации
-cargo run -- --config config.toml serve          # демон: расписание + команды
+cargo run -- --config config.toml login          # one-time login
+cargo run -- --config config.toml preview        # how many posts were collected, no call to Claude
+cargo run -- --config config.toml run --dry-run  # digest in out/digest.html, nothing is posted
+cargo run -- --config config.toml serve          # the daemon: schedule + commands
 ```
 
-Публикующего прогона в CLI нет: публикует только демон — по расписанию или по
-команде `/run`. Иначе два процесса над одной базой выдали бы два дайджеста.
-`preview` и `run --dry-run` используют копию списка каналов в памяти:
-синхронизация папки в этих командах не меняет сохранённые каналы и курсоры.
+The CLI has no run that posts. Only the daemon posts: on the schedule or after
+the `/run` command. Otherwise two processes on one database could post two
+digests. `preview` and `run --dry-run` use a copy of the channel list in memory:
+in these commands the folder sync does not change the saved channels or cursors.
 
-При старте демон проверяет недоставленный дайджест независимо от настроек
-`catch_up` и `run_on_start`: свежий доставляет, для устаревшего ждёт
-`/resume` или `/abandon`. Команды доступны и во время ручного прогона;
-изменения состояния в этот момент отклоняются, без очереди.
+When the daemon starts, it always checks for an undelivered digest, whatever
+`catch_up` and `run_on_start` say. A fresh one is delivered. For an old one it
+waits for `/resume` or `/abandon`. Commands also work during a manual run, but
+commands that change state are refused at that time. They are not queued.
 
-## Настройка
+## Settings
 
-Заполнить в `config.toml`:
+Fill in `config.toml`:
 
-1. `telegram.api_id` / `api_hash` — получить на <https://my.telegram.org>;
-2. `telegram.phone` — номер аккаунта, который подписан на нужные каналы;
+1. `telegram.api_id` / `api_hash` — get them at <https://my.telegram.org>;
+2. `telegram.phone` — the phone number of the account that follows the channels;
 3. `anthropic.api_key`;
-4. `telegram.folder` — имя папки в Telegram со списком каналов.
+4. `telegram.folder` — the name of the Telegram folder with the channel list.
 
-Секреты можно не держать в файле: `TG_API_ID`, `TG_API_HASH`, `TG_PHONE`,
-`ANTHROPIC_API_KEY` перекрывают значения из TOML.
+You do not have to keep secrets in the file: `TG_API_ID`, `TG_API_HASH`,
+`TG_PHONE` and `ANTHROPIC_API_KEY` override the values from the TOML.
 
-### Каналы
+### Channels
 
-Папку собираете руками в приложении Telegram: добавить канал — перетащить в папку,
-убрать — вытащить. Папка с авто-правилами («Каналы», «Непрочитанные») отклоняется:
-её состав вычисляемый, и синхронизация выключила бы все каналы разом.
+You build the folder by hand in the Telegram app. To add a channel, drag it into
+the folder. To remove it, drag it out. A folder with automatic rules ("Channels",
+"Unread") is refused: its content is calculated, and a sync would turn off all
+channels at once.
 
-`[[channels]]` в конфиге — только seed для пустой базы при первом запуске.
+`[[channels]]` in the config is only a seed for an empty database on the first
+start.
 
-## Команды в «Избранном»
+## Commands in Saved Messages
 
-| Команда | Что делает |
+| Command | What it does |
 |---|---|
-| `/add @канал`, `/add t.me/+ссылка`, `/add id` | подписаться и положить в папку |
-| `/rm @канал` · `/rm id` | убрать из папки |
-| `/list` | каналы: id, username, вкл/выкл, курсор, последняя ошибка |
-| `/reset id` | перечитать канал с окна `lookback_hours` |
-| `/run` | прогон сейчас (или доставка недоставленного) |
-| `/status` | последний прогон: статус, посты, темы, токены, части |
-| `/last` | переотправить последний дайджест |
-| `/resume N` · `/abandon N` | доставить или снять недоставленный прогон |
-| `/sync` | перечитать папку |
-| `/help` | список команд |
+| `/add @channel`, `/add t.me/+link`, `/add id` | join the channel and put it in the folder |
+| `/rm @channel` · `/rm id` | remove it from the folder |
+| `/list` | channels: id, username, on/off, cursor, last error |
+| `/reset id` | read the channel again from the `lookback_hours` window |
+| `/run` | run now (or deliver an undelivered digest) |
+| `/status` | last run: status, posts, topics, tokens, parts |
+| `/last` | send the last digest again |
+| `/resume N` · `/abandon N` | deliver or cancel an undelivered run |
+| `/sync` | read the folder again |
+| `/help` | list of commands |
 
-Туда же приходят уведомления: упавший прогон, исключённый канал, папка
-с авто-правилами, недоставленный дайджест.
+Notifications also come there: a failed run, an excluded channel, a folder with
+automatic rules, an undelivered digest.
 
-## Безопасность
+## Security
 
-`tg.session` — полный доступ к вашему аккаунту Telegram. Он, база и `config.toml`
-с ключами лежат в `.gitignore` (каталог `data/`); не коммитить и не копировать
-наружу.
+`tg.session` gives full access to your Telegram account. It, the database and
+`config.toml` with the keys are in `.gitignore` (the `data/` folder). Do not
+commit them and do not copy them anywhere.
 
-## Стоимость
+## Cost
 
-Ориентир: 20 каналов × ~30 постов ≈ 120 тыс. токенов входа, около **$0.6–0.8**
-за прогон на `claude-opus-5` — примерно $20 в месяц при ежедневном запуске.
-Модель и `effort` меняются в конфиге без пересборки, фактический расход виден
-в `/status` и в логах.
+A rough guide: 20 channels × ~30 posts ≈ 120k input tokens, about **$0.6–0.8**
+per run on `claude-opus-5`. That is about $20 a month with one run a day. You can
+change the model and `effort` in the config without a rebuild. The real usage is
+in `/status` and in the logs.

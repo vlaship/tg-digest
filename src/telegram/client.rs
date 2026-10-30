@@ -1,11 +1,11 @@
-//! Подключение, авторизация и выборка постов.
+//! Connection, login and post selection.
 //!
-//! ВНИМАНИЕ: grammers 0.10 переписал схему подключения по сравнению с 0.7–0.9:
-//! теперь сначала создаётся `SenderPool` (session + api_id), его `runner`
-//! крутится отдельной задачей, `Client::new` принимает `handle`, а updates
-//! приходят отдельным приёмником пула. Сессия — SQLite-файл, а не старый
+//! WARNING: grammers 0.10 rewrote the connection scheme compared to 0.7–0.9:
+//! now a `SenderPool` (session + api_id) is created first, its `runner`
+//! is spawned as a separate task, `Client::new` takes `handle`, and updates
+//! come through a separate receiver of the pool. The session is a SQLite file, not the old
 //! `Session::load_file_or_create`.
-//! Сигнатуры сверять с https://docs.rs/grammers-client/0.10.0/
+//! Check signatures at https://docs.rs/grammers-client/0.10.0/
 
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
@@ -25,25 +25,25 @@ use crate::config::Config;
 use crate::db::Channel;
 use crate::digest::Post;
 
-/// Сколько раз повторяем чтение канала после временной ошибки.
+/// How many times we retry reading a channel after a temporary error.
 const MAX_ATTEMPTS: u32 = 4;
-/// FLOOD_WAIT дольше этого не пережидаем: канал исключается из прогона,
-/// курсор не двигается, дайджест собирается по остальным.
+/// We do not wait out a FLOOD_WAIT longer than this: the channel is excluded from the run,
+/// its cursor does not move, the digest is built from the other channels.
 const MAX_FLOOD_WAIT: Duration = Duration::from_secs(600);
 
-/// Клиент вместе с приёмником updates: слушатель команд в «Избранном» берёт
-/// его отсюда, потому что приёмник у пула ровно один.
+/// The client together with the updates receiver: the listener for Saved Messages
+/// commands takes it from here, because the pool has exactly one receiver.
 pub struct Session {
     pub client: Client,
     pub updates: UnboundedReceiver<UpdatesLike>,
 }
 
-/// Подключиться к Telegram, подняв фоновую задачу сетевого пула.
+/// Connect to Telegram and start the background task of the network pool.
 pub async fn connect(cfg: &Config) -> Result<Session> {
     let session = Arc::new(
         SqliteSession::open(&cfg.telegram.session_file)
             .await
-            .with_context(|| format!("не удалось открыть сессию {}", cfg.telegram.session_file))?,
+            .with_context(|| format!("could not open the session {}", cfg.telegram.session_file))?,
     );
 
     let pool = SenderPool::new(session, cfg.telegram.api_id);
@@ -53,7 +53,7 @@ pub async fn connect(cfg: &Config) -> Result<Session> {
         updates,
     } = pool;
 
-    // Пул сам по себе ничего не делает — его надо крутить.
+    // The pool does nothing by itself — it must be run.
     tokio::spawn(runner.run());
 
     Ok(Session {
@@ -62,54 +62,54 @@ pub async fn connect(cfg: &Config) -> Result<Session> {
     })
 }
 
-/// Интерактивный вход: код из Telegram + пароль 2FA, если он включён.
+/// Interactive login: the code from Telegram + the 2FA password if it is on.
 pub async fn login(client: &Client, cfg: &Config) -> Result<()> {
     if client.is_authorized().await? {
-        println!("Уже авторизованы, повторный вход не нужен.");
+        println!("Already logged in, no need to log in again.");
         return Ok(());
     }
 
     let phone = &cfg.telegram.phone;
-    println!("Запрашиваем код для {phone}…");
+    println!("Requesting a code for {phone}…");
 
     let token = client
         .request_login_code(phone, &cfg.telegram.api_hash)
         .await
-        .context("не удалось запросить код входа")?;
+        .context("could not request a login code")?;
 
-    let code = prompt("Код из Telegram: ")?;
+    let code = prompt("Code from Telegram: ")?;
 
     match client.sign_in(&token, code.trim()).await {
         Ok(user) => {
-            println!("Готово, вошли как {}", user.id());
+            println!("Done, logged in as {}", user.id());
             Ok(())
         }
-        // Без этой ветки аккаунты с двухфакторной авторизацией не залогинятся.
+        // Without this branch accounts with two-factor authentication cannot log in.
         Err(SignInError::PasswordRequired(password_token)) => {
-            let password = rpassword::prompt_password("Пароль 2FA: ")
-                .context("не удалось прочитать пароль")?;
+            let password = rpassword::prompt_password("2FA password: ")
+                .context("could not read the password")?;
             let user = client
                 .check_password(password_token, password.trim())
                 .await
-                .context("неверный пароль 2FA")?;
-            println!("Готово, вошли как {}", user.id());
+                .context("wrong 2FA password")?;
+            println!("Done, logged in as {}", user.id());
             Ok(())
         }
-        Err(e) => Err(anyhow!("вход не удался: {e}")),
+        Err(e) => Err(anyhow!("login failed: {e}")),
     }
 }
 
 pub async fn ensure_authorized(client: &Client) -> Result<()> {
     if !client.is_authorized().await? {
-        bail!("нет авторизации в Telegram — выполните `tg-digest login`");
+        bail!("not logged in to Telegram — run `tg-digest login`");
     }
     Ok(())
 }
 
-/// Сессия отозвана («Завершить все другие сеансы», удалённый аккаунт).
+/// The session is revoked ("Terminate all other sessions", a deleted account).
 ///
-/// Это не «ошибка одного прогона»: пережидать её бессмысленно, поэтому демон
-/// на такой ошибке выходит с ненулевым кодом и просит выполнить `login`.
+/// This is not "an error of one run": there is no point in waiting it out, so the daemon
+/// exits with a non-zero code on this error and asks to run `login`.
 pub fn is_auth_error(error: &InvocationError) -> bool {
     const FATAL: [&str; 5] = [
         "AUTH_KEY_UNREGISTERED",
@@ -121,8 +121,8 @@ pub fn is_auth_error(error: &InvocationError) -> bool {
     matches!(error, InvocationError::Rpc(rpc) if FATAL.iter().any(|name| rpc.is(name)))
 }
 
-/// То же самое, но для ошибки, уже завёрнутой в `anyhow`: прогон таких не
-/// переживает, демон обязан выйти.
+/// The same, but for an error already wrapped in `anyhow`: a run does not survive
+/// such errors, the daemon must exit.
 pub fn is_fatal(error: &anyhow::Error) -> bool {
     error.chain().any(|e| {
         e.downcast_ref::<InvocationError>()
@@ -130,7 +130,7 @@ pub fn is_fatal(error: &anyhow::Error) -> bool {
     })
 }
 
-/// Сколько просит подождать FLOOD_WAIT, если это он.
+/// How long FLOOD_WAIT asks to wait, if this is FLOOD_WAIT.
 pub fn flood_wait(error: &InvocationError) -> Option<Duration> {
     match error {
         InvocationError::Rpc(rpc) if rpc.is("FLOOD_WAIT") || rpc.is("FLOOD_PREMIUM_WAIT") => {
@@ -142,28 +142,28 @@ pub fn flood_wait(error: &InvocationError) -> Option<Duration> {
 
 pub fn peer_ref(id: i64, access_hash: i64) -> Result<PeerRef> {
     let peer_id =
-        PeerId::channel(id).ok_or_else(|| anyhow!("{id} не похож на идентификатор канала"))?;
+        PeerId::channel(id).ok_or_else(|| anyhow!("{id} does not look like a channel id"))?;
     Ok(PeerRef {
         id: peer_id,
         auth: PeerAuth::from_hash(access_hash),
     })
 }
 
-/// Результат сбора по всем каналам.
+/// The result of collecting from all channels.
 pub struct Collected {
     pub posts: Vec<Post>,
-    /// Курсоры **успешно прочитанных** каналов: максимальный id, который видели,
-    /// независимо от фильтра по длине и склейки альбомов.
+    /// Cursors of **successfully read** channels: the highest id we saw,
+    /// regardless of the length filter and album merging.
     pub cursors: BTreeMap<i64, i32>,
-    /// Каналы, исключённые из прогона, и причина. Курсор у них не двигается.
+    /// Channels excluded from the run, and the reason. Their cursor does not move.
     pub failures: Vec<(Channel, String)>,
 }
 
-/// Собрать посты включённых каналов.
+/// Collect posts of the enabled channels.
 ///
-/// Граница — курсор канала, а не глобальное время: канал, который три дня
-/// падал, при восстановлении отдаст все три дня. Дата участвует только при
-/// курсоре 0 (новый или сброшенный канал).
+/// The limit is the channel cursor, not a global time: a channel that failed for three
+/// days gives all three days when it works again. The date matters only when
+/// the cursor is 0 (a new or reset channel).
 pub async fn collect_posts(
     client: &Client,
     cfg: &Config,
@@ -181,12 +181,12 @@ pub async fn collect_posts(
 
     for (index, channel) in channels.iter().enumerate() {
         if cancel.is_cancelled() {
-            bail!("сбор остановлен сигналом");
+            bail!("collection stopped by signal");
         }
         if index > 0 {
-            // Пауза между каналами — самая дешёвая защита от FLOOD_WAIT.
+            // A pause between channels is the cheapest protection from FLOOD_WAIT.
             if cancel.sleep(pause).await.is_err() {
-                bail!("сбор остановлен сигналом");
+                bail!("collection stopped by signal");
             }
         }
 
@@ -196,7 +196,7 @@ pub async fn collect_posts(
                     channel = %channel.label(),
                     count = batch.posts.len(),
                     cursor = batch.max_id_seen,
-                    "собрано постов"
+                    "posts collected"
                 );
                 if batch.max_id_seen > 0 {
                     collected.cursors.insert(channel.id, batch.max_id_seen);
@@ -213,10 +213,10 @@ pub async fn collect_posts(
                         text: p.text,
                     }));
             }
-            Err(ChannelError::Cancelled) => bail!("сбор остановлен сигналом"),
-            Err(ChannelError::Auth(e)) => return Err(e).context("сессия Telegram недействительна"),
+            Err(ChannelError::Cancelled) => bail!("collection stopped by signal"),
+            Err(ChannelError::Auth(e)) => return Err(e).context("Telegram session is not valid"),
             Err(ChannelError::Excluded(reason)) => {
-                tracing::warn!(channel = %channel.label(), %reason, "канал исключён из прогона");
+                tracing::warn!(channel = %channel.label(), %reason, "channel excluded from the run");
                 collected.failures.push((channel.clone(), reason));
             }
         }
@@ -226,8 +226,8 @@ pub async fn collect_posts(
 }
 
 enum ChannelError {
-    /// Канал выпадает из этого прогона; курсор не двигаем, дайджест собираем
-    /// по остальным.
+    /// The channel drops out of this run; we do not move the cursor, the digest is built
+    /// from the other channels.
     Excluded(String),
     Auth(anyhow::Error),
     Cancelled,
@@ -244,7 +244,7 @@ async fn fetch_channel(
         .map_err(|e| ChannelError::Excluded(e.to_string()))?;
 
     let limit = cfg.telegram.max_posts_per_channel;
-    // +1: чтобы отличить «канал кончился ровно на лимите» от «упёрлись в лимит».
+    // +1: to tell "the channel ended exactly at the limit" from "we hit the limit".
     let mut iter = client.iter_messages(peer).limit(limit + 1);
     let mut raw: Vec<RawMessage> = Vec::new();
     let mut attempt = 0;
@@ -269,11 +269,11 @@ async fn fetch_channel(
                 let wait = flood_wait(&e);
                 if attempt >= MAX_ATTEMPTS || wait.is_some_and(|w| w > MAX_FLOOD_WAIT) {
                     return Err(ChannelError::Excluded(format!(
-                        "ошибка чтения канала: {e}. Следующий прогон дочитает с курсора"
+                        "error reading the channel: {e}. The next run reads from the cursor"
                     )));
                 }
                 let delay = wait.unwrap_or_else(|| Duration::from_secs(2u64.pow(attempt)));
-                tracing::warn!(channel = %channel.label(), error = %e, ?delay, "повтор чтения");
+                tracing::warn!(channel = %channel.label(), error = %e, ?delay, "retrying the read");
                 if cancel.sleep(delay).await.is_err() {
                     return Err(ChannelError::Cancelled);
                 }
@@ -287,12 +287,12 @@ async fn fetch_channel(
             break;
         }
 
-        // Упёрлись в предохранитель, не дойдя до курсора: молча отрезать хвост
-        // нельзя, поэтому канал выпадает из прогона целиком.
+        // We hit the safety limit before reaching the cursor: we cannot silently cut
+        // the tail, so the channel drops out of the run completely.
         if raw.len() >= limit {
             return Err(ChannelError::Excluded(format!(
-                "превышен лимит {limit} постов за прогон — поднимите telegram.max_posts_per_channel \
-                 или сбросьте канал через /reset {}",
+                "limit of {limit} posts per run exceeded — raise telegram.max_posts_per_channel \
+                 or reset the channel with /reset {}",
                 channel.id
             )));
         }
@@ -309,8 +309,8 @@ async fn fetch_channel(
     Ok(assemble(&raw, cfg.telegram.min_post_chars))
 }
 
-/// Граница сбора. При курсоре 0 (новый или сброшенный канал) берём окно по
-/// дате, иначе читаем всё, что выше курсора, сколько бы дней это ни было.
+/// The collection limit. With cursor 0 (a new or reset channel) we take a window by
+/// date, otherwise we read everything above the cursor, however many days that is.
 fn reached_border(id: i32, date: DateTime<Utc>, cursor: i32, since: DateTime<Utc>) -> bool {
     if cursor > 0 {
         id <= cursor
@@ -319,28 +319,28 @@ fn reached_border(id: i32, date: DateTime<Utc>, cursor: i32, since: DateTime<Utc
     }
 }
 
-/// Сообщение до склейки альбомов и фильтра — в таком виде его удобно гонять
-/// в тестах без Telegram.
+/// A message before album merging and the filter — in this form it is easy to use
+/// in tests without Telegram.
 #[derive(Debug, Clone)]
 pub struct RawMessage {
     pub id: i32,
     pub date: DateTime<Utc>,
     pub grouped_id: Option<i64>,
     pub text: String,
-    /// Откуда репост, если это репост.
+    /// Where the repost is from, if it is a repost.
     pub forward: Option<Forward>,
 }
 
-/// Происхождение репоста. Нужно, чтобы слияние дублей не считало репост и
-/// оригинал двумя разными новостями: без пометки модель честно выдаёт два
-/// пункта об одном событии.
+/// The origin of a repost. It is needed so that duplicate merging does not see a repost
+/// and the original as two different news items: without the label the model honestly
+/// gives two items about one event.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Forward {
-    /// Имя исходного канала, если Telegram его прислал (у скрытых — нет).
+    /// Name of the source channel, if Telegram sent it (hidden ones have none).
     pub name: Option<String>,
-    /// Id исходного канала: по нему ищем название среди своих каналов.
+    /// Id of the source channel: we use it to find the title among our channels.
     pub channel_id: Option<i64>,
-    /// Номер поста в исходном канале.
+    /// Post number in the source channel.
     pub post_id: Option<i32>,
 }
 
@@ -354,15 +354,15 @@ pub struct PreparedPost {
 
 pub struct Batch {
     pub posts: Vec<PreparedPost>,
-    /// Максимальный id, который видели, **до** фильтра: иначе части альбома
-    /// остаются выше курсора и на следующем прогоне читаются заново.
+    /// The highest id we saw, **before** the filter: otherwise parts of an album
+    /// stay above the cursor and are read again on the next run.
     pub max_id_seen: i32,
 }
 
-/// Склейка альбомов и фильтр коротких постов.
+/// Album merging and the short post filter.
 ///
-/// Альбом = несколько сообщений с одним `grouped_id`, но одна публикация:
-/// текст лежит в подписи к одной из частей, ссылку даём на самую раннюю.
+/// An album = several messages with one `grouped_id`, but one publication:
+/// the text is in the caption of one of the parts, we link to the earliest one.
 pub fn assemble(raw: &[RawMessage], min_post_chars: usize) -> Batch {
     let mut albums: HashMap<i64, PreparedPost> = HashMap::new();
     let mut posts: Vec<PreparedPost> = Vec::new();
@@ -383,12 +383,12 @@ pub fn assemble(raw: &[RawMessage], min_post_chars: usize) -> Batch {
                 if entry.text.is_empty() && !text.is_empty() {
                     entry.text = text;
                 }
-                // Альбом целиком — одна пересылка, так что источник берём
-                // у любой части, у которой он есть.
+                // The whole album is one forward, so we take the source
+                // from any part that has it.
                 if entry.forward.is_none() {
                     entry.forward = message.forward.clone();
                 }
-                // Ссылка должна вести на первую часть альбома.
+                // The link must lead to the first part of the album.
                 if message.id < entry.msg_id {
                     entry.msg_id = message.id;
                     entry.date = message.date;
@@ -405,18 +405,18 @@ pub fn assemble(raw: &[RawMessage], min_post_chars: usize) -> Batch {
 
     posts.extend(albums.into_values());
 
-    // Короткие посты — это стикеры, реакции и «только медиа»: для дайджеста шум.
+    // Short posts are stickers, reactions and "media only": noise for the digest.
     posts.retain(|p| p.text.chars().count() >= min_post_chars);
     posts.sort_by_key(|p| p.msg_id);
 
     Batch { posts, max_id_seen }
 }
 
-/// Человекочитаемый источник репоста.
+/// A human-readable source of a repost.
 ///
-/// Если исходный канал — один из наших, берём его название и ссылку на
-/// оригинальный пост: тогда модель видит, что репост и оригинал — одно
-/// событие, а не два.
+/// If the source channel is one of ours, we take its title and a link to the
+/// original post: then the model sees that the repost and the original are one
+/// event, not two.
 fn describe_origin(forward: &Forward, channels: &[Channel]) -> String {
     let known = forward
         .channel_id
@@ -429,13 +429,13 @@ fn describe_origin(forward: &Forward, channels: &[Channel]) -> String {
         (Some(channel), _, None) => channel.title.clone(),
         (None, Some(name), _) => name.clone(),
         (None, None, _) => match forward.channel_id {
-            Some(id) => format!("канал id {id}"),
-            None => "скрытый источник".into(),
+            Some(id) => format!("channel id {id}"),
+            None => "hidden source".into(),
         },
     }
 }
 
-/// Откуда репост. У скрытых пересылок нет ни id, ни имени — тогда `None`.
+/// Where the repost is from. Hidden forwards have neither id nor name — then `None`.
 fn forward_origin(header: Option<&tl::enums::MessageFwdHeader>) -> Option<Forward> {
     let tl::enums::MessageFwdHeader::Header(header) = header?;
 
@@ -452,9 +452,9 @@ fn forward_origin(header: Option<&tl::enums::MessageFwdHeader>) -> Option<Forwar
     (forward != Forward::default()).then_some(forward)
 }
 
-/// `message.text()` отдаёт голый текст: ссылка из «подробнее — [тут]» пропадает.
-/// Дописываем такие адреса отдельной строкой — модели они нужны для контекста,
-/// а в `sources` всё равно попадут только ссылки на сами посты.
+/// `message.text()` gives plain text: the link from "more — [here]" is lost.
+/// We add such addresses as a separate line — the model needs them for context,
+/// but only links to the posts themselves go into `sources` anyway.
 fn with_hidden_links(text: &str, entities: Option<&Vec<tl::enums::MessageEntity>>) -> String {
     let Some(entities) = entities else {
         return text.to_string();
@@ -473,7 +473,7 @@ fn with_hidden_links(text: &str, entities: Option<&Vec<tl::enums::MessageEntity>
     if urls.is_empty() {
         return text.to_string();
     }
-    format!("{text}\nСсылки в посте: {}", urls.join(", "))
+    format!("{text}\nLinks in the post: {}", urls.join(", "))
 }
 
 fn prompt(label: &str) -> Result<String> {
@@ -529,7 +529,7 @@ mod tests {
     fn album_parts_become_one_post_linked_to_the_first() {
         let raw = vec![
             message(12, Some(7), ""),
-            message(11, Some(7), "подпись под альбомом, достаточно длинная"),
+            message(11, Some(7), "caption under the album, long enough"),
             message(10, Some(7), ""),
         ];
         let batch = assemble(&raw, 10);
@@ -540,13 +540,13 @@ mod tests {
 
     #[test]
     fn cursor_counts_filtered_out_messages_too() {
-        // Альбом без подписи и стикер отфильтруются, но курсор обязан уйти за
-        // них: иначе следующий прогон перечитает альбом и выдаст его дважды.
+        // An album without a caption and a sticker are filtered out, but the cursor must
+        // move past them: otherwise the next run reads the album again and shows it twice.
         let raw = vec![
             message(30, Some(1), ""),
             message(29, Some(1), ""),
             message(28, None, "ok"),
-            message(27, None, "достаточно длинный пост, чтобы пройти фильтр"),
+            message(27, None, "a post long enough to pass the filter"),
         ];
         let batch = assemble(&raw, 10);
         assert_eq!(batch.posts.len(), 1);
@@ -557,9 +557,9 @@ mod tests {
     #[test]
     fn posts_come_out_oldest_first() {
         let raw = vec![
-            message(3, None, "третий пост, длинный достаточно"),
-            message(1, None, "первый пост, длинный достаточно"),
-            message(2, None, "второй пост, длинный достаточно"),
+            message(3, None, "third post, long enough to pass"),
+            message(1, None, "first post, long enough to pass"),
+            message(2, None, "second post, long enough to pass"),
         ];
         let batch = assemble(&raw, 10);
         let ids: Vec<i32> = batch.posts.iter().map(|p| p.msg_id).collect();
@@ -576,7 +576,7 @@ mod tests {
     #[test]
     fn border_is_the_cursor_when_there_is_one() {
         let since = at(100);
-        // Старый по дате, но выше курсора — берём: канал мог три дня падать.
+        // Old by date, but above the cursor — we take it: the channel could fail for three days.
         assert!(!reached_border(50, at(0), 40, since));
         assert!(reached_border(40, at(200), 40, since));
     }
@@ -601,12 +601,12 @@ mod tests {
                 length: 4,
             }),
         ];
-        let out = with_hidden_links("тут", Some(&entities));
+        let out = with_hidden_links("here", Some(&entities));
         assert!(out.contains("https://example.com/a"));
 
-        // Адрес, который и так виден в тексте, второй раз не дописываем.
-        let out = with_hidden_links("см. https://example.com/a", Some(&entities));
-        assert_eq!(out, "см. https://example.com/a");
+        // An address that is already visible in the text is not added a second time.
+        let out = with_hidden_links("see https://example.com/a", Some(&entities));
+        assert_eq!(out, "see https://example.com/a");
     }
 
     #[test]
@@ -614,7 +614,7 @@ mod tests {
         let raw = vec![forwarded(
             5,
             None,
-            "новость, пересказанная достаточно длинно",
+            "news retold long enough to pass",
             Forward {
                 name: None,
                 channel_id: Some(777),
@@ -631,31 +631,26 @@ mod tests {
     #[test]
     fn album_takes_the_source_from_whichever_part_has_it() {
         let from = Forward {
-            name: Some("Первоисточник".into()),
+            name: Some("Original source".into()),
             channel_id: None,
             post_id: None,
         };
         let raw = vec![
             message(12, Some(7), ""),
-            forwarded(
-                11,
-                Some(7),
-                "подпись под альбомом, достаточно длинная",
-                from,
-            ),
+            forwarded(11, Some(7), "caption under the album, long enough", from),
             message(10, Some(7), ""),
         ];
         let batch = assemble(&raw, 10);
         assert_eq!(batch.posts.len(), 1);
         assert_eq!(
             batch.posts[0].forward.as_ref().unwrap().name.as_deref(),
-            Some("Первоисточник")
+            Some("Original source")
         );
     }
 
     #[test]
     fn a_repost_from_a_tracked_channel_points_at_the_original_post() {
-        let channels = vec![channel(777, Some("source"), "Первоисточник")];
+        let channels = vec![channel(777, Some("source"), "Original source")];
         let origin = describe_origin(
             &Forward {
                 name: None,
@@ -664,23 +659,23 @@ mod tests {
             },
             &channels,
         );
-        assert_eq!(origin, "Первоисточник (https://t.me/source/42)");
+        assert_eq!(origin, "Original source (https://t.me/source/42)");
     }
 
     #[test]
     fn a_repost_from_an_unknown_channel_falls_back_to_whatever_telegram_gave() {
-        let channels = vec![channel(1, None, "Наш канал")];
+        let channels = vec![channel(1, None, "Our channel")];
 
         assert_eq!(
             describe_origin(
                 &Forward {
-                    name: Some("Чужой канал".into()),
+                    name: Some("Other channel".into()),
                     channel_id: Some(999),
                     post_id: Some(1),
                 },
                 &channels
             ),
-            "Чужой канал"
+            "Other channel"
         );
         assert_eq!(
             describe_origin(
@@ -691,11 +686,11 @@ mod tests {
                 },
                 &channels
             ),
-            "канал id 999"
+            "channel id 999"
         );
         assert_eq!(
             describe_origin(&Forward::default(), &channels),
-            "скрытый источник"
+            "hidden source"
         );
     }
 
@@ -703,7 +698,7 @@ mod tests {
     fn a_message_without_a_forward_header_has_no_origin() {
         assert_eq!(forward_origin(None), None);
 
-        // Полностью скрытая пересылка: ни имени, ни id — помечать нечем.
+        // A fully hidden forward: no name, no id — nothing to mark it with.
         let empty = tl::enums::MessageFwdHeader::Header(tl::types::MessageFwdHeader {
             imported: false,
             saved_out: false,

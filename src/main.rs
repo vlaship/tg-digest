@@ -1,10 +1,10 @@
-//! tg-digest — читает Telegram-каналы, суммаризирует их через Claude и постит
-//! дайджест обратно в Telegram по cron-расписанию из конфига.
+//! tg-digest — reads Telegram channels, summarizes them with Claude and posts
+//! a digest back to Telegram on the cron schedule from the config.
 //!
-//! Штатный режим — `serve` в контейнере: планировщик и слушатель команд в
-//! «Избранном» живут в одном процессе, каналы и курсоры — в базе. Остальные
-//! команды CLI отладочные: `login` один раз и `preview` / `run --dry-run`,
-//! чтобы проверить выборку и промпт, не публикуя ничего.
+//! The normal mode is `serve` in a container: the scheduler and the listener for
+//! commands in Saved Messages live in one process, channels and cursors in the
+//! database. The other CLI commands are for debugging: `login` once, and `preview` /
+//! `run --dry-run` to check the post selection and the prompt without posting anything.
 
 mod cancel;
 mod config;
@@ -30,16 +30,16 @@ use run::{Runner, TRIGGER_CATCH_UP, TRIGGER_CRON};
 use schedule::Scheduler;
 use summarize::Summarizer;
 
-/// Как часто просыпаемся, чтобы проверить, не наступил ли слот.
+/// How often we wake up to check whether a slot has come.
 ///
-/// Один длинный sleep до времени запуска непредсказуемо переживает засыпание
-/// машины, поэтому ждём тиками и каждый раз сверяемся с часами.
+/// One long sleep until the run time survives a sleeping machine in
+/// unpredictable ways, so we wait in ticks and check the clock each time.
 const TICK: Duration = Duration::from_secs(60);
 
 #[derive(Parser)]
-#[command(name = "tg-digest", about = "Дайджест Telegram-каналов через Claude")]
+#[command(name = "tg-digest", about = "Digest of Telegram channels with Claude")]
 struct Cli {
-    /// Путь к конфигу
+    /// Path to the config
     #[arg(long, short, default_value = "/data/config.toml", global = true)]
     config: PathBuf,
 
@@ -49,17 +49,17 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Разовая авторизация в Telegram (код из приложения, при 2FA — пароль)
+    /// One-time login to Telegram (code from the app, and the password with 2FA)
     Login,
-    /// Показать, сколько постов собралось, без вызова LLM
+    /// Show how many posts were collected, without calling the LLM
     Preview,
-    /// Собрать дайджест и сохранить в out/digest.html, ничего не публикуя
+    /// Build the digest and save it to out/digest.html, without posting anything
     Run {
-        /// Обязателен: публикует только демон, чтобы два процесса не дублировали дайджест
+        /// Required: only the daemon posts, so two processes do not post the digest twice
         #[arg(long)]
         dry_run: bool,
     },
-    /// Демон: прогоны по расписанию и команды из «Избранного»
+    /// Daemon: runs on schedule and commands from Saved Messages
     Serve,
 }
 
@@ -84,8 +84,8 @@ async fn main() -> Result<()> {
         Command::Run { dry_run } => {
             if !dry_run {
                 bail!(
-                    "публикует только демон: `serve` по расписанию или /run в «Избранном». \
-                     Для проверки — `run --dry-run`"
+                    "only the daemon posts: `serve` on schedule or /run in Saved Messages. \
+                     To check, use `run --dry-run`"
                 );
             }
             dry_run_once(cfg).await
@@ -94,8 +94,8 @@ async fn main() -> Result<()> {
     }
 }
 
-/// Дешёвая проверка выборки: каналы, курсоры, склейка альбомов — всё без
-/// единого токена в Anthropic.
+/// A cheap check of the selection: channels, cursors, album merging — all without
+/// a single Anthropic token.
 async fn preview(cfg: Arc<Config>) -> Result<()> {
     let runner = prepare(cfg.clone()).await?;
     runner.refresh_channels().await?;
@@ -105,7 +105,7 @@ async fn preview(cfg: Arc<Config>) -> Result<()> {
         telegram::client::collect_posts(&runner.client, &cfg, &channels, &Cancel::never()).await?;
 
     println!(
-        "Каналов включено: {}, собрано {} постов\n",
+        "Channels enabled: {}, collected {} posts\n",
         channels.len(),
         collected.posts.len()
     );
@@ -126,13 +126,13 @@ async fn preview(cfg: Arc<Config>) -> Result<()> {
         );
     }
     for (channel, reason) in &collected.failures {
-        println!("! {} исключён: {reason}", channel.label());
+        println!("! {} excluded: {reason}", channel.label());
     }
     Ok(())
 }
 
-/// Прогон без публикации и без записи в базу: курсоры не двигаются, журнал
-/// доставки не создаётся.
+/// A run without posting and without writing to the database: cursors do not move,
+/// no delivery journal is created.
 async fn dry_run_once(cfg: Arc<Config>) -> Result<()> {
     let runner = prepare(cfg.clone()).await?;
     runner.refresh_channels().await?;
@@ -142,7 +142,7 @@ async fn dry_run_once(cfg: Arc<Config>) -> Result<()> {
         telegram::client::collect_posts(&runner.client, &cfg, &channels, &Cancel::never()).await?;
 
     if collected.posts.is_empty() {
-        println!("новых постов нет, дайджест собирать не из чего");
+        println!("no new posts, nothing to build the digest from");
         return Ok(());
     }
 
@@ -172,24 +172,24 @@ async fn dry_run_once(cfg: Arc<Config>) -> Result<()> {
     );
 
     if chunks.is_empty() {
-        println!("модель не нашла ни одной темы — публиковать было бы нечего");
+        println!("the model found no topics — there would be nothing to post");
         return Ok(());
     }
 
     std::fs::create_dir_all("out")?;
     let html = chunks.join("\n\n<hr/>\n\n");
-    std::fs::write("out/digest.html", &html).context("не удалось записать out/digest.html")?;
+    std::fs::write("out/digest.html", &html).context("could not write out/digest.html")?;
     println!("{html}");
     tracing::info!(
         topics = result.topics.len(),
         parts = chunks.len(),
-        "dry-run: сохранено в out/digest.html, состояние не изменено"
+        "dry-run: saved to out/digest.html, state not changed"
     );
     Ok(())
 }
 
-/// Общая подготовка отладочных команд: база, клиент, проверка авторизации,
-/// seed каналов. Токен остановки им не нужен — процесс одноразовый.
+/// Common setup for the debug commands: database, client, login check,
+/// channel seed. They do not need a shutdown token — the process runs once.
 async fn prepare(cfg: Arc<Config>) -> Result<Arc<Runner>> {
     let db = Arc::new(Db::open(&cfg.db_file).await?.preview_copy().await?);
     let session = telegram::client::connect(&cfg).await?;
@@ -205,8 +205,8 @@ async fn prepare(cfg: Arc<Config>) -> Result<Arc<Runner>> {
     )))
 }
 
-/// `[[channels]]` из конфига — только seed для пустой базы: дальше список живёт
-/// в папке Telegram и в базе.
+/// `[[channels]]` from the config is only a seed for an empty database: after that
+/// the list lives in the Telegram folder and in the database.
 async fn seed_if_empty(
     cfg: &Config,
     db: &Db,
@@ -220,7 +220,7 @@ async fn seed_if_empty(
         return Ok(());
     }
     let added = telegram::folder::seed(client, db, &seeds).await?;
-    tracing::info!(added, "каналы из конфига перенесены в базу");
+    tracing::info!(added, "channels from the config copied to the database");
     Ok(())
 }
 
@@ -230,7 +230,10 @@ async fn serve(cfg: Arc<Config>) -> Result<()> {
 
     let interrupted = db.close_interrupted_runs().await?;
     if interrupted > 0 {
-        tracing::warn!(interrupted, "прогоны, оборвавшиеся на сборе, закрыты");
+        tracing::warn!(
+            interrupted,
+            "runs that stopped during collection are closed"
+        );
     }
 
     let session = telegram::client::connect(&cfg).await?;
@@ -247,12 +250,12 @@ async fn serve(cfg: Arc<Config>) -> Result<()> {
         cancel.clone(),
     ));
 
-    // Слушатель команд и планировщик — две задачи над одним клиентом. Отозванная
-    // сессия роняет любую из них, процесс выходит с ненулевым кодом, Docker его
-    // перезапускает, а в логах написано, что делать (`login`).
+    // The command listener and the scheduler are two tasks on one client. A revoked
+    // session breaks either of them, the process exits with a non-zero code, Docker
+    // restarts it, and the logs say what to do (`login`).
     let listener = telegram::commands::listen(runner.clone(), session.updates, cancel.clone());
 
-    tracing::info!(cron = %cfg.schedule.cron, tz = %cfg.schedule.timezone, "демон запущен");
+    tracing::info!(cron = %cfg.schedule.cron, tz = %cfg.schedule.timezone, "daemon started");
 
     let schedule_loop = schedule_loop(runner, scheduler, cancel);
 
@@ -276,34 +279,34 @@ async fn schedule_loop(runner: Arc<Runner>, scheduler: Scheduler, cancel: Cancel
         .map(|run| run.started_at);
 
     if runner.db.unfinished_run().await?.is_some() {
-        tracing::info!("восстанавливаем недоставленный прогон при старте");
+        tracing::info!("recovering an undelivered run on start");
         report(runner.trigger(TRIGGER_CATCH_UP).await?);
     } else if runner.cfg.schedule.run_on_start {
-        tracing::info!("run_on_start: стартовый прогон");
+        tracing::info!("run_on_start: start run");
         report(runner.trigger(TRIGGER_CRON).await?);
     } else if runner.cfg.schedule.catch_up && scheduler.missed_since(last_finished, Utc::now())? {
-        tracing::info!(?last_finished, "пропущенный слот, догоняем");
+        tracing::info!(?last_finished, "missed slot, catching up");
         report(runner.trigger(TRIGGER_CATCH_UP).await?);
     }
 
     loop {
         let next = scheduler.next_after(Utc::now())?;
-        tracing::info!(next = %next, "ждём следующего прогона");
+        tracing::info!(next = %next, "waiting for the next run");
 
         if wait_until(next, &cancel).await == Wake::Interrupted {
-            tracing::info!("получен сигнал остановки, выходим");
+            tracing::info!("shutdown signal received, exiting");
             return Ok(());
         }
 
-        // Ошибка одного прогона не должна ронять демон: она уже записана в базу
-        // и ушла уведомлением, ждём следующего слота. Наружу летит только
-        // неустранимое — например, отозванная сессия.
+        // An error in one run must not break the daemon: it is already saved in the
+        // database and sent as a notification, we wait for the next slot. Only
+        // fatal errors go out — for example, a revoked session.
         report(runner.trigger(TRIGGER_CRON).await?);
     }
 }
 
-/// Пропущенный слот — это warn, а не info: тихо пропущенный дайджест владелец
-/// заметит только через сутки.
+/// A missed slot is a warn, not an info: the owner notices a silently missed
+/// digest only a day later.
 fn report(outcome: run::Outcome) {
     use run::Outcome;
     match outcome {
@@ -336,15 +339,15 @@ async fn wait_until(deadline: chrono::DateTime<Utc>, cancel: &Cancel) -> Wake {
     }
 }
 
-/// SIGTERM от `docker stop` и Ctrl+C — один и тот же токен. Второй сигнал —
-/// немедленный выход: значит, владелец не готов ждать `stop_grace_period`.
+/// SIGTERM from `docker stop` and Ctrl+C are the same token. A second signal means
+/// exit at once: the owner does not want to wait for `stop_grace_period`.
 async fn watch_signals(source: cancel::CancelSource) {
     first_signal().await;
-    tracing::info!("получен сигнал остановки, завершаем текущую работу");
+    tracing::info!("shutdown signal received, finishing the current work");
     source.cancel();
 
     first_signal().await;
-    tracing::warn!("второй сигнал — выходим немедленно");
+    tracing::warn!("second signal — exiting at once");
     std::process::exit(130);
 }
 
@@ -354,7 +357,7 @@ async fn first_signal() {
     let mut term = match signal(SignalKind::terminate()) {
         Ok(term) => term,
         Err(e) => {
-            tracing::warn!(error = %e, "SIGTERM недоступен, ждём только Ctrl+C");
+            tracing::warn!(error = %e, "SIGTERM is not available, waiting only for Ctrl+C");
             let _ = tokio::signal::ctrl_c().await;
             return;
         }

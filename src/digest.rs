@@ -1,5 +1,5 @@
-//! Модель дайджеста: подстановка в промпт, JSON-схема ответа, проверка ссылок,
-//! рендер в Telegram-HTML и разбиение по лимиту сообщения.
+//! The digest model: prompt filling, the JSON schema of the answer, link checks,
+//! rendering to Telegram-HTML and splitting by the message limit.
 
 use chrono::{DateTime, Utc};
 use chrono_tz::Tz;
@@ -7,24 +7,24 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::HashSet;
 
-/// Лимит Telegram — 4096 символов на сообщение, и считает он их в UTF-16
-/// (emoji = 2 единицы). Держим запас на служебную разметку.
+/// The Telegram limit is 4096 characters per message, and it counts them in UTF-16
+/// (emoji = 2 units). We keep a margin for service markup.
 const TELEGRAM_CHUNK_LIMIT: usize = 3900;
 
-/// Один пост канала, уже отфильтрованный и со склеенным альбомом.
+/// One channel post, already filtered and with the album merged.
 #[derive(Debug, Clone)]
 pub struct Post {
-    /// Id канала в базе — по нему считается курсор.
+    /// Channel id in the database — the cursor is counted by it.
     pub channel_id: i64,
-    /// Как канал адресуется: `@username` или `id 123`.
+    /// How the channel is named: `@username` or `id 123`.
     pub channel: String,
-    /// Отображаемое имя канала.
+    /// The display name of the channel.
     pub title: String,
     pub date: DateTime<Utc>,
     pub text: String,
     pub url: String,
-    /// Откуда репост, если это репост: без пометки модель считает репост и
-    /// оригинал двумя разными новостями и не сливает их в один пункт.
+    /// Where the repost is from, if it is a repost: without the label the model sees a repost
+    /// and the original as two different news items and does not merge them into one item.
     pub origin: Option<String>,
 }
 
@@ -37,7 +37,7 @@ pub struct Digest {
 }
 
 impl Digest {
-    /// Публиковать нечего: заголовок без единой темы — это спам в канал.
+    /// Nothing to post: a title without a single topic is spam in the channel.
     pub fn is_empty(&self) -> bool {
         self.topics.is_empty()
     }
@@ -57,8 +57,8 @@ pub struct Source {
     pub url: String,
 }
 
-/// Строки и таймзона для рендера. Живут в конфиге: вечерний прогон по
-/// `America/New_York` иначе получал бы завтрашнюю дату из UTC.
+/// Strings and time zone for rendering. They live in the config: otherwise an evening run in
+/// `America/New_York` would get tomorrow's date from UTC.
 pub struct RenderOptions<'a> {
     pub digest_title: &'a str,
     pub tldr_title: &'a str,
@@ -66,12 +66,12 @@ pub struct RenderOptions<'a> {
     pub now: DateTime<Utc>,
 }
 
-/// Схема структурированного ответа. Живёт в коде, а не в конфиге: это контракт
-/// парсинга, менять его без правки `Digest` нельзя. Текстовые инструкции —
-/// в `[prompts]`.
+/// The schema of the structured answer. It lives in the code, not in the config: it is the
+/// parsing contract, you cannot change it without changing `Digest`. Text instructions are
+/// in `[prompts]`.
 ///
-/// Ограничения API: `additionalProperties: false` обязателен, keywords вроде
-/// `minLength`/`maximum` не поддерживаются.
+/// API limits: `additionalProperties: false` is required, keywords like
+/// `minLength`/`maximum` are not supported.
 pub fn response_schema() -> Value {
     json!({
         "type": "object",
@@ -107,12 +107,12 @@ pub fn response_schema() -> Value {
     })
 }
 
-/// Выкидываем из ответа всё, чего не было во входных постах.
+/// We drop from the answer everything that was not in the input posts.
 ///
-/// Промпт просит «не придумывай URL», но просьба — не проверка. Заодно это
-/// защита от prompt-injection: пост может уговорить модель вставить чужую
-/// ссылку, но в дайджест попадут только адреса собранных постов.
-/// Возвращает число выброшенных ссылок.
+/// The prompt says "do not make up URLs", but a request is not a check. This is also
+/// protection from prompt injection: a post can talk the model into adding a foreign
+/// link, but only addresses of collected posts get into the digest.
+/// Returns the number of dropped links.
 pub fn drop_foreign_sources(digest: &mut Digest, posts: &[Post]) -> usize {
     let allowed: HashSet<&str> = posts.iter().map(|p| p.url.as_str()).collect();
     let mut dropped = 0;
@@ -122,7 +122,7 @@ pub fn drop_foreign_sources(digest: &mut Digest, posts: &[Post]) -> usize {
             let ok = allowed.contains(source.url.as_str());
             if !ok {
                 dropped += 1;
-                tracing::warn!(url = %source.url, topic = %topic.title, "ссылки не было во входных постах, выбрасываем");
+                tracing::warn!(url = %source.url, topic = %topic.title, "the link was not in the input posts, dropping it");
             }
             ok
         });
@@ -130,8 +130,8 @@ pub fn drop_foreign_sources(digest: &mut Digest, posts: &[Post]) -> usize {
     dropped
 }
 
-/// Входные данные для модели: посты, сгруппированные по каналам, каждый со
-/// ссылкой — модель обязана вернуть в `sources` именно эти URL.
+/// Input for the model: posts grouped by channel, each with a link —
+/// the model must return exactly these URLs in `sources`.
 pub fn format_posts(posts: &[Post]) -> String {
     let mut out = String::new();
     let mut current = i64::MIN;
@@ -140,7 +140,7 @@ pub fn format_posts(posts: &[Post]) -> String {
         if post.channel_id != current {
             current = post.channel_id;
             out.push_str(&format!(
-                "\n\n=== Канал: {} ({}) ===\n",
+                "\n\n=== Channel: {} ({}) ===\n",
                 post.title, post.channel
             ));
         }
@@ -150,7 +150,7 @@ pub fn format_posts(posts: &[Post]) -> String {
             post.url,
             post.origin
                 .as_ref()
-                .map(|origin| format!(" | репост из: {origin}"))
+                .map(|origin| format!(" | repost from: {origin}"))
                 .unwrap_or_default(),
             post.text.trim()
         ));
@@ -177,8 +177,8 @@ pub fn render_user_prompt(
     )
 }
 
-/// То же самое, но с готовым блоком материалов: на сведении (reduce) вместо
-/// постов подставляются сводки по частям.
+/// The same, but with a ready block of material: in the reduce step summaries of
+/// parts are used instead of posts.
 #[allow(clippy::too_many_arguments)]
 pub fn render_prompt_with(
     template: &str,
@@ -202,18 +202,18 @@ pub fn render_prompt_with(
         .replace("{{posts}}", posts_block)
 }
 
-/// Накладные расходы на один пост в промпте: дата, ссылка, разделители.
+/// Overhead of one post in the prompt: date, link, separators.
 const POST_OVERHEAD_CHARS: usize = 200;
 
-/// Разбить посты на части под map-reduce — по каналам.
+/// Split posts into parts for map-reduce — by channel.
 ///
-/// Канал целиком уходит в одну часть: сжимать половину ленты канала в отрыве
-/// от второй половины — значит терять контекст ровно там, где модель должна
-/// слить дубли. Разрывается канал только если он сам не влезает в бюджет;
-/// пост не разрывается никогда — молча терять хвост запрещено.
+/// A whole channel goes into one part: condensing half of a channel feed apart
+/// from the other half means losing context exactly where the model must
+/// merge duplicates. A channel is split only if it alone does not fit the budget;
+/// a post is never split — silently losing the tail is forbidden.
 ///
-/// Посты приходят подряд по каналам, поэтому все части остаются непрерывными
-/// срезами исходного списка.
+/// Posts come in a row by channel, so all parts stay continuous
+/// slices of the original list.
 pub fn split_batches(posts: &[Post], budget_chars: usize) -> Vec<&[Post]> {
     let mut batches: Vec<&[Post]> = Vec::new();
     let mut batch_start = 0;
@@ -223,8 +223,8 @@ pub fn split_batches(posts: &[Post], budget_chars: usize) -> Vec<&[Post]> {
         let posts_of_run = &posts[run.clone()];
         let run_size = batch_cost(posts_of_run);
 
-        // Канал не влезает даже в пустую часть: режем его, но сначала
-        // закрываем накопленное, чтобы не смешивать обрывок с соседями.
+        // The channel does not fit even into an empty part: we cut it, but first
+        // we close what has been collected, so we do not mix a piece with its neighbours.
         if run_size > budget_chars {
             if batch_size > 0 {
                 batches.push(&posts[batch_start..run.start]);
@@ -260,8 +260,8 @@ pub fn split_batches(posts: &[Post], budget_chars: usize) -> Vec<&[Post]> {
     batches
 }
 
-/// Границы каналов: посты идут подряд по каналам, так что достаточно отследить
-/// смену `channel_id`.
+/// Channel borders: posts come in a row by channel, so it is enough to watch
+/// for a change of `channel_id`.
 fn channel_runs(posts: &[Post]) -> Vec<std::ops::Range<usize>> {
     let mut runs: Vec<std::ops::Range<usize>> = Vec::new();
 
@@ -282,11 +282,11 @@ fn batch_cost(posts: &[Post]) -> usize {
     posts.iter().map(post_cost).sum()
 }
 
-/// Разбить сводки частей для промежуточного сведения.
+/// Split part summaries for an intermediate reduce.
 ///
-/// Нужно, когда сводок столько, что их сумма сама не влезает в один запрос:
-/// тогда они сводятся в несколько заходов. Сводка, которая одна больше
-/// бюджета, уходит в группу одна — резать её нечем.
+/// Needed when there are so many summaries that together they do not fit in one request:
+/// then they are reduced in several rounds. A summary that alone is bigger than
+/// the budget goes into a group alone — there is nothing to cut it with.
 pub fn split_partials(parts: &[Digest], budget_chars: usize) -> Vec<&[Digest]> {
     let mut groups = Vec::new();
     let mut start = 0;
@@ -307,19 +307,19 @@ pub fn split_partials(parts: &[Digest], budget_chars: usize) -> Vec<&[Digest]> {
     groups
 }
 
-/// Во сколько символов обойдутся сводки в запросе.
+/// How many characters the summaries will take in the request.
 pub fn partials_size(parts: &[Digest]) -> usize {
     format_partials(parts).chars().count()
 }
 
-/// Сводки частей — вход для сведения. Ссылки переносим как есть: итоговый
-/// дайджест всё равно проверяется по множеству собранных постов, а без них
-/// модели нечего будет указать в источниках.
+/// Part summaries are the input for the reduce. We copy the links as they are: the final
+/// digest is checked against the set of collected posts anyway, and without them
+/// the model would have nothing to put in the sources.
 pub fn format_partials(parts: &[Digest]) -> String {
     let mut out = String::new();
 
     for (index, part) in parts.iter().enumerate() {
-        out.push_str(&format!("\n\n=== Сводка части {} ===\n", index + 1));
+        out.push_str(&format!("\n\n=== Summary of part {} ===\n", index + 1));
         for topic in &part.topics {
             out.push_str(&format!("\n--- {}\n{}\n", topic.title, topic.summary));
             if !topic.sources.is_empty() {
@@ -328,7 +328,7 @@ pub fn format_partials(parts: &[Digest]) -> String {
                     .iter()
                     .map(|s| format!("{} {}", s.channel, s.url))
                     .collect();
-                out.push_str(&format!("Источники: {}\n", links.join(", ")));
+                out.push_str(&format!("Sources: {}\n", links.join(", ")));
             }
         }
         for item in &part.tldr {
@@ -338,8 +338,8 @@ pub fn format_partials(parts: &[Digest]) -> String {
     out
 }
 
-/// Рендер в Telegram-HTML. Разметку строим сами, а не просим у модели: чинить
-/// сломанный markdown от LLM дороже, чем собрать HTML из структуры.
+/// Rendering to Telegram-HTML. We build the markup ourselves and do not ask the model: fixing
+/// broken markdown from an LLM costs more than building HTML from the structure.
 pub fn render_html(digest: &Digest, opts: &RenderOptions) -> Vec<String> {
     if digest.is_empty() {
         return Vec::new();
@@ -385,8 +385,8 @@ pub fn render_html(digest: &Digest, opts: &RenderOptions) -> Vec<String> {
     pack(blocks)
 }
 
-/// Складываем блоки в сообщения по лимиту, не разрывая тему пополам.
-/// Блок, который сам длиннее лимита, режем с сохранением HTML-разметки.
+/// We put blocks into messages by the limit, without cutting a topic in half.
+/// A block that alone is longer than the limit is cut, keeping the HTML markup.
 fn pack(blocks: Vec<String>) -> Vec<String> {
     let mut messages = Vec::new();
     let mut current = String::new();
@@ -468,13 +468,13 @@ fn split_html(mut line: &str) -> Vec<String> {
     out
 }
 
-/// Разбиение обычного текста — ответов на команды и уведомлений — по тому же
-/// лимиту сообщения.
+/// Splitting plain text — command replies and notifications — by the same
+/// message limit.
 ///
-/// Нужно потому, что Telegram длинное сообщение не обрезает, а отвергает:
-/// `/list` на полусотне каналов или `/status` с длинной ошибкой иначе просто
-/// не приходили бы. Режем по строкам, а строку длиннее лимита — по границам
-/// символов; разметки здесь нет, ломать нечего.
+/// Needed because Telegram does not cut a long message, it rejects it:
+/// `/list` with fifty channels or `/status` with a long error would otherwise just
+/// not arrive. We cut by lines, and a line longer than the limit — by character
+/// borders; there is no markup here, nothing to break.
 pub fn split_plain(text: &str) -> Vec<String> {
     if len16(text) <= TELEGRAM_CHUNK_LIMIT {
         return vec![text.to_string()];
@@ -523,14 +523,14 @@ fn split_long_line(line: &str) -> Vec<String> {
     out
 }
 
-/// Telegram считает длину сообщения в UTF-16: `chars().count()` на дайджесте
-/// с эмодзи занижает её вдвое.
+/// Telegram counts message length in UTF-16: `chars().count()` on a digest
+/// with emoji gives half the real length.
 fn len16(s: &str) -> usize {
     s.encode_utf16().count()
 }
 
-/// Telegram-HTML требует экранирования `&`, `<`, `>`; кавычку экранируем тоже,
-/// иначе URL с `"` разорвал бы атрибут `href`.
+/// Telegram-HTML needs `&`, `<`, `>` to be escaped; we escape the quote too,
+/// or a URL with `"` would break the `href` attribute.
 fn escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -548,7 +548,7 @@ mod tests {
             channel: "@news".into(),
             title: "News".into(),
             date: Utc::now(),
-            text: "текст".into(),
+            text: "text".into(),
             url: url.into(),
             origin: None,
         }
@@ -557,7 +557,7 @@ mod tests {
     fn topic(title: &str, urls: &[&str]) -> Topic {
         Topic {
             title: title.into(),
-            summary: "итог".into(),
+            summary: "summary".into(),
             sources: urls
                 .iter()
                 .map(|u| Source {
@@ -570,8 +570,8 @@ mod tests {
 
     fn options() -> RenderOptions<'static> {
         RenderOptions {
-            digest_title: "📰 Дайджест за {{date}}",
-            tldr_title: "Коротко",
+            digest_title: "📰 Digest for {{date}}",
+            tldr_title: "In short",
             timezone: chrono_tz::UTC,
             now: DateTime::parse_from_rfc3339("2026-09-15T12:00:00Z")
                 .unwrap()
@@ -596,7 +596,7 @@ mod tests {
     #[test]
     fn splits_a_single_oversized_block() {
         let block = (0..500)
-            .map(|i| format!("строка {i}"))
+            .map(|i| format!("line {i}"))
             .collect::<Vec<_>>()
             .join("\n");
         let pieces = split_oversized(block);
@@ -616,35 +616,35 @@ mod tests {
 
     #[test]
     fn short_plain_text_is_sent_as_one_message() {
-        assert_eq!(split_plain("привет"), vec!["привет".to_string()]);
+        assert_eq!(split_plain("hello"), vec!["hello".to_string()]);
         assert_eq!(split_plain(""), vec![String::new()]);
     }
 
     #[test]
     fn long_plain_text_is_split_on_line_boundaries() {
-        // Ответ на /list в большом аккаунте: много коротких строк.
+        // A /list reply in a big account: many short lines.
         let text = (0..400)
-            .map(|i| format!("✅ канал {i} — id {i}, @name{i}, курсор {i}"))
+            .map(|i| format!("✅ channel {i} — id {i}, @name{i}, cursor {i}"))
             .collect::<Vec<_>>()
             .join("\n");
 
         let pieces = split_plain(&text);
         assert!(pieces.len() > 1);
         assert!(pieces.iter().all(|p| len16(p) <= TELEGRAM_CHUNK_LIMIT));
-        // Ни одна строка не должна потеряться или разъехаться по двум частям.
+        // Not a single line may get lost or be split between two parts.
         assert_eq!(pieces.join("\n"), text);
     }
 
     #[test]
     fn a_single_overlong_line_is_cut_by_character_boundaries() {
-        // Одна строка без переводов: длинная ошибка в /status или уведомлении.
-        let text = "я".repeat(5000);
+        // One line without line breaks: a long error in /status or in a notification.
+        let text = "x".repeat(5000);
         let pieces = split_plain(&text);
         assert!(pieces.len() > 1);
         assert!(pieces.iter().all(|p| len16(p) <= TELEGRAM_CHUNK_LIMIT));
         assert_eq!(pieces.concat(), text);
 
-        // Суррогатная пара не должна разрезаться пополам.
+        // A surrogate pair must not be cut in half.
         let text = "🎉".repeat(4000);
         let pieces = split_plain(&text);
         assert!(pieces.iter().all(|p| len16(p) <= TELEGRAM_CHUNK_LIMIT));
@@ -654,7 +654,7 @@ mod tests {
     #[test]
     fn oversized_html_keeps_text_entities_and_links_in_every_piece() {
         use grammers_client::parsers::parse_html_message;
-        let text = "🎉 & <новость>\n".repeat(900);
+        let text = "🎉 & <news>\n".repeat(900);
         for html in [
             format!("<b>{}</b>", escape(&text)),
             format!("<a href=\"https://t.me/news/1\">{}</a>", escape(&text)),
@@ -678,9 +678,9 @@ mod tests {
         Post {
             channel_id,
             channel: format!("@c{channel_id}"),
-            title: format!("Канал {channel_id}"),
+            title: format!("Channel {channel_id}"),
             date: Utc::now(),
-            text: "я".repeat(chars),
+            text: "x".repeat(chars),
             url: url.into(),
             origin: None,
         }
@@ -695,7 +695,7 @@ mod tests {
         let batches = split_batches(&posts, 3000);
         assert!(batches.len() > 1);
 
-        // Ни один пост не потерян и порядок сохранён — иначе это тихая обрезка.
+        // No post is lost and the order is kept — otherwise this is silent truncation.
         let seen: Vec<&str> = batches
             .iter()
             .flat_map(|b| b.iter().map(|p| p.url.as_str()))
@@ -708,14 +708,17 @@ mod tests {
                 .iter()
                 .map(|p| p.text.chars().count() + POST_OVERHEAD_CHARS)
                 .sum();
-            assert!(size <= 3000 || batch.len() == 1, "часть длиннее бюджета");
+            assert!(
+                size <= 3000 || batch.len() == 1,
+                "part is longer than the budget"
+            );
         }
     }
 
     #[test]
     fn a_channel_is_not_split_between_batches_unless_it_has_to_be() {
-        // Три канала по ~2400 символов при бюджете 5000: первые два вместе,
-        // третий отдельно — но ни один не разорван.
+        // Three channels of ~2400 characters with a budget of 5000: the first two together,
+        // the third one alone — but none of them is split.
         let posts: Vec<Post> = (0..9)
             .map(|i| sized_post(i / 3, 600, &format!("https://t.me/c/1/{i}")))
             .collect();
@@ -732,7 +735,7 @@ mod tests {
             for channel in channels {
                 let total = posts.iter().filter(|p| p.channel_id == channel).count();
                 let here = batch.iter().filter(|p| p.channel_id == channel).count();
-                assert_eq!(here, total, "канал {channel} разорван между частями");
+                assert_eq!(here, total, "channel {channel} is split between parts");
             }
         }
     }
@@ -744,7 +747,7 @@ mod tests {
         posts.push(sized_post(3, 100, "https://t.me/c/3/1"));
 
         let batches = split_batches(&posts, 2500);
-        // Мелкие соседи не приклеены к обрывкам большого канала.
+        // Small neighbours are not stuck to the pieces of a big channel.
         assert_eq!(batches[0].len(), 1);
         assert_eq!(batches[0][0].channel_id, 1);
         assert_eq!(batches.last().unwrap()[0].channel_id, 3);
@@ -753,7 +756,7 @@ mod tests {
             .iter()
             .flat_map(|b| b.iter().map(|p| p.url.as_str()))
             .collect();
-        assert_eq!(seen.len(), posts.len(), "посты потерялись при разбиении");
+        assert_eq!(seen.len(), posts.len(), "posts were lost while splitting");
     }
 
     #[test]
@@ -761,7 +764,7 @@ mod tests {
         let parts: Vec<Digest> = (0..6)
             .map(|i| Digest {
                 topics: vec![topic(
-                    &format!("тема {i}"),
+                    &format!("topic {i}"),
                     &["https://t.me/news/1", "https://t.me/news/2"],
                 )],
                 tldr: vec![],
@@ -783,21 +786,21 @@ mod tests {
         let parts = vec![
             Digest {
                 topics: vec![Topic {
-                    title: "огромная тема".into(),
-                    summary: "я".repeat(10_000),
+                    title: "huge topic".into(),
+                    summary: "x".repeat(10_000),
                     sources: vec![],
                 }],
                 tldr: vec![],
             },
             Digest {
-                topics: vec![topic("маленькая", &["https://t.me/news/1"])],
+                topics: vec![topic("small", &["https://t.me/news/1"])],
                 tldr: vec![],
             },
         ];
 
         let groups = split_partials(&parts, 1000);
-        // Группы ровно по одной сводке: сжимать дальше нечем, и вызывающая
-        // сторона на этом обязана остановиться, а не крутить цикл.
+        // Groups of exactly one summary each: there is nothing more to condense, and the
+        // caller must stop here and not spin in a loop.
         assert_eq!(groups.len(), parts.len());
     }
 
@@ -822,50 +825,57 @@ mod tests {
 
     #[test]
     fn partial_summaries_carry_their_links_into_the_reduce_step() {
-        // Ссылки — единственное, что связывает сводку с исходными постами:
-        // без них свод не сможет заполнить sources, и все источники вылетят
-        // на проверке.
+        // Links are the only thing that connects a summary with the original posts:
+        // without them the reduce cannot fill sources, and all sources fail
+        // the check.
         let parts = vec![
             Digest {
-                topics: vec![topic("тема A", &["https://t.me/news/1"])],
+                topics: vec![topic("topic A", &["https://t.me/news/1"])],
                 tldr: vec![],
             },
             Digest {
-                topics: vec![topic("тема B", &["https://t.me/news/2"])],
-                tldr: vec!["коротко".into()],
+                topics: vec![topic("topic B", &["https://t.me/news/2"])],
+                tldr: vec!["in short".into()],
             },
         ];
 
         let text = format_partials(&parts);
         assert!(text.contains("https://t.me/news/1"));
         assert!(text.contains("https://t.me/news/2"));
-        assert!(text.contains("тема A") && text.contains("тема B"));
-        assert!(text.contains("Сводка части 1") && text.contains("Сводка части 2"));
+        assert!(text.contains("topic A") && text.contains("topic B"));
+        assert!(text.contains("Summary of part 1") && text.contains("Summary of part 2"));
     }
 
     #[test]
     fn prompt_placeholders_are_filled_for_both_steps() {
         let posts = vec![sized_post(1, 10, "https://t.me/c/1/1")];
         let template =
-            "{{post_count}} постов из {{channel_count}} каналов за {{lookback_hours}} ч\n{{posts}}";
+            "{{post_count}} posts from {{channel_count}} channels in {{lookback_hours}} h\n{{posts}}";
 
         let mapped = render_user_prompt(template, &posts, 24, 3, options().now, chrono_tz::UTC);
-        assert!(mapped.starts_with("1 постов из 3 каналов за 24 ч"));
+        assert!(mapped.starts_with("1 posts from 3 channels in 24 h"));
         assert!(mapped.contains("https://t.me/c/1/1"));
 
-        let reduced =
-            render_prompt_with(template, "сводка", 42, 24, 3, options().now, chrono_tz::UTC);
-        assert!(reduced.starts_with("42 постов из 3 каналов за 24 ч"));
-        assert!(reduced.contains("сводка"));
+        let reduced = render_prompt_with(
+            template,
+            "summary",
+            42,
+            24,
+            3,
+            options().now,
+            chrono_tz::UTC,
+        );
+        assert!(reduced.starts_with("42 posts from 3 channels in 24 h"));
+        assert!(reduced.contains("summary"));
     }
 
     #[test]
     fn a_repost_is_marked_so_duplicates_can_be_merged() {
         let mut post = sized_post(1, 10, "https://t.me/c/1/1");
-        post.origin = Some("Первоисточник (https://t.me/source/42)".into());
+        post.origin = Some("Original source (https://t.me/source/42)".into());
 
         let text = format_posts(&[post]);
-        assert!(text.contains("репост из: Первоисточник (https://t.me/source/42)"));
+        assert!(text.contains("repost from: Original source (https://t.me/source/42)"));
     }
 
     #[test]
@@ -873,7 +883,7 @@ mod tests {
         let posts = vec![post("https://t.me/news/1")];
         let mut digest = Digest {
             topics: vec![topic(
-                "тема",
+                "topic",
                 &["https://t.me/news/1", "https://evil.example/phish"],
             )],
             tldr: vec![],
@@ -893,13 +903,13 @@ mod tests {
     #[test]
     fn renders_header_tldr_and_topic_without_sources() {
         let digest = Digest {
-            topics: vec![topic("<заголовок>", &[])],
-            tldr: vec!["первое".into()],
+            topics: vec![topic("<title>", &[])],
+            tldr: vec!["first".into()],
         };
         let html = render_html(&digest, &options()).join("\n");
-        assert!(html.contains("📰 Дайджест за 15.09.2026"));
-        assert!(html.contains("<b>Коротко</b>"));
-        assert!(html.contains("&lt;заголовок&gt;"));
+        assert!(html.contains("📰 Digest for 15.09.2026"));
+        assert!(html.contains("<b>In short</b>"));
+        assert!(html.contains("&lt;title&gt;"));
         assert!(!html.contains("<a href"));
     }
 
@@ -912,13 +922,13 @@ mod tests {
             .with_timezone(&Utc);
 
         let digest = Digest {
-            topics: vec![topic("тема", &[])],
+            topics: vec![topic("topic", &[])],
             tldr: vec![],
         };
         let html = render_html(&digest, &opts).join("\n");
         assert!(
             html.contains("15.09.2026"),
-            "вечер 15-го в Нью-Йорке: {html}"
+            "evening of the 15th in New York: {html}"
         );
     }
 }

@@ -4,26 +4,26 @@ services:
     image: tg-digest
     restart: unless-stopped
 
-    # Всё состояние — здесь: config.toml, tg.session, digest.db.
-    # tg.session — это полный доступ к аккаунту Telegram, а не «просто кэш».
+    # All state is here: config.toml, tg.session, digest.db.
+    # tg.session gives full access to the Telegram account. It is not "just a cache".
     volumes:
       - ./data:/data
 
-    # Секреты удобнее держать в окружении, чем в файле внутри volume:
-    # любая из переменных перекрывает значение из config.toml.
-    # Список без `=` пробрасывает переменную, только если она задана на хосте:
-    # иначе пустая строка затёрла бы ключ из конфига.
+    # It is easier to keep secrets in the environment than in a file in the volume:
+    # each variable overrides the value from config.toml.
+    # A name without `=` is passed only if it is set on the host.
+    # Otherwise an empty string would replace the key from the config.
     environment:
       - TG_API_ID
       - TG_API_HASH
       - TG_PHONE
       - ANTHROPIC_API_KEY
 
-    # Прерванным можно всё, что не записано; нельзя рвать отправку одной части.
-    # 30 секунд хватает, чтобы дописать текущую часть и закрыть транзакцию.
+    # Anything not yet saved can be stopped, but sending one part must not be cut.
+    # 30 seconds is enough to finish the current part and close the transaction.
     stop_grace_period: 30s
 
-    # Логи собирает Docker; в контейнере ничего в файлы не пишем.
+    # Docker collects the logs; the container writes no log files.
     logging:
       driver: json-file
       options:
