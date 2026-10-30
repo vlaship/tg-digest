@@ -76,6 +76,9 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE runs ADD COLUMN extra_dests TEXT",
     // 5: users who turned the digest off with /stop.
     "CREATE TABLE muted_users (user_id INTEGER PRIMARY KEY)",
+    // 6: short topics of the digest (JSON list of strings), so the next run can skip
+    // stories that were already sent.
+    "ALTER TABLE runs ADD COLUMN digest_topics TEXT",
 ];
 
 /// A channel in the database. `id` is the "bare" Telegram channel id (positive,
@@ -442,6 +445,35 @@ impl Db {
     }
 
     // ------------------------------------------------------------------- runs
+
+    /// Short topics of a digest, saved with the run (see `last_digest_topics`).
+    pub async fn set_digest_topics(&self, run_id: i64, topics: &[String]) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE runs SET digest_topics = ?2 WHERE id = ?1",
+                params![run_id, serde_json::to_string(topics)?],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Topics of the last delivered digest: the next run must not repeat them.
+    pub async fn last_digest_topics(&self) -> Result<Vec<String>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT digest_topics FROM runs
+                 WHERE status = 'ok' AND digest_topics IS NOT NULL
+                 ORDER BY id DESC LIMIT 1",
+                (),
+            )
+            .await?;
+        Ok(match rows.next().await? {
+            Some(row) => serde_json::from_str(&row.get::<String>(0)?)
+                .context("digest topics in the database are damaged")?,
+            None => Vec::new(),
+        })
+    }
 
     pub async fn start_run(&self, trigger: &str) -> Result<i64> {
         self.conn

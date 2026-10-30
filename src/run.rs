@@ -12,7 +12,7 @@ use std::sync::Arc;
 use tokio::sync::{Mutex, MutexGuard};
 
 use crate::cancel::Cancel;
-use crate::config::Config;
+use crate::config::{Config, Prompts};
 use crate::db::{self, Db, Run};
 use crate::digest::{self, RenderOptions};
 use crate::summarize::Summarizer;
@@ -293,9 +293,16 @@ impl Runner {
             Ok(s) => s,
             Err(e) => return self.fail(run_id, e).await,
         };
+        // A channel often writes about yesterday's story again in a new post: tell the
+        // model what the last digest already had.
+        let previous = self.db.last_digest_topics().await.unwrap_or_else(|e| {
+            tracing::warn!(error = %format!("{e:#}"), "could not read the last digest topics");
+            Vec::new()
+        });
+        let prompts = with_previous_topics(&self.cfg.prompts, &previous);
         let summary = match summarizer
             .summarize(
-                &self.cfg.prompts,
+                &prompts,
                 &collected.posts,
                 self.cfg.telegram.lookback_hours,
                 channels.len() - failed.len(),
@@ -380,6 +387,12 @@ impl Runner {
                 &journal,
             )
             .await?;
+        let topics: Vec<String> = digest
+            .topics
+            .iter()
+            .map(|t| short_topic(&t.title, &t.summary))
+            .collect();
+        self.db.set_digest_topics(run_id, &topics).await?;
 
         let run = self
             .db
@@ -455,4 +468,30 @@ impl Runner {
             }
         }
     }
+}
+
+/// How much of each old topic goes into the prompt: enough to know the story.
+const PREVIOUS_TOPIC_CHARS: usize = 300;
+
+/// "Title — start of the text" of one topic, for the next run.
+fn short_topic(title: &str, summary: &str) -> String {
+    let text: String = summary.chars().take(PREVIOUS_TOPIC_CHARS).collect();
+    format!("{title} — {text}")
+}
+
+/// The system prompt plus the topics of the last delivered digest, so the model does
+/// not send the same stories again. Without old topics the prompts stay as they are.
+fn with_previous_topics(prompts: &Prompts, previous: &[String]) -> Prompts {
+    if previous.is_empty() {
+        return prompts.clone();
+    }
+    let list: String = previous.iter().map(|t| format!("- {t}\n")).collect();
+    let mut out = prompts.clone();
+    out.system = format!(
+        "{}\n\nThe last digest already had these stories:\n{list}\
+         Do NOT repeat them. Leave a story out if the new posts only say the same again. \
+         If there is real news about one of them, write only what is new.",
+        prompts.system.trim_end()
+    );
+    out
 }

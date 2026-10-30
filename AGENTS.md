@@ -116,6 +116,10 @@ map-reduce (`summarize.rs`):
 - `max_posts_per_channel` is a safety limit. A channel that hits it is removed
   from the run completely, and its cursor does not move.
 
+**No story twice in a row.** Each run saves its topics (`runs.digest_topics`). The
+next run adds the topics of the last delivered digest to the system prompt and asks
+the model not to repeat them, only to write what is really new.
+
 **A repost is marked with its source.** Without the "repost from: …" label the
 model sees a repost and its original as two news items and does not merge them.
 
