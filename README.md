@@ -39,8 +39,15 @@ was down.
 CI publishes the image to GitHub Container Registry:
 
 - `ghcr.io/vlaship/tg-digest:latest` — the last build of `main`;
-- `ghcr.io/vlaship/tg-digest:sha-<commit>` — one exact commit;
-- `ghcr.io/vlaship/tg-digest:1.2.3` and `:1.2` — from a `v1.2.3` git tag.
+- `ghcr.io/vlaship/tg-digest:20261030-011220` — one exact build, by its UTC build
+  time (`YYYYMMDD-HHmmss`);
+- `ghcr.io/vlaship/tg-digest:1.2.3` and `:1.2` — from a `v1.2.3` git tag. A tag
+  build gets only these version tags:
+
+  ```bash
+  git tag v1.2.3
+  git push origin v1.2.3
+  ```
 
 To use it instead of a local build, change `image:` in `compose.yaml` to one of
 these tags and run `docker compose pull` instead of `docker compose build`.
