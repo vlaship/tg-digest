@@ -36,7 +36,8 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Tags: `latest` and `sha-<short>` from main, `1.2.3` and `1.2` from a v1.2.3 tag.
+      # Tags: a push to main gives `latest` and a UTC build time like
+      # `20261030-011220`; a push of the git tag v1.2.3 gives only `1.2.3` and `1.2`.
       - name: Image tags
         id: meta
         uses: docker/metadata-action@v6
@@ -44,7 +45,7 @@ jobs:
           images: ghcr.io/${{ github.repository }}
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
-            type=sha
+            type=raw,value={{date 'YYYYMMDD-HHmmss' tz='UTC'}},enable=${{ github.ref_type == 'branch' }}
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
 
