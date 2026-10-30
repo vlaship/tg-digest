@@ -160,6 +160,10 @@ state. There is no coverage target.
 
 ## Commits and pull requests
 
+`main` is protected: no direct pushes, no force pushes. Every change goes through a
+branch and a pull request, and the `check` (cargo) and `build` (docker) jobs must
+pass before the merge.
+
 Write short commit subjects in the imperative mood. A PR should explain the change,
 related issues, the effect on the config, and how you checked it. For rendering
 changes, add sample output.
