@@ -181,8 +181,13 @@ changes, add sample output.
 
 CI has two workflows:
 
-- `.github/workflows/cargo.yml` — on every push to any branch: `cargo fmt --check`,
-  `cargo clippy --all-targets -- -D warnings`, `cargo build --release`, all with `--locked`.
-- `.github/workflows/docker.yml` — builds the image. A push to `main` or a `v*` tag
-  publishes one image to `ghcr.io/vlaship/tg-digest`. A PR only builds it. A manual
-  run only builds it, unless you tick "publish".
+- `.github/workflows/cargo.yml` — on every push to a branch except `main`:
+  `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
+  `cargo build --release`, all with `--locked`.
+- `.github/workflows/docker.yml` — a push to `main` or a `v*` tag builds and
+  publishes one image to `ghcr.io/vlaship/tg-digest`. On branches and PRs it runs
+  only by hand (Actions → docker → Run workflow); a manual run only builds, unless
+  you tick "publish".
+
+CI costs money: push only when the owner asks, and test locally first
+(`docker compose up -d --build`).
