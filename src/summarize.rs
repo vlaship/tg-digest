@@ -1,4 +1,4 @@
-//! Calls to the Anthropic Messages API.
+//! Calls to the model API: Anthropic Messages or Google Gemini (`provider`).
 //!
 //! There is no official Rust SDK, so we call HTTP directly with reqwest —
 //! this is the normal way for languages without an SDK.
@@ -10,11 +10,36 @@ use serde_json::{json, Value};
 use std::time::Duration;
 
 use crate::cancel::Cancel;
-use crate::config::{Anthropic, Prompts};
+use crate::config::{Config, Prompts};
 use crate::digest::{self, Digest, Post};
 
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 const MAX_ATTEMPTS: u32 = 4;
+/// How many times we ask the model when its answer is broken (`Digest::defect`).
+const MAX_BROKEN_ANSWERS: u32 = 2;
+
+/// The API limit is used up: requests per minute or per day, or money on the account.
+/// It is a separate type, so the owner gets a clear message, not a JSON dump.
+#[derive(Debug)]
+pub struct LimitReached {
+    pub api: &'static str,
+    pub details: String,
+}
+
+impl std::fmt::Display for LimitReached {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the {} API limit is used up: {}", self.api, self.details)
+    }
+}
+
+impl std::error::Error for LimitReached {}
+
+/// The answer says the limit or the balance is used up.
+fn is_limit(status: reqwest::StatusCode, text: &str) -> bool {
+    status.as_u16() == 429
+        || text.contains("RESOURCE_EXHAUSTED")
+        || text.contains("credit balance is too low")
+}
 
 /// Above this size we switch to map-reduce: we condense the input in parts, then
 /// reduce the summaries into one digest. The model context is 1M tokens, so the limit
@@ -70,17 +95,89 @@ impl Default for Limits {
 
 pub struct Summarizer {
     http: reqwest::Client,
-    cfg: AnthropicSettings,
+    backend: Backend,
+    /// Model id, only for the log.
+    model: String,
     limits: Limits,
 }
 
-/// A copy of the settings without a lifetime tied to the whole Config.
-struct AnthropicSettings {
-    api_key: String,
-    api_url: String,
-    model: String,
-    effort: String,
-    max_tokens: u32,
+/// Which API writes the digest. A copy of the settings without a lifetime tied to
+/// the whole Config.
+enum Backend {
+    Anthropic {
+        api_key: String,
+        api_url: String,
+        model: String,
+        effort: String,
+        max_tokens: u32,
+    },
+    Gemini {
+        api_key: String,
+        /// With the model id already in it.
+        api_url: String,
+        max_tokens: u32,
+    },
+}
+
+impl Backend {
+    fn name(&self) -> &'static str {
+        match self {
+            Backend::Anthropic { .. } => "Anthropic",
+            Backend::Gemini { .. } => "Gemini",
+        }
+    }
+
+    fn body(&self, system: &str, user: &str) -> Value {
+        match self {
+            // thinking is on by default on claude-opus-5 — we do not pass the parameter.
+            // temperature and budget_tokens return 400 on this model.
+            Backend::Anthropic {
+                model,
+                effort,
+                max_tokens,
+                ..
+            } => json!({
+                "model": model,
+                "max_tokens": max_tokens,
+                "output_config": {
+                    "effort": effort,
+                    "format": { "type": "json_schema", "schema": digest::response_schema() }
+                },
+                "system": system,
+                "messages": [{ "role": "user", "content": user }]
+            }),
+            Backend::Gemini { max_tokens, .. } => json!({
+                "systemInstruction": { "parts": [{ "text": system }] },
+                "contents": [{ "role": "user", "parts": [{ "text": user }] }],
+                "generationConfig": {
+                    "maxOutputTokens": max_tokens,
+                    "responseMimeType": "application/json",
+                    "responseJsonSchema": digest::response_schema()
+                }
+            }),
+        }
+    }
+
+    fn request(&self, http: &reqwest::Client) -> reqwest::RequestBuilder {
+        match self {
+            Backend::Anthropic {
+                api_key, api_url, ..
+            } => http
+                .post(api_url)
+                .header("x-api-key", api_key)
+                .header("anthropic-version", ANTHROPIC_VERSION),
+            Backend::Gemini {
+                api_key, api_url, ..
+            } => http.post(api_url).header("x-goog-api-key", api_key),
+        }
+    }
+
+    fn parse(&self, response: Value) -> Result<Summary> {
+        match self {
+            Backend::Anthropic { .. } => parse_summary(response),
+            Backend::Gemini { .. } => parse_gemini(response),
+        }
+    }
 }
 
 /// The model answer together with token usage: without it there is nothing to check the
@@ -93,21 +190,41 @@ pub struct Summary {
 }
 
 impl Summarizer {
-    pub fn new(cfg: &Anthropic) -> Result<Self> {
+    pub fn new(cfg: &Config) -> Result<Self> {
+        let (backend, timeout) = if cfg.provider == "gemini" {
+            let g = &cfg.gemini;
+            let backend = Backend::Gemini {
+                api_key: g.api_key.clone(),
+                api_url: g.api_url.replace("{model}", &g.model),
+                max_tokens: g.max_tokens,
+            };
+            (backend, g.request_timeout_secs)
+        } else {
+            let a = &cfg.anthropic;
+            let backend = Backend::Anthropic {
+                api_key: a.api_key.clone(),
+                api_url: a.api_url.clone(),
+                model: a.model.clone(),
+                effort: a.effort.clone(),
+                max_tokens: a.max_tokens,
+            };
+            (backend, a.request_timeout_secs)
+        };
+
         let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(cfg.request_timeout_secs))
+            .timeout(Duration::from_secs(timeout))
             .build()
             .context("could not create the HTTP client")?;
 
+        let model = if cfg.provider == "gemini" {
+            cfg.gemini.model.clone()
+        } else {
+            cfg.anthropic.model.clone()
+        };
         Ok(Self {
             http,
-            cfg: AnthropicSettings {
-                api_key: cfg.api_key.clone(),
-                api_url: cfg.api_url.clone(),
-                model: cfg.model.clone(),
-                effort: cfg.effort.clone(),
-                max_tokens: cfg.max_tokens,
-            },
+            backend,
+            model,
             limits: Limits::default(),
         })
     }
@@ -293,25 +410,36 @@ impl Summarizer {
     /// `effort = "high"` the answer takes minutes, no sensible `stop_grace_period`
     /// covers that.
     async fn ask(&self, system: &str, user: &str, cancel: &Cancel) -> Result<Summary> {
-        // thinking is on by default on claude-opus-5 — we do not pass the parameter.
-        // temperature and budget_tokens return 400 on this model.
-        let body = json!({
-            "model": self.cfg.model,
-            "max_tokens": self.cfg.max_tokens,
-            "output_config": {
-                "effort": self.cfg.effort,
-                "format": { "type": "json_schema", "schema": digest::response_schema() }
-            },
-            "system": system,
-            "messages": [{ "role": "user", "content": user }]
-        });
+        let body = self.backend.body(system, user);
 
-        let response = tokio::select! {
-            _ = cancel.cancelled() => bail!("model request stopped by the shutdown signal"),
-            result = self.post_with_retries(&body) => result?,
-        };
-
-        parse_summary(response)
+        // A broken answer (see `Digest::defect`) is asked again once. If the second
+        // one is broken too, the run fails and the cursors do not move.
+        let mut attempt = 1;
+        loop {
+            tracing::info!(
+                api = self.backend.name(),
+                model = %self.model,
+                system_chars = system.chars().count(),
+                user_chars = user.chars().count(),
+                attempt,
+                "asking the model, this can take a few minutes"
+            );
+            let started = std::time::Instant::now();
+            let response = tokio::select! {
+                _ = cancel.cancelled() => bail!("model request stopped by the shutdown signal"),
+                result = self.post_with_retries(&body) => result?,
+            };
+            tracing::info!(seconds = started.elapsed().as_secs(), "the model answered");
+            let summary = self.backend.parse(response)?;
+            let Some(defect) = summary.digest.defect() else {
+                return Ok(summary);
+            };
+            if attempt >= MAX_BROKEN_ANSWERS {
+                bail!("the model answer is broken again ({defect}), nothing is posted");
+            }
+            tracing::warn!(%defect, attempt, "the model answer is broken, asking again");
+            attempt += 1;
+        }
     }
 
     /// We retry only what makes sense to retry: 429 (by `retry-after`),
@@ -323,11 +451,10 @@ impl Summarizer {
         loop {
             attempt += 1;
 
+            let api = self.backend.name();
             let result = self
-                .http
-                .post(&self.cfg.api_url)
-                .header("x-api-key", &self.cfg.api_key)
-                .header("anthropic-version", ANTHROPIC_VERSION)
+                .backend
+                .request(&self.http)
                 .header("content-type", "application/json")
                 .json(body)
                 .send()
@@ -341,7 +468,9 @@ impl Summarizer {
                     tokio::time::sleep(delay).await;
                     continue;
                 }
-                Err(e) => return Err(e).context("request to the Anthropic API failed"),
+                Err(e) => {
+                    return Err(e).with_context(|| format!("request to the {api} API failed"))
+                }
             };
 
             let status = response.status();
@@ -350,7 +479,7 @@ impl Summarizer {
                 return response
                     .json()
                     .await
-                    .context("the Anthropic API answer is not JSON");
+                    .with_context(|| format!("the {api} API answer is not JSON"));
             }
 
             let retry_after = response
@@ -364,13 +493,25 @@ impl Summarizer {
 
             let retryable = status.as_u16() == 429 || status.is_server_error();
             if retryable && attempt < MAX_ATTEMPTS {
-                let delay = retry_after.unwrap_or_else(|| backoff(attempt));
-                tracing::warn!(%status, attempt, ?delay, "the API returned a temporary error, retrying");
+                // An overloaded server (5xx) needs more time than a network glitch.
+                let delay = retry_after.unwrap_or_else(|| {
+                    if status.is_server_error() {
+                        overload_backoff(attempt)
+                    } else {
+                        backoff(attempt)
+                    }
+                });
+                let short: String = text.chars().take(200).collect();
+                tracing::warn!(%status, attempt, ?delay, answer = %short, "the API returned a temporary error, retrying");
                 tokio::time::sleep(delay).await;
                 continue;
             }
 
-            bail!("the Anthropic API returned {status}: {text}");
+            if is_limit(status, &text) {
+                let details: String = text.chars().take(300).collect();
+                return Err(LimitReached { api, details }.into());
+            }
+            bail!("the {api} API returned {status}: {text}");
         }
     }
 }
@@ -450,6 +591,11 @@ fn backoff(attempt: u32) -> Duration {
     Duration::from_secs(2u64.pow(attempt))
 }
 
+/// 15 s, 30 s, 60 s: the server said it is overloaded.
+fn overload_backoff(attempt: u32) -> Duration {
+    Duration::from_secs(15 * 2u64.pow(attempt - 1))
+}
+
 /// We check `stop_reason` BEFORE reading `content`: on a refusal the model answers
 /// HTTP 200 with `stop_reason: "refusal"` and empty content.
 fn parse_summary(response: Value) -> Result<Summary> {
@@ -505,5 +651,72 @@ fn parse_summary(response: Value) -> Result<Summary> {
         digest,
         input_tokens: usage("input_tokens"),
         output_tokens: usage("output_tokens"),
+    })
+}
+
+/// The Gemini answer: text is in `candidates[0].content.parts`, parts with
+/// `thought: true` are the model's thinking and are skipped. A blocked prompt
+/// comes back with no candidates and `promptFeedback.blockReason`.
+fn parse_gemini(response: Value) -> Result<Summary> {
+    if let Some(reason) = response
+        .pointer("/promptFeedback/blockReason")
+        .and_then(Value::as_str)
+    {
+        bail!("Gemini blocked the request (blockReason={reason})");
+    }
+
+    let candidate = response
+        .pointer("/candidates/0")
+        .with_context(|| format!("the Gemini answer has no candidates: {response}"))?;
+    let finish_reason = candidate
+        .get("finishReason")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if finish_reason == "MAX_TOKENS" {
+        bail!("the answer was cut at max_tokens — raise gemini.max_tokens in the config");
+    }
+    if finish_reason != "STOP" && !finish_reason.is_empty() {
+        bail!("Gemini stopped the answer (finishReason={finish_reason})");
+    }
+
+    let text: String = candidate
+        .pointer("/content/parts")
+        .and_then(Value::as_array)
+        .map(|parts| {
+            parts
+                .iter()
+                .filter(|p| p.get("thought").and_then(Value::as_bool) != Some(true))
+                .filter_map(|p| p.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .concat()
+        })
+        .unwrap_or_default();
+    if text.trim().is_empty() {
+        bail!("the Gemini answer has no text: {response}");
+    }
+
+    let digest: Digest = serde_json::from_str(&text)
+        .with_context(|| format!("could not parse the model answer as a digest: {text}"))?;
+
+    let usage = |field: &str| {
+        response
+            .pointer(&format!("/usageMetadata/{field}"))
+            .and_then(Value::as_u64)
+    };
+    // Thinking tokens are paid as output, so we count them there.
+    let output_tokens = add(usage("candidatesTokenCount"), usage("thoughtsTokenCount"));
+
+    tracing::info!(
+        input_tokens = usage("promptTokenCount"),
+        output_tokens,
+        %finish_reason,
+        topics = digest.topics.len(),
+        "model answer received"
+    );
+
+    Ok(Summary {
+        digest,
+        input_tokens: usage("promptTokenCount"),
+        output_tokens,
     })
 }

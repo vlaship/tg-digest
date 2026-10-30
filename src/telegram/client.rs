@@ -251,6 +251,7 @@ pub async fn collect_posts(
                         url: channel.post_url(p.msg_id),
                         origin: p.forward.as_ref().map(|f| describe_origin(f, channels)),
                         text: p.text,
+                        photos: p.photos,
                     }));
             }
             Err(ChannelError::Cancelled) => bail!("collection stopped by signal"),
@@ -347,6 +348,7 @@ async fn fetch_channel(
             grouped_id: message.grouped_id(),
             text: with_hidden_links(message.text(), message.fmt_entities()),
             forward: forward_origin(message.forward_header().as_ref()),
+            photo: message.photo().is_some(),
         });
     }
 
@@ -373,6 +375,8 @@ pub struct RawMessage {
     pub text: String,
     /// Where the repost is from, if it is a repost.
     pub forward: Option<Forward>,
+    /// The message has a photo.
+    pub photo: bool,
 }
 
 /// The origin of a repost. It is needed so that duplicate merging does not see a repost
@@ -394,6 +398,8 @@ pub struct PreparedPost {
     pub date: DateTime<Utc>,
     pub text: String,
     pub forward: Option<Forward>,
+    /// Ids of the messages with a photo, in album order.
+    pub photos: Vec<i32>,
 }
 
 pub struct Batch {
@@ -423,7 +429,11 @@ pub fn assemble(raw: &[RawMessage], min_post_chars: usize) -> Batch {
                     date: message.date,
                     text: String::new(),
                     forward: None,
+                    photos: Vec::new(),
                 });
+                if message.photo {
+                    entry.photos.push(message.id);
+                }
                 if entry.text.is_empty() && !text.is_empty() {
                     entry.text = text;
                 }
@@ -443,10 +453,18 @@ pub fn assemble(raw: &[RawMessage], min_post_chars: usize) -> Batch {
                 date: message.date,
                 text,
                 forward: message.forward.clone(),
+                photos: if message.photo {
+                    vec![message.id]
+                } else {
+                    Vec::new()
+                },
             }),
         }
     }
 
+    for album in albums.values_mut() {
+        album.photos.sort_unstable();
+    }
     posts.extend(albums.into_values());
 
     // Short posts are stickers, reactions and "media only": noise for the digest.

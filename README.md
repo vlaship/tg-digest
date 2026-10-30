@@ -121,7 +121,7 @@ Fill in `config.toml`:
 
 1. `telegram.api_id` / `api_hash` — get them at <https://my.telegram.org>;
 2. `telegram.phone` — the phone number of the account that follows the channels;
-3. `anthropic.api_key`;
+3. `anthropic.api_key`, or `provider = "gemini"` and `gemini.api_key` (from https://aistudio.google.com/apikey);
 4. `bot.token` — create a bot with [@BotFather](https://t.me/BotFather): send it
    `/newbot`, choose a name and a username, and copy the token it gives you.
 
@@ -160,6 +160,8 @@ every run, so a renamed channel keeps correct links.
 Each digest goes to you and to every user in `bot.allowed_users` who has started
 the bot, except those who sent `/stop` (you can send it too).
 A story from the last digest is not sent again, unless there is real news about it.
+After a delivered digest the posts are marked as read in Telegram for your account
+(`telegram.mark_read`), so the channels do not keep unread counters.
 Notifications come only to you: a failed run, an excluded channel, an undelivered
 digest.
 

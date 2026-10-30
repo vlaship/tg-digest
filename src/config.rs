@@ -12,7 +12,13 @@ use std::path::Path;
 pub struct Config {
     pub schedule: Schedule,
     pub telegram: Telegram,
+    /// Which model writes the digest: "anthropic" (default) or "gemini".
+    #[serde(default = "default_provider")]
+    pub provider: String,
+    #[serde(default)]
     pub anthropic: Anthropic,
+    #[serde(default)]
+    pub gemini: Gemini,
     pub prompts: Prompts,
     /// The bot you talk to: commands, replies, digests, notifications.
     #[serde(default)]
@@ -86,6 +92,10 @@ pub struct Telegram {
     /// How many channels are read at the same time.
     #[serde(default = "default_parallel_channels")]
     pub parallel_channels: usize,
+    /// After a delivered (or empty) run, mark the read posts as read in Telegram, so
+    /// the channels do not keep unread counters for news the digest already told.
+    #[serde(default = "default_true")]
+    pub mark_read: bool,
     /// For how many hours the daemon itself retries an undelivered digest. After this
     /// window the retry is manual only (`/resume`), see docs/PLAN.md 9.3.
     #[serde(default = "default_publish_retry_window_hours")]
@@ -106,6 +116,46 @@ pub struct Anthropic {
     pub api_url: String,
     #[serde(default = "default_timeout_secs")]
     pub request_timeout_secs: u64,
+}
+
+impl Default for Anthropic {
+    fn default() -> Self {
+        Self {
+            api_key: String::new(),
+            model: default_model(),
+            effort: default_effort(),
+            max_tokens: default_max_tokens(),
+            api_url: default_api_url(),
+            request_timeout_secs: default_timeout_secs(),
+        }
+    }
+}
+
+/// Google Gemini API. The key is from Google AI Studio: a Gemini app
+/// subscription (Google AI Pro / Ultra) does not give API access.
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+pub struct Gemini {
+    pub api_key: String,
+    pub model: String,
+    pub max_tokens: u32,
+    /// `{model}` is replaced with the model id.
+    pub api_url: String,
+    pub request_timeout_secs: u64,
+}
+
+impl Default for Gemini {
+    fn default() -> Self {
+        Self {
+            api_key: String::new(),
+            model: "gemini-2.5-flash".into(),
+            max_tokens: 32000,
+            api_url:
+                "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+                    .into(),
+            request_timeout_secs: default_timeout_secs(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -149,8 +199,15 @@ impl Config {
         if self.telegram.phone.is_empty() {
             bail!("telegram.phone is not set");
         }
-        if self.anthropic.api_key.is_empty() {
-            bail!("anthropic.api_key is not set");
+        match self.provider.as_str() {
+            "anthropic" if self.anthropic.api_key.is_empty() => {
+                bail!("anthropic.api_key is not set")
+            }
+            "gemini" if self.gemini.api_key.is_empty() => {
+                bail!("gemini.api_key is not set (get it at https://aistudio.google.com/apikey)")
+            }
+            "anthropic" | "gemini" => {}
+            other => bail!("provider must be \"anthropic\" or \"gemini\", not {other:?}"),
         }
         if self.telegram.lookback_hours <= 0 {
             bail!("telegram.lookback_hours must be greater than zero");
@@ -192,6 +249,9 @@ fn default_max_posts() -> usize {
 fn default_min_post_chars() -> usize {
     30
 }
+fn default_true() -> bool {
+    true
+}
 fn default_parallel_channels() -> usize {
     5
 }
@@ -200,6 +260,9 @@ fn default_pause_ms() -> u64 {
 }
 fn default_publish_retry_window_hours() -> i64 {
     2
+}
+fn default_provider() -> String {
+    "anthropic".into()
 }
 fn default_model() -> String {
     "claude-opus-5".into()

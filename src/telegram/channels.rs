@@ -8,7 +8,7 @@ use anyhow::{Context, Result};
 use grammers_client::client::Client;
 use grammers_client::tl;
 use grammers_session::types::PeerKind;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use crate::db::{Channel, Db};
 use crate::telegram::client::peer_ref;
@@ -146,6 +146,42 @@ fn channel_names(chat: &tl::enums::Chat) -> Option<(i64, Option<String>, String)
         tl::enums::Chat::Channel(c) => Some((c.id, c.username.clone(), c.title.clone())),
         tl::enums::Chat::ChannelForbidden(c) => Some((c.id, None, c.title.clone())),
         _ => None,
+    }
+}
+
+/// Mark posts as read in Telegram, up to each channel's cursor, for the personal account.
+/// Reading the history through the API does not do it, so the channels would keep
+/// unread counters for news the digest already told. One request per channel; a
+/// failure is only logged, it never breaks the run.
+pub async fn mark_read(client: &Client, db: &Db, cursors: &BTreeMap<i64, i32>) {
+    let mut marked = 0;
+    for (&id, &max_id) in cursors {
+        let channel = match db.channel(id).await {
+            Ok(Some(channel)) => channel,
+            Ok(None) => continue,
+            Err(e) => {
+                tracing::warn!(error = %format!("{e:#}"), id, "could not read the channel");
+                continue;
+            }
+        };
+        let request = tl::functions::channels::ReadHistory {
+            channel: tl::enums::InputChannel::Channel(tl::types::InputChannel {
+                channel_id: channel.id,
+                access_hash: channel.access_hash,
+            }),
+            max_id,
+        };
+        match client.invoke(&request).await {
+            Ok(_) => marked += 1,
+            Err(e) => tracing::warn!(
+                channel = %channel.label(),
+                error = %e,
+                "could not mark the posts as read"
+            ),
+        }
+    }
+    if marked > 0 {
+        tracing::info!(channels = marked, "posts marked as read");
     }
 }
 

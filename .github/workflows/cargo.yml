@@ -1,5 +1,5 @@
-# Checks every commit: format, lint and a release build.
-# The same check as before a commit: cargo fmt && cargo clippy --all-targets.
+# Checks every commit on a branch: format, lint and a release build. Not on main:
+# main gets only merged PRs, and their commits were checked on the branch.
 name: cargo
 
 # Only push, no pull_request: a PR branch is already checked by its push. A second,
@@ -7,7 +7,7 @@ name: cargo
 # on main and could let a broken PR merge.
 on:
   push:
-    branches: ["**"]
+    branches-ignore: [main]
   workflow_dispatch:
 
 permissions:

@@ -26,6 +26,8 @@ pub struct Post {
     /// Where the repost is from, if it is a repost: without the label the model sees a repost
     /// and the original as two different news items and does not merge them into one item.
     pub origin: Option<String>,
+    /// Ids of the messages with a photo: one for a post, several for an album.
+    pub photos: Vec<i32>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -41,6 +43,35 @@ impl Digest {
     pub fn is_empty(&self) -> bool {
         self.topics.is_empty()
     }
+
+    /// Why the answer looks broken, if it does. Sometimes the model writes the short
+    /// summary in full, but then only a few topics and a stub like "placeholder". Such
+    /// a digest must not be posted: the cursors would move, and the news would be lost.
+    pub fn defect(&self) -> Option<String> {
+        if self.topics.len() < self.tldr.len() {
+            return Some(format!(
+                "{} items in the short summary, but only {} topics",
+                self.tldr.len(),
+                self.topics.len()
+            ));
+        }
+        for topic in &self.topics {
+            let title = topic.title.trim();
+            let summary = topic.summary.trim();
+            if title.is_empty() || summary.is_empty() || is_stub(title) || is_stub(summary) {
+                return Some(format!("a topic is a stub: title {title:?}"));
+            }
+        }
+        None
+    }
+}
+
+fn is_stub(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    ["placeholder", "todo", "tbd", "lorem ipsum", "..."]
+        .iter()
+        .any(|stub| lower == *stub)
+        || lower.contains("placeholder")
 }
 
 #[derive(Debug, Deserialize)]
@@ -128,6 +159,28 @@ pub fn drop_foreign_sources(digest: &mut Digest, posts: &[Post]) -> usize {
         });
     }
     dropped
+}
+
+/// Telegram puts at most 10 photos in one album.
+pub const MAX_PHOTOS: usize = 10;
+
+/// Photos for a topic: all photos of ONE source post — the one with the most photos,
+/// the first source on a tie. Photos of different channels are not mixed: often it
+/// is the same picture twice. Returns `(channel_id, message ids)`.
+pub fn pick_photos(topic: &Topic, posts: &[Post]) -> Option<(i64, Vec<i32>)> {
+    let mut best: Option<&Post> = None;
+    for source in &topic.sources {
+        let Some(post) = posts.iter().find(|p| p.url == source.url) else {
+            continue;
+        };
+        if post.photos.len() > best.map_or(0, |b| b.photos.len()) {
+            best = Some(post);
+        }
+    }
+    best.map(|post| {
+        let ids = post.photos.iter().take(MAX_PHOTOS).copied().collect();
+        (post.channel_id, ids)
+    })
 }
 
 /// Input for the model: posts grouped by channel, each with a link —
@@ -341,10 +394,26 @@ pub fn format_partials(parts: &[Digest]) -> String {
 /// Rendering to Telegram-HTML. We build the markup ourselves and do not ask the model: fixing
 /// broken markdown from an LLM costs more than building HTML from the structure.
 pub fn render_html(digest: &Digest, opts: &RenderOptions) -> Vec<String> {
+    render_parts(digest, opts)
+        .into_iter()
+        .map(|part| part.html)
+        .collect()
+}
+
+/// One message of the digest and the topic it belongs to (`None` for the title and
+/// "In short"): photos are added to the messages of a topic.
+pub struct Part {
+    pub html: String,
+    pub topic: Option<usize>,
+}
+
+pub fn render_parts(digest: &Digest, opts: &RenderOptions) -> Vec<Part> {
     if digest.is_empty() {
         return Vec::new();
     }
 
+    // The first message is the title with "In short", then every topic is its own
+    // message. `pack` still cuts a block that alone is longer than the limit.
     let mut blocks: Vec<String> = Vec::new();
 
     let date = opts
@@ -364,8 +433,12 @@ pub fn render_html(digest: &Digest, opts: &RenderOptions) -> Vec<String> {
         }
         blocks.push(tldr);
     }
+    let mut messages: Vec<Part> = pack(blocks)
+        .into_iter()
+        .map(|html| Part { html, topic: None })
+        .collect();
 
-    for topic in &digest.topics {
+    for (index, topic) in digest.topics.iter().enumerate() {
         let mut block = format!(
             "<b>{}</b>\n{}",
             escape(&topic.title),
@@ -379,10 +452,13 @@ pub fn render_html(digest: &Digest, opts: &RenderOptions) -> Vec<String> {
                 .collect();
             block.push_str(&format!("\n{}", links.join(" · ")));
         }
-        blocks.push(block);
+        messages.extend(pack(vec![block]).into_iter().map(|html| Part {
+            html,
+            topic: Some(index),
+        }));
     }
 
-    pack(blocks)
+    messages
 }
 
 /// We put blocks into messages by the limit, without cutting a topic in half.

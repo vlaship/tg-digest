@@ -7,4 +7,5 @@ pub mod bot;
 pub mod channels;
 pub mod client;
 pub mod commands;
+pub mod photos;
 pub mod publish;

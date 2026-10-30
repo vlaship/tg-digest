@@ -32,7 +32,7 @@ Toolchain: `cargo --version`. If the command is missing, the install steps are i
 
 Working config: `config.toml` (not `config.example.toml`). If it is missing, copy
 the example and name the fields the owner must fill in: `telegram.api_id`,
-`telegram.api_hash`, `telegram.phone`, `anthropic.api_key`, `bot.token` (from
+`telegram.api_hash`, `telegram.phone`, `anthropic.api_key` (or `gemini.api_key` with `provider = "gemini"`), `bot.token` (from
 @BotFather). Channels are not in the config: the owner adds them with `/add` in
 the chat with the bot. The owner must send the bot `/start` once, or the bot
 cannot write to them.
