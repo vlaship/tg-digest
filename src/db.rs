@@ -82,6 +82,8 @@ const MIGRATIONS: &[&str] = &[
     // 7: how many photos a part has. The files are in the photos folder
     // (`photos.rs`), downloaded once at `summarized` time.
     "ALTER TABLE run_chunks ADD COLUMN photos INTEGER NOT NULL DEFAULT 0",
+    // 8: settings the owner changes with commands, like the active model provider.
+    "CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
 ];
 
 /// A channel in the database. `id` is the "bare" Telegram channel id (positive,
@@ -498,6 +500,30 @@ impl Db {
                 .context("digest topics in the database are damaged")?,
             None => Vec::new(),
         })
+    }
+
+    pub async fn setting(&self, key: &str) -> Result<Option<String>> {
+        let mut rows = self
+            .conn
+            .prepare("SELECT value FROM settings WHERE key = ?1")
+            .await?
+            .query(params![key])
+            .await?;
+        Ok(match rows.next().await? {
+            Some(row) => Some(row.get(0)?),
+            None => None,
+        })
+    }
+
+    pub async fn set_setting(&self, key: &str, value: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO settings (key, value) VALUES (?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![key, value],
+            )
+            .await?;
+        Ok(())
     }
 
     pub async fn start_run(&self, trigger: &str) -> Result<i64> {

@@ -18,6 +18,10 @@ db_file = "/data/digest.db"
 # Which model writes the digest: "anthropic" ([anthropic] below) or "gemini" ([gemini]).
 provider = "anthropic"
 
+# Where to switch when the limit of `provider` is used up. The bot asks the owner
+# first (/fallback), nothing switches by itself. Its key must be set too.
+# fallback_provider = "gemini"
+
 # ------------------------------------------------------------------ schedule --
 [schedule]
 # Standard 5-field cron: minute hour day month weekday

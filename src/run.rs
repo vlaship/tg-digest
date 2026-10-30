@@ -23,6 +23,9 @@ pub const TRIGGER_CRON: &str = "cron";
 pub const TRIGGER_CATCH_UP: &str = "catch_up";
 pub const TRIGGER_MANUAL: &str = "manual";
 
+/// Key in the `settings` table for the provider the owner chose.
+const PROVIDER_SETTING: &str = "provider";
+
 /// How a trigger ended. We reply to `/run` with the same text.
 pub enum Outcome {
     /// The lock is taken: a run is already going.
@@ -118,6 +121,27 @@ impl Runner {
             Some(bot) => bot.notify(text).await,
             None => tracing::warn!(%text, "notification (no bot in this command)"),
         }
+    }
+
+    /// The model provider for the next run: the one the owner chose with `/provider`
+    /// or `/fallback` (kept in the database), else `provider` from the config.
+    pub async fn provider(&self) -> String {
+        match self.db.setting(PROVIDER_SETTING).await {
+            Ok(Some(name)) if self.cfg.check_provider(&name).is_ok() => name,
+            Ok(_) => self.cfg.provider.clone(),
+            Err(e) => {
+                tracing::warn!(error = %format!("{e:#}"), "could not read the provider setting");
+                self.cfg.provider.clone()
+            }
+        }
+    }
+
+    /// Switch the model provider. The name and its key are checked first.
+    pub async fn set_provider(&self, name: &str) -> Result<()> {
+        self.cfg.check_provider(name)?;
+        self.db.set_setting(PROVIDER_SETTING, name).await?;
+        tracing::info!(provider = name, "model provider switched");
+        Ok(())
     }
 
     /// The lock for commands that touch cursors and run status.
@@ -295,7 +319,8 @@ impl Runner {
             return self.finish_empty(run_id, &collected, (None, None)).await;
         }
 
-        let summarizer = match Summarizer::new(&self.cfg) {
+        let provider = self.provider().await;
+        let summarizer = match Summarizer::new(&self.cfg, &provider) {
             Ok(s) => s,
             Err(e) => return self.fail(run_id, e).await,
         };
@@ -546,12 +571,23 @@ impl Runner {
                 .chain()
                 .find_map(|e| e.downcast_ref::<crate::summarize::LimitReached>());
             let text = match limit {
-                Some(limit) => format!(
-                    "⚠️ the {} API limit is used up, the digest is not built.\n\
-                     The posts are kept and go into the next run. \
-                     Wait for the limit to reset, or switch the model in the config.\n\n{}",
-                    limit.api, limit.details
-                ),
+                Some(limit) => {
+                    let current = self.provider().await;
+                    let choice = match &self.cfg.fallback_provider {
+                        Some(fallback) if *fallback != current => format!(
+                            "Switch to {fallback} and build the digest now? Send /fallback.\n\
+                             Later, /provider {current} switches back."
+                        ),
+                        _ => "Wait for the limit to reset, or set fallback_provider \
+                              in the config."
+                            .to_string(),
+                    };
+                    format!(
+                        "⚠️ the {} API limit is used up, the digest is not built.\n\
+                         The posts are kept and go into the next run.\n\n{choice}\n\n{}",
+                        limit.api, limit.details
+                    )
+                }
                 None => format!("digest not built: {reason}"),
             };
             self.notify(&text).await;
