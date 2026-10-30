@@ -23,7 +23,7 @@ use it is in [README.md](README.md).
 | `src/telegram/publish.rs` | sending parts by `random_id`, delivery journal |
 | `src/telegram/bot.rs` | the bot: login with the token, the chat with the owner, notifications |
 | `src/telegram/commands.rs` | commands to the bot (`/add`, `/rm`, `/run`, `/status`, …), only from the owner |
-| `src/summarize.rs` | HTTP calls to the Anthropic Messages API, map-reduce |
+| `src/summarize.rs` | HTTP calls to the model API (Anthropic or Gemini, `provider`), map-reduce |
 | `src/digest.rs` | JSON schema of the answer, link checks, Telegram-HTML rendering, splitting |
 | `Dockerfile`, `compose.yaml` | image and run; all state is in the `/data` volume |
 

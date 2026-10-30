@@ -290,7 +290,7 @@ impl Runner {
             return self.finish_empty(run_id, &collected, (None, None)).await;
         }
 
-        let summarizer = match Summarizer::new(&self.cfg.anthropic) {
+        let summarizer = match Summarizer::new(&self.cfg) {
             Ok(s) => s,
             Err(e) => return self.fail(run_id, e).await,
         };

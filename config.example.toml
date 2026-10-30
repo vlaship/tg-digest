@@ -15,6 +15,9 @@
 # a container restart, together with the text of its parts and their random_id.
 db_file = "/data/digest.db"
 
+# Which model writes the digest: "anthropic" ([anthropic] below) or "gemini" ([gemini]).
+provider = "anthropic"
+
 # ------------------------------------------------------------------ schedule --
 [schedule]
 # Standard 5-field cron: minute hour day month weekday
@@ -116,6 +119,15 @@ max_tokens = 16000
 
 api_url              = "https://api.anthropic.com/v1/messages"
 request_timeout_secs = 600
+
+# ------------------------------------------------------------------- gemini --
+# Used when provider = "gemini". The key is from https://aistudio.google.com/apikey
+# (free tier with limits). A Gemini app subscription (AI Pro / Ultra) gives no API access.
+[gemini]
+api_key    = "..."
+# Check the model list in AI Studio, ids change often.
+model      = "gemini-2.5-flash"
+max_tokens = 32000
 
 # ------------------------------------------------------------------ prompts --
 # Edit them here, no rebuild needed. Placeholders in user_template:
