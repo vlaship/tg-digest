@@ -1,11 +1,8 @@
-//! Loading `config.toml`: secrets, schedule, prompts, limits.
+//! Loading `config.toml`: secrets, schedule, prompts, limits — everything comes from
+//! this one file (in a container: `/data/config.toml`).
 //!
-//! Secrets live in the TOML, but any of the environment variables `TG_API_ID`,
-//! `TG_API_HASH`, `TG_PHONE`, `ANTHROPIC_API_KEY` overrides the value from the file —
-//! so the same config moves to another machine without edits.
-//!
-//! There is no channel list here any more: the truth about channels is in the
-//! Telegram folder and in the database (`db.rs`). `[[channels]]` is only a seed for an empty database.
+//! There is no channel list here: it lives only in the database (`db.rs`) and is
+//! managed with `/add` and `/rm` in Saved Messages.
 
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
@@ -20,9 +17,6 @@ pub struct Config {
     /// Database file. In a container it is in the `/data` volume, next to the session.
     #[serde(default = "default_db_file")]
     pub db_file: String,
-    /// Seed: used only if the channel table is empty.
-    #[serde(default)]
-    pub channels: Vec<SeedChannel>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -48,10 +42,6 @@ pub struct Telegram {
     pub session_file: String,
     #[serde(default = "default_destination")]
     pub destination: String,
-    /// Name of the folder (dialog filter) in the account — the source of the channel list.
-    /// Not set → only the `/add` and `/rm` commands manage channels.
-    #[serde(default)]
-    pub folder: Option<String>,
     #[serde(default = "default_lookback_hours")]
     pub lookback_hours: i64,
     /// A safety limit against reading the whole history, **not** a digest cut: a channel
@@ -99,21 +89,6 @@ pub struct Prompts {
     pub tldr_title: String,
 }
 
-/// A channel from the config. It is needed only to fill an empty database on the
-/// first start: after that the list lives in the Telegram folder and in the database.
-#[derive(Debug, Clone, Deserialize)]
-pub struct SeedChannel {
-    #[serde(default)]
-    pub username: Option<String>,
-    /// Private channel: `-100…` or a "bare" id. Works without a username.
-    #[serde(default)]
-    pub id: Option<i64>,
-    #[serde(default)]
-    pub title: Option<String>,
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-}
-
 impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         let raw = std::fs::read_to_string(path).with_context(|| {
@@ -126,30 +101,9 @@ impl Config {
         let mut cfg: Config =
             toml::from_str(&raw).with_context(|| format!("{} — invalid TOML", path.display()))?;
 
-        cfg.apply_env_overrides();
         cfg.telegram.phone = normalize_phone(&cfg.telegram.phone);
         cfg.validate()?;
         Ok(cfg)
-    }
-
-    fn apply_env_overrides(&mut self) {
-        if let Some(v) = env("TG_API_ID") {
-            match v.parse() {
-                Ok(id) => self.telegram.api_id = id,
-                Err(_) => tracing::warn!(
-                    "TG_API_ID={v} is not a number, the value from the config is kept"
-                ),
-            }
-        }
-        if let Some(v) = env("TG_API_HASH") {
-            self.telegram.api_hash = v;
-        }
-        if let Some(v) = env("TG_PHONE") {
-            self.telegram.phone = v;
-        }
-        if let Some(v) = env("ANTHROPIC_API_KEY") {
-            self.anthropic.api_key = v;
-        }
     }
 
     /// We catch empty required fields here, not on the first network call:
@@ -162,7 +116,7 @@ impl Config {
             bail!("telegram.phone is not set");
         }
         if self.anthropic.api_key.is_empty() {
-            bail!("anthropic.api_key is not set (or the ANTHROPIC_API_KEY environment variable)");
+            bail!("anthropic.api_key is not set");
         }
         if self.telegram.lookback_hours <= 0 {
             bail!("telegram.lookback_hours must be greater than zero");
@@ -173,29 +127,8 @@ impl Config {
         if self.telegram.publish_retry_window_hours < 0 {
             bail!("telegram.publish_retry_window_hours cannot be negative");
         }
-        if self.telegram.folder.as_deref().map(str::trim) == Some("") {
-            bail!("telegram.folder is an empty string — remove the key or enter a folder name");
-        }
-        for channel in &self.channels {
-            if channel.username.is_none() && channel.id.is_none() {
-                bail!("[[channels]] has an entry with no username and no id");
-            }
-        }
         Ok(())
     }
-
-    /// Seed channels that must be added to an empty database.
-    pub fn seed_channels(&self) -> Vec<&SeedChannel> {
-        self.channels.iter().filter(|c| c.enabled).collect()
-    }
-}
-
-/// An empty environment variable means "not set", not "delete the key from the config".
-/// Orchestrators often put an empty string in place of a variable that is not set,
-/// and without this check a config with secrets would break on an empty `.env`.
-fn env(name: &str) -> Option<String> {
-    let value = std::env::var(name).ok()?;
-    (!value.trim().is_empty()).then_some(value)
 }
 
 fn default_timezone() -> String {
@@ -245,9 +178,6 @@ fn default_digest_title() -> String {
 }
 fn default_tldr_title() -> String {
     "In short".into()
-}
-fn default_true() -> bool {
-    true
 }
 
 /// Telegram expects the number as digits: we remove dashes, spaces and brackets from
@@ -313,22 +243,21 @@ mod tests {
     }
 
     #[test]
-    fn minimal_config_is_valid_without_any_channels() {
-        let cfg =
-            parse(MINIMAL).expect("channels live in the database, a config without them is valid");
+    fn minimal_config_is_valid() {
+        let cfg = parse(MINIMAL).expect("channels live in the database, the config has none");
         assert_eq!(cfg.telegram.max_posts_per_channel, 1000);
         assert_eq!(cfg.telegram.publish_retry_window_hours, 2);
-        assert!(cfg.telegram.folder.is_none());
         assert_eq!(cfg.db_file, "/data/digest.db");
+        assert_eq!(cfg.telegram.session_file, "/data/tg.session");
     }
 
+    /// Old configs may still have `folder` and `[[channels]]`: they are ignored,
+    /// so an existing data/config.toml keeps working after the update.
     #[test]
-    fn seed_channel_needs_a_username_or_an_id() {
-        let raw = format!("{MINIMAL}\n[[channels]]\ntitle = \"no address\"\n");
-        assert!(parse(&raw).is_err());
-
-        let raw = format!("{MINIMAL}\n[[channels]]\nid = -1001234567890\n");
-        assert_eq!(parse(&raw).unwrap().seed_channels().len(), 1);
+    fn old_folder_and_channel_keys_are_ignored() {
+        let raw = MINIMAL.replace("phone =", "folder = \"Digest\"\nphone =")
+            + "\n[[channels]]\nusername = \"news\"\n";
+        assert!(parse(&raw).is_ok());
     }
 
     /// The example config is part of the docs: it must be parsed by the same
@@ -338,37 +267,10 @@ mod tests {
         let cfg: Config = toml::from_str(include_str!("../config.example.toml"))
             .expect("config.example.toml must parse");
 
-        assert_eq!(cfg.telegram.folder.as_deref(), Some("Digest"));
         assert_eq!(cfg.telegram.publish_retry_window_hours, 2);
         assert_eq!(cfg.telegram.max_posts_per_channel, 1000);
         assert_eq!(cfg.db_file, "/data/digest.db");
         assert!(cfg.prompts.digest_title.contains("{{date}}"));
         assert!(cfg.prompts.user_template.contains("{{posts}}"));
-    }
-
-    #[test]
-    fn empty_folder_name_is_rejected() {
-        let raw = MINIMAL.replace("phone =", "folder = \"\"\nphone =");
-        assert!(parse(&raw).is_err());
-    }
-
-    /// Environment variables are shared by the whole process, so there is one check and it
-    /// runs step by step inside the test.
-    #[test]
-    fn empty_env_override_does_not_erase_a_configured_secret() {
-        let mut cfg: Config = toml::from_str(MINIMAL).unwrap();
-
-        std::env::set_var("TG_API_HASH", "");
-        std::env::set_var("ANTHROPIC_API_KEY", "   ");
-        cfg.apply_env_overrides();
-        assert_eq!(cfg.telegram.api_hash, "hash");
-        assert_eq!(cfg.anthropic.api_key, "key");
-
-        std::env::set_var("TG_API_HASH", "from-env");
-        cfg.apply_env_overrides();
-        assert_eq!(cfg.telegram.api_hash, "from-env");
-
-        std::env::remove_var("TG_API_HASH");
-        std::env::remove_var("ANTHROPIC_API_KEY");
     }
 }

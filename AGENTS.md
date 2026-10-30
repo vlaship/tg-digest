@@ -13,15 +13,15 @@ use it is in [README.md](README.md).
 | File | What it does |
 |---|---|
 | `src/main.rs` | CLI (`login` / `preview` / `run --dry-run` / `serve`), scheduler, signals |
-| `src/config.rs` | `config.toml` + env overrides for secrets, validation |
+| `src/config.rs` | `config.toml` (all settings and secrets), validation |
 | `src/db.rs` | SQLite: channels with cursors, journal of runs and delivered parts |
 | `src/run.rs` | one full run (collect, summarize, publish), the lock, recovery of undelivered runs |
 | `src/cancel.rs` | safe shutdown on SIGTERM / Ctrl+C |
 | `src/schedule.rs` | croner: next trigger, catch-up of missed slots |
 | `src/telegram/client.rs` | connection, login, reading posts by cursor |
-| `src/telegram/folder.rs` | the Telegram folder as the channel list: read, check, sync |
+| `src/telegram/channels.rs` | finding a channel for `/add`, reading titles and usernames before each run |
 | `src/telegram/publish.rs` | sending parts by `random_id`, delivery journal |
-| `src/telegram/commands.rs` | Saved Messages commands (`/add`, `/run`, `/status`, …) |
+| `src/telegram/commands.rs` | Saved Messages commands (`/add`, `/rm`, `/run`, `/status`, …) |
 | `src/summarize.rs` | HTTP calls to the Anthropic Messages API, map-reduce |
 | `src/digest.rs` | JSON schema of the answer, link checks, Telegram-HTML rendering, splitting |
 | `Dockerfile`, `compose.yaml` | image and run; all state is in the `/data` volume |
@@ -58,16 +58,17 @@ words.
 
 **Secrets.** `config.toml` and `tg.session` are in `.gitignore` and must stay
 there. `tg.session` gives full access to the Telegram account — it is not "just a
-cache". Only `config.example.toml` goes into the repository. The secret
-environment overrides are `TG_API_ID`, `TG_API_HASH`, `TG_PHONE` and
-`ANTHROPIC_API_KEY`. When you add a setting, add it to the example too. When you
-add a module, add it to the table above. Never commit runtime state.
+cache". Only `config.example.toml` goes into the repository. All settings, the
+secrets too, come only from `config.toml` (in a container: `data/config.toml`,
+mounted as `/data`); there are no environment overrides. When you add a setting,
+add it to the example too. When you add a module, add it to the table above.
+Never commit runtime state.
 
-**The truth about channels is in the database and in the Telegram folder,** not in
-the config. `[[channels]]` is only a seed for an empty database. After the first
-start, changes there do nothing. Titles and usernames are read again before every
-run (`refresh_channels`) with one `channels.getChannels` call — with or without a
-folder. Otherwise a renamed channel would stay in the digest forever with an old
+**The channel list lives only in the database.** It is managed with `/add` and
+`/rm` in Saved Messages. There is no Telegram folder, no `[[channels]]` in the
+config, and no sync step. Titles and usernames are read again before every run
+(`refresh_channels`, one `channels.getChannels` call); this never changes the
+list. Otherwise a renamed channel would stay in the digest forever with an old
 link.
 
 **grammers 0.10.** The crate is pre-1.0, and its API changed a lot after 0.7–0.9.

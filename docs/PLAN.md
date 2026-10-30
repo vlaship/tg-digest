@@ -934,3 +934,19 @@ have no username. `/list` and the `/add` reply always show the `id`.
     saved `random_id`), `status = ok`, the cursors are applied. Repeat the scenario with
     `/abandon N` → `error: abandoned`, the cursors are in place, the next `/run`
     collects the same posts.
+
+---
+
+## Update 2026-10-30: one channel list, in the database
+
+The Telegram folder, the `[[channels]]` seed in the config and the environment
+overrides for secrets are removed:
+
+- The channel list lives only in the database. It is managed with `/add` and `/rm`
+  in Saved Messages; `/sync` is gone. There is no sync step at all.
+- Before every run, titles and usernames are still read again with one
+  `channels.getChannels` call (`telegram/channels.rs`). This never changes the list.
+- All settings, the secrets too, come only from `config.toml` (`data/config.toml`
+  in the container). Old keys `telegram.folder` and `[[channels]]` are ignored.
+
+The text above about folders and the seed is history: it describes earlier steps.

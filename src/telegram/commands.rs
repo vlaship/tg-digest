@@ -22,7 +22,7 @@ use crate::cancel::Cancel;
 use crate::db::Channel;
 use crate::run::{Runner, TRIGGER_MANUAL};
 use crate::telegram::client::is_auth_error;
-use crate::telegram::{folder, publish};
+use crate::telegram::{channels, publish};
 
 const HELP: &str = "\
 /add @channel | link | id — add a channel
@@ -34,7 +34,6 @@ const HELP: &str = "\
 /last — send the last digest again
 /resume N — deliver an old run (a duplicate is possible)
 /abandon N — cancel an undelivered run
-/sync — read the folder again
 /help — this help";
 
 /// Run the updates loop until the shutdown signal comes.
@@ -159,7 +158,6 @@ async fn handle(runner: &Arc<Runner>, text: &str) -> Result<String> {
             Err(_) => Ok("a run number is needed: /abandon 12".into()),
         },
         // Futures are lazy: the action does not start until `guarded` lets it through.
-        "/sync" => guarded(runner, sync(runner)).await,
         "/add" => guarded(runner, add(runner, arg)).await,
         "/rm" => guarded(runner, remove(runner, arg)).await,
         "/reset" => guarded(runner, reset(runner, arg)).await,
@@ -196,7 +194,7 @@ where
 async fn list(runner: &Arc<Runner>) -> Result<String> {
     let channels = runner.db.channels().await?;
     if channels.is_empty() {
-        return Ok("no channels: build the folder in Telegram and call /sync".into());
+        return Ok("no channels yet: add one with /add @channel".into());
     }
 
     let mut out = String::new();
@@ -283,54 +281,19 @@ async fn status(runner: &Arc<Runner>) -> Result<String> {
     Ok(out)
 }
 
-async fn sync(runner: &Arc<Runner>) -> Result<String> {
-    if runner.cfg.telegram.folder.is_none() {
-        return Ok("no folder is set (telegram.folder), /add and /rm manage channels".into());
-    }
-    let Some(report) = runner.sync_folder().await? else {
-        return Ok("could not read the folder, details are in the log".into());
-    };
-    if let Some(refused) = report.refused {
-        return Ok(refused);
-    }
-    Ok(format!(
-        "channels in the folder: {}\nadded: {}\ndisabled: {}",
-        report.total,
-        or_dash(&report.added),
-        or_dash(&report.disabled)
-    ))
-}
-
+/// The channel list lives only in the database, so `/add` writes there directly.
+/// A channel that was removed with `/rm` comes back with a fresh cursor.
 async fn add(runner: &Arc<Runner>, arg: &str) -> Result<String> {
     if arg.is_empty() {
         return Ok("a channel is needed: /add @name, /add https://t.me/+invite or /add id".into());
     }
 
     let peer = resolve_new_channel(runner, arg).await?;
-    let (username, title) = folder::describe(&runner.client, peer).await?;
-
-    match runner.cfg.telegram.folder.as_deref() {
-        // The folder is the single source of truth: we edit it, or the next sync
-        // undoes the edit.
-        Some(name) => match folder::find(&runner.client, name).await? {
-            folder::Lookup::Found(f) => {
-                folder::add_peer(&runner.client, &f, peer).await?;
-                folder::sync(&runner.client, &runner.db, name).await?;
-            }
-            folder::Lookup::Invalid(reason) => return Ok(reason),
-            folder::Lookup::Missing => {
-                return Ok(format!(
-                    "there is no folder {name:?} in the account — create it"
-                ))
-            }
-        },
-        None => {
-            runner
-                .db
-                .upsert_channel(peer.id, peer.access_hash, username.as_deref(), &title)
-                .await?;
-        }
-    }
+    let (username, title) = channels::describe(&runner.client, peer).await?;
+    runner
+        .db
+        .upsert_channel(peer.id, peer.access_hash, username.as_deref(), &title)
+        .await?;
 
     Ok(format!("added: {title}, id {}", peer.id))
 }
@@ -345,21 +308,8 @@ async fn remove(runner: &Arc<Runner>, arg: &str) -> Result<String> {
         ));
     };
 
-    match runner.cfg.telegram.folder.as_deref() {
-        Some(name) => match folder::find(&runner.client, name).await? {
-            folder::Lookup::Found(f) => {
-                folder::remove_peer(&runner.client, &f, channel.id).await?;
-                folder::sync(&runner.client, &runner.db, name).await?;
-            }
-            folder::Lookup::Invalid(reason) => return Ok(reason),
-            folder::Lookup::Missing => {
-                return Ok(format!("there is no folder {name:?} in the account"))
-            }
-        },
-        None => {
-            runner.db.disable_channel(channel.id).await?;
-        }
-    }
+    // Disabled, not deleted: `/list` still shows the channel with its last error.
+    runner.db.disable_channel(channel.id).await?;
 
     Ok(format!("disabled: {}, id {}", channel.title, channel.id))
 }
@@ -413,7 +363,7 @@ async fn last(runner: &Arc<Runner>) -> Result<String> {
 }
 
 /// `@username`, an invite link or a numeric id.
-async fn resolve_new_channel(runner: &Arc<Runner>, arg: &str) -> Result<folder::ChannelPeer> {
+async fn resolve_new_channel(runner: &Arc<Runner>, arg: &str) -> Result<channels::ChannelPeer> {
     let client = &runner.client;
 
     // A numeric id is a special case: there is nowhere to take access_hash from, and
@@ -424,15 +374,19 @@ async fn resolve_new_channel(runner: &Arc<Runner>, arg: &str) -> Result<folder::
             .db
             .channel(id)
             .await?
-            .map(|channel| folder::ChannelPeer {
+            .map(|channel| channels::ChannelPeer {
                 id: channel.id,
                 access_hash: channel.access_hash,
             });
         return match known {
             Some(peer) => Ok(peer),
-            None => folder::find_in_dialogs(client, id).await?.with_context(|| {
-                format!("channel id {id} is not among the dialogs — does the account follow it?")
-            }),
+            None => channels::find_in_dialogs(client, id)
+                .await?
+                .with_context(|| {
+                    format!(
+                        "channel id {id} is not among the dialogs — does the account follow it?"
+                    )
+                }),
         };
     }
 
@@ -462,7 +416,7 @@ async fn resolve_new_channel(runner: &Arc<Runner>, arg: &str) -> Result<folder::
         .map_err(|e| anyhow::anyhow!("channel is not available: {e}"))?
         .context("channel is not available")?;
 
-    Ok(folder::ChannelPeer {
+    Ok(channels::ChannelPeer {
         id: reference.id.bare_id().context("the channel has no id")?,
         access_hash: reference.auth.hash(),
     })
@@ -474,14 +428,6 @@ fn peer_kind(peer: &Peer) -> &'static str {
         Peer::User(_) => "user",
         Peer::Group(_) => "group",
         Peer::Channel(_) => "channel",
-    }
-}
-
-fn or_dash(items: &[String]) -> String {
-    if items.is_empty() {
-        "—".into()
-    } else {
-        items.join(", ")
     }
 }
 
@@ -515,7 +461,6 @@ mod tests {
             "/reset 1",
             "/abandon 1",
             "/resume 1",
-            "/sync",
             "/add @news",
             "/rm 1",
             "/last",

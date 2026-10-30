@@ -5,9 +5,10 @@
 #     cargo run -- --config config.toml preview
 #
 # config.toml is in .gitignore — it never goes into the repository.
-# Any secret value can be set with an environment variable instead of the file.
-# The variable wins over the TOML:
-#     TG_API_ID, TG_API_HASH, TG_PHONE, ANTHROPIC_API_KEY
+# All settings come only from this file, the secrets too.
+#
+# Channels are not set here: add them with /add in Saved Messages. The list is
+# stored in the database.
 
 # Database: channels, cursors, journal of runs and digest parts.
 # It is in the same volume as the session: an unfinished run must survive
@@ -42,13 +43,6 @@ phone    = "+1-000-00-00"
 # Session file (SQLite). The `tg-digest login` command creates it.
 # WARNING: it gives full access to the account — do not commit it or copy it anywhere.
 session_file = "/data/tg.session"
-
-# Name of the Telegram folder that holds the channel list. You fill the folder by
-# hand in the app: to add a channel, drag it into the folder; to remove it, drag it out.
-# A folder with automatic rules ("Channels", "Unread" and so on) is refused:
-# its content is calculated, and a sync would turn everything off at once.
-# You can remove this key — then only the /add and /rm commands manage channels.
-folder = "Digest"
 
 # Where to post the digest: "me" = Saved Messages, or "@my_channel"
 destination = "me"
@@ -128,19 +122,3 @@ tldr_title   = "In short"
 # You condense a PART of the channel feed — it will be merged with other parts later.
 # Copy all links from the input into sources exactly, do not drop anything.
 # """
-
-# ----------------------------------------------------------------- channels --
-# ONLY A SEED for an empty database: on the first start these channels are copied
-# to the database. After that the truth is in the Telegram folder and the database.
-# Edits here change nothing; channels are managed by the folder, /add, /rm and /sync.
-#
-# username — without @; for a private channel use id instead of username
-# (the account must follow it).
-
-# [[channels]]
-# username = "durov"
-# title    = "Durov"          # optional: the label in the digest
-
-# [[channels]]
-# id    = -1001234567890      # private channel
-# title = "Private channel"
