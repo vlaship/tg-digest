@@ -96,6 +96,8 @@ impl Default for Limits {
 pub struct Summarizer {
     http: reqwest::Client,
     backend: Backend,
+    /// Model id, only for the log.
+    model: String,
     limits: Limits,
 }
 
@@ -214,9 +216,15 @@ impl Summarizer {
             .build()
             .context("could not create the HTTP client")?;
 
+        let model = if cfg.provider == "gemini" {
+            cfg.gemini.model.clone()
+        } else {
+            cfg.anthropic.model.clone()
+        };
         Ok(Self {
             http,
             backend,
+            model,
             limits: Limits::default(),
         })
     }
@@ -408,10 +416,20 @@ impl Summarizer {
         // one is broken too, the run fails and the cursors do not move.
         let mut attempt = 1;
         loop {
+            tracing::info!(
+                api = self.backend.name(),
+                model = %self.model,
+                system_chars = system.chars().count(),
+                user_chars = user.chars().count(),
+                attempt,
+                "asking the model, this can take a few minutes"
+            );
+            let started = std::time::Instant::now();
             let response = tokio::select! {
                 _ = cancel.cancelled() => bail!("model request stopped by the shutdown signal"),
                 result = self.post_with_retries(&body) => result?,
             };
+            tracing::info!(seconds = started.elapsed().as_secs(), "the model answered");
             let summary = self.backend.parse(response)?;
             let Some(defect) = summary.digest.defect() else {
                 return Ok(summary);
@@ -475,8 +493,16 @@ impl Summarizer {
 
             let retryable = status.as_u16() == 429 || status.is_server_error();
             if retryable && attempt < MAX_ATTEMPTS {
-                let delay = retry_after.unwrap_or_else(|| backoff(attempt));
-                tracing::warn!(%status, attempt, ?delay, "the API returned a temporary error, retrying");
+                // An overloaded server (5xx) needs more time than a network glitch.
+                let delay = retry_after.unwrap_or_else(|| {
+                    if status.is_server_error() {
+                        overload_backoff(attempt)
+                    } else {
+                        backoff(attempt)
+                    }
+                });
+                let short: String = text.chars().take(200).collect();
+                tracing::warn!(%status, attempt, ?delay, answer = %short, "the API returned a temporary error, retrying");
                 tokio::time::sleep(delay).await;
                 continue;
             }
@@ -563,6 +589,11 @@ fn add(total: Option<u64>, next: Option<u64>) -> Option<u64> {
 
 fn backoff(attempt: u32) -> Duration {
     Duration::from_secs(2u64.pow(attempt))
+}
+
+/// 15 s, 30 s, 60 s: the server said it is overloaded.
+fn overload_backoff(attempt: u32) -> Duration {
+    Duration::from_secs(15 * 2u64.pow(attempt - 1))
 }
 
 /// We check `stop_reason` BEFORE reading `content`: on a refusal the model answers

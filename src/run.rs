@@ -458,7 +458,15 @@ impl Runner {
             }
 
             let one_message = parts.get(i + 1).map(|next| next.topic) != Some(Some(topic));
-            if one_message && publish::fits_caption(&part.html) {
+            let in_caption = one_message && publish::fits_caption(&part.html);
+            tracing::info!(
+                topic = %digest.topics[topic].title,
+                photos = files.len(),
+                kb = files.iter().map(Vec::len).sum::<usize>() / 1024,
+                in_caption,
+                "photos added to the topic"
+            );
+            if in_caption {
                 journal.push(NewChunk {
                     photos: files.len(),
                     ..text
@@ -477,6 +485,7 @@ impl Runner {
 
     async fn topic_photos(&self, topic: &digest::Topic, posts: &[digest::Post]) -> Vec<Vec<u8>> {
         let Some((channel_id, ids)) = digest::pick_photos(topic, posts) else {
+            tracing::debug!(topic = %topic.title, "no photos in the sources of the topic");
             return Vec::new();
         };
         match photos::download(&self.client, &self.db, channel_id, &ids).await {
