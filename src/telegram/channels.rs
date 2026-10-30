@@ -149,6 +149,17 @@ fn channel_names(chat: &tl::enums::Chat) -> Option<(i64, Option<String>, String)
     }
 }
 
+/// Id of the newest message in the channel, `None` if the channel has no messages.
+pub async fn last_message_id(client: &Client, peer: ChannelPeer) -> Result<Option<i32>> {
+    let reference = peer_ref(peer.id, peer.access_hash)?;
+    let mut messages = client.iter_messages(reference).limit(1);
+    let last = messages
+        .next()
+        .await
+        .with_context(|| format!("could not read the last message of channel id {}", peer.id))?;
+    Ok(last.map(|m| m.id()))
+}
+
 /// Title and username of one channel by peer.
 pub async fn describe(client: &Client, peer: ChannelPeer) -> Result<(Option<String>, String)> {
     let reference = peer_ref(peer.id, peer.access_hash)?;

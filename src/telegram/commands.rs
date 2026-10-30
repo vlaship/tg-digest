@@ -343,7 +343,21 @@ async fn add(runner: &Arc<Runner>, arg: &str) -> Result<String> {
         .upsert_channel(peer.id, peer.access_hash, username.as_deref(), &title)
         .await?;
 
-    Ok(format!("added: {title}, id {}", peer.id))
+    // Start from the newest message: only posts after adding go into the digest.
+    // If we cannot read it, the channel keeps cursor 0 (the lookback_hours window).
+    match channels::last_message_id(&runner.client, peer).await {
+        Ok(Some(last)) => runner.db.set_cursor(peer.id, last).await?,
+        Ok(None) => {}
+        Err(e) => {
+            tracing::warn!(error = %format!("{e:#}"), channel = peer.id, "could not read the last message, the lookback window is used")
+        }
+    }
+
+    Ok(format!(
+        "added: {title}, id {}. Only new posts from now on go into the digest \
+         (/reset {} reads the last lookback_hours too)",
+        peer.id, peer.id
+    ))
 }
 
 fn already_added(channel: &Channel) -> String {

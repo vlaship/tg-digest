@@ -390,6 +390,18 @@ impl Db {
         Ok(affected > 0)
     }
 
+    /// Set the cursor exactly: `/add` puts it on the last message, so only posts that
+    /// come after adding go into the digest.
+    pub async fn set_cursor(&self, id: i64, last_msg_id: i32) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE channels SET last_msg_id = ?2 WHERE id = ?1",
+                params![id, last_msg_id],
+            )
+            .await?;
+        Ok(())
+    }
+
     /// `/reset`: read the channel again from the `lookback_hours` window.
     pub async fn reset_channel(&self, id: i64) -> Result<bool> {
         let affected = self

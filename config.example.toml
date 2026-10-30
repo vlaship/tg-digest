@@ -48,7 +48,9 @@ session_file = "/data/tg.session"
 # or "@my_channel" — then the bot must be an admin of that channel.
 destination = "bot"
 
-# Time window for a new channel (one with no cursor yet) and for a channel after
+# /add starts a channel from its newest message. This window is used after
+# /reset, and for a channel whose newest message could not be read on /add.
+# Time window for a channel with no cursor yet and for a channel after
 # /reset. For other channels the limit is the cursor: a channel that failed for
 # three days gives all three days when it works again.
 lookback_hours = 24
