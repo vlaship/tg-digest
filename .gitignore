@@ -7,6 +7,9 @@
 # config.example.toml goes into the repository
 config.toml
 
+# Secrets for docker compose — only the template .env.example is committed
+.env
+
 # Telegram session file = FULL ACCESS TO THE ACCOUNT. Never commit it.
 tg.session
 tg.session-journal
