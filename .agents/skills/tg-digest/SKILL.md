@@ -2,7 +2,7 @@
 name: tg-digest
 description: >-
   Build, run and debug the tg-digest service — the container with `serve`,
-  commands in Saved Messages, the debug CLI commands login/preview/run --dry-run,
+  commands to the bot, the debug CLI commands login/preview/run --dry-run,
   the safe order for checking changes, recovery scenarios and common errors.
   Use it when you need to build the project, run a digest, check which posts are
   collected, debug the schedule or find out why a run failed.
@@ -12,8 +12,8 @@ description: >-
 
 ## How it runs
 
-The normal mode is a container with `serve`: the scheduler and the listener for
-commands in Saved Messages run in one process. Channels, cursors and the delivery
+The normal mode is a container with `serve`: the scheduler and the bot that
+listens for commands run in one process. Channels, cursors and the delivery
 journal live in the database (`digest.db`), not in the config and not in
 `state.json` — that file does not exist any more.
 
@@ -32,10 +32,12 @@ Toolchain: `cargo --version`. If the command is missing, the install steps are i
 
 Working config: `config.toml` (not `config.example.toml`). If it is missing, copy
 the example and name the fields the owner must fill in: `telegram.api_id`,
-`telegram.api_hash`, `telegram.phone`, `anthropic.api_key`. Channels are not in the
-config: the owner adds them with `/add` in Saved Messages.
+`telegram.api_hash`, `telegram.phone`, `anthropic.api_key`, `bot.token` (from
+@BotFather). Channels are not in the config: the owner adds them with `/add` in
+the chat with the bot. The owner must send the bot `/start` once, or the bot
+cannot write to them.
 
-**Never print the content of `config.toml`, `tg.session` or `digest.db`
+**Never print the content of `config.toml`, `tg.session`, `bot.session` or `digest.db`
 to a log or a reply** — they hold keys, account access and digest texts.
 
 ## Order for checking changes
@@ -46,13 +48,12 @@ only after the previous one is clean.
 | Step | Command | What it checks | Cost |
 |---|---|---|---|
 | 1 | `cargo build` | compilation | — |
-| 2 | `cargo test` | answer parsing, rendering, cursors, map-reduce flow | — |
-| 3 | `cargo run -- --config config.toml preview` | channels from the database, cursors, album merging, short post filter | free, no LLM call |
-| 4 | `cargo run -- --config config.toml run --dry-run` | digest quality: are duplicates merged, are links right | costs tokens, posts nothing |
-| 5 | `serve` + `/run` with `destination = "me"` | the full publish: markup, splitting, no link previews | the post goes to Saved Messages |
-| 6 | `destination = "@channel"` | — | subscribers see it |
+| 2 | `cargo run -- --config config.toml preview` | channels from the database, cursors, album merging, short post filter | free, no LLM call |
+| 3 | `cargo run -- --config config.toml run --dry-run` | digest quality: are duplicates merged, are links right | costs tokens, posts nothing |
+| 4 | `serve` + `/run` to the bot with `destination = "bot"` | the full publish: markup, splitting, no link previews | the post goes to the chat with the bot |
+| 5 | `destination = "@channel"` (the bot is an admin there) | — | subscribers see it |
 
-Do not suggest step 6 until the owner clearly says they are happy with the result.
+Do not suggest step 5 until the owner clearly says they are happy with the result.
 
 ## Login
 
@@ -76,11 +77,11 @@ docker compose stop              # soft stop (SIGTERM, grace 30s)
 docker compose kill              # SIGKILL without grace — only for crash scenarios
 ```
 
-All state is in `./data`: `config.toml`, `tg.session`, `digest.db`.
+All state is in `./data`: `config.toml`, `tg.session`, `bot.session`, `digest.db`.
 Rebuilding while the daemon runs is normal (`up -d --build`): the file is not
 locked, as it would be on Windows.
 
-## Commands in Saved Messages
+## Commands to the bot
 
 `/help` shows the list. Channel management (`/add`, `/rm`, `/reset`), diagnostics
 (`/list`, `/status`), a run (`/run`), a repeat (`/last`) and handling an
@@ -100,7 +101,7 @@ short time use:
 cron = "*/2 * * * *"
 ```
 
-plus `destination = "me"`. Start `serve` and check that the log has "waiting for
+plus `destination = "bot"`. Start `serve` and check that the log has "waiting for
 the next run" with the right time, that the run starts, and that Ctrl+C stops the
 daemon. After the check **put the real cron back**.
 
@@ -157,6 +158,13 @@ signatures at <https://docs.rs/grammers-client/0.10.0/>, not in search examples 
 they target the old API.
 
 **`not logged in to Telegram`** — run `login`.
+
+**`the bot cannot write to you yet`** — the owner never wrote to the bot. Open the
+bot in Telegram and send it `/start`; after that the bot remembers the chat.
+
+**`bot.token is not set`** / **`bot login failed`** — put the token from @BotFather
+into `[bot]` in `config.toml`. If you change the token to another bot, delete
+`data/bot.session`.
 
 **`channel excluded from the run`** — it hit `max_posts_per_channel` or the
 channel cannot be read. The cursor did not move, the next run reads the rest;

@@ -1,9 +1,8 @@
-//! Controlling the service with commands in Saved Messages.
+//! Controlling the service with commands to the bot.
 //!
-//! We listen to updates and react **only** to outgoing messages in the chat with
-//! ourselves: nobody except the account owner can write there, so no separate
-//! authorization is needed. We do not create a bot for this — a bot cannot read
-//! channels anyway, and the account itself gives a UI for one owner.
+//! The bot listens to updates and reacts **only** to messages from the owner (the
+//! personal account from `[telegram]`) in the private chat with the bot. Anybody can
+//! write to a bot, so everybody else is ignored.
 //!
 //! Channels are named by `@username` or by numeric `id`: private channels have
 //! no username, so `/list` and the `/add` reply always show the `id`.
@@ -24,8 +23,6 @@ use crate::run::{Runner, TRIGGER_MANUAL};
 use crate::telegram::client::is_auth_error;
 use crate::telegram::{channels, publish};
 
-/// Our replies also come back as messages in Saved Messages. So no reply may start
-/// with `/`, or the service would take its own reply as a new command.
 const HELP: &str = "\
 Commands:
 /add @channel | link | id — add a channel
@@ -45,14 +42,10 @@ pub async fn listen(
     updates: UnboundedReceiver<UpdatesLike>,
     cancel: Cancel,
 ) -> Result<()> {
-    let me = runner
-        .client
-        .get_me()
-        .await
-        .context("could not get own profile")?
-        .id();
+    let bot = runner.bot()?;
+    let owner = bot.owner;
 
-    let mut stream = runner
+    let mut stream = bot
         .client
         .stream_updates(
             updates,
@@ -64,7 +57,7 @@ pub async fn listen(
         .await
         .map_err(|e| anyhow::anyhow!("could not subscribe to updates: {e}"))?;
 
-    tracing::info!("listening for commands in Saved Messages, /help for the list");
+    tracing::info!("listening for commands to the bot, /help for the list");
     let mut commands = JoinSet::<Result<()>>::new();
 
     loop {
@@ -101,13 +94,14 @@ pub async fn listen(
             tracing::debug!("update skipped: not a new message");
             continue;
         };
-        // Only the chat with ourselves. We do not check `outgoing()`: a message that the
-        // owner writes there from the phone comes with `out = false`.
-        if message.peer_id() != me {
+        // Only what the owner writes to the bot in the private chat. The bot's own
+        // replies are outgoing, so they never come back as commands.
+        if message.outgoing() || message.peer_id() != owner {
             tracing::debug!(
                 peer = ?message.peer_id(),
-                me = ?me,
-                "message skipped: not in Saved Messages"
+                owner = ?owner,
+                outgoing = message.outgoing(),
+                "message skipped: not from the owner"
             );
             continue;
         }
@@ -116,7 +110,7 @@ pub async fn listen(
             continue;
         }
 
-        tracing::info!(command = %text, "command from Saved Messages");
+        tracing::info!(command = %text, "command from the owner");
         let runner = runner.clone();
         let cancel = cancel.clone();
         commands.spawn(async move {
@@ -152,7 +146,13 @@ pub async fn listen(
 
 async fn handle(runner: &Arc<Runner>, text: &str) -> Result<String> {
     let mut parts = text.splitn(2, char::is_whitespace);
-    let command = parts.next().unwrap_or_default();
+    // Telegram may add the bot name: `/list@my_digest_bot`.
+    let command = parts
+        .next()
+        .unwrap_or_default()
+        .split('@')
+        .next()
+        .unwrap_or_default();
     let arg = parts.next().unwrap_or("").trim();
 
     match command {
@@ -355,10 +355,10 @@ async fn last(runner: &Arc<Runner>) -> Result<String> {
         return Ok(format!("run #{} has no saved parts", run.id));
     }
 
-    let dest =
-        publish::resolve_destination(&runner.client, &runner.cfg.telegram.destination).await?;
+    let bot = runner.bot()?;
+    let dest = publish::resolve_destination(bot, &runner.cfg.telegram.destination).await?;
     publish::resend(
-        &runner.client,
+        &bot.client,
         publish::destination_ref(dest)?,
         &chunks,
         runner.cancellation(),
@@ -453,120 +453,5 @@ fn peer_kind(peer: &Peer) -> &'static str {
         Peer::User(_) => "user",
         Peer::Group(_) => "group",
         Peer::Channel(_) => "channel",
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::db::{Db, Destination};
-    use grammers_client::{Client, SenderPool};
-    use grammers_session::storages::MemorySession;
-    use std::collections::BTreeMap;
-
-    async fn runner() -> Arc<Runner> {
-        let cfg = toml::from_str(include_str!("../../config.example.toml")).unwrap();
-        let db = Arc::new(Db::open(":memory:").await.unwrap());
-        // The sender is never run: all commands in these tests are local.
-        let pool = SenderPool::new(Arc::new(MemorySession::default()), 1);
-        Arc::new(Runner::new(
-            Arc::new(cfg),
-            db,
-            Client::new(pool.handle),
-            Cancel::never(),
-        ))
-    }
-
-    /// Replies come back into Saved Messages as new messages: one that starts with
-    /// `/` would be taken as a command, and the service would answer itself.
-    #[tokio::test]
-    async fn no_reply_looks_like_a_command() {
-        let runner = runner().await;
-        for command in [
-            "/help",
-            "/list",
-            "/status",
-            "/resume",
-            "/abandon",
-            "/rm",
-            "/add",
-            "/reset 1",
-            "/last",
-            "/nonsense",
-        ] {
-            let reply = handle(&runner, command).await.unwrap();
-            assert!(!reply.trim_start().starts_with('/'), "{command}: {reply}");
-        }
-    }
-
-    #[test]
-    fn username_is_taken_from_any_link_form() {
-        for arg in [
-            "@news",
-            "news",
-            "t.me/news",
-            "https://t.me/news",
-            "https://t.me/news/123",
-            "http://telegram.me/news?start=1",
-            " https://t.me/@news ",
-        ] {
-            assert_eq!(username_from(arg), "news", "{arg}");
-        }
-    }
-
-    #[tokio::test]
-    async fn commands_reject_mutation_but_allow_reads_during_a_run() {
-        let runner = runner().await;
-        let _guard = runner.try_lock().unwrap();
-        for command in [
-            "/run",
-            "/reset 1",
-            "/abandon 1",
-            "/resume 1",
-            "/add @news",
-            "/rm 1",
-            "/last",
-        ] {
-            let reply = handle(&runner, command).await.unwrap();
-            assert!(reply.contains("is going"), "{command}: {reply}");
-        }
-        assert!(handle(&runner, "/list").await.is_ok());
-        assert!(handle(&runner, "/status").await.is_ok());
-        assert_eq!(handle(&runner, "/help").await.unwrap(), HELP);
-    }
-
-    #[tokio::test]
-    async fn pending_delivery_blocks_reset_until_abandoned() {
-        let runner = runner().await;
-        runner.db.upsert_channel(1, 7, None, "News").await.unwrap();
-        let id = runner.db.start_run("manual").await.unwrap();
-        runner
-            .db
-            .save_summary(
-                id,
-                1,
-                1,
-                (None, None),
-                &BTreeMap::from([(1, 42)]),
-                "me",
-                Destination {
-                    peer_id: 5,
-                    access_hash: 6,
-                },
-                &[("news".into(), 7)],
-            )
-            .await
-            .unwrap();
-        assert!(handle(&runner, "/reset 1")
-            .await
-            .unwrap()
-            .contains("undelivered"));
-        handle(&runner, &format!("/abandon {id}")).await.unwrap();
-        assert!(handle(&runner, "/reset 1")
-            .await
-            .unwrap()
-            .contains("cursor reset"));
-        assert!(runner.db.unfinished_run().await.unwrap().is_none());
-        assert_eq!(runner.db.channel(1).await.unwrap().unwrap().last_msg_id, 0);
     }
 }

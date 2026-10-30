@@ -20,6 +20,7 @@ use std::time::Duration;
 
 use crate::cancel::Cancel;
 use crate::db::{Db, Destination, Run};
+use crate::telegram::bot::Bot;
 use crate::telegram::client::{flood_wait, is_auth_error};
 
 /// Pause between parts of a long digest, so Telegram does not see it as flooding.
@@ -45,23 +46,17 @@ pub enum SendOutcome {
     Auth(InvocationError),
 }
 
-/// Where we post: `"me"` is Saved Messages of the current account, otherwise `@username`.
+/// Where the bot posts: `"bot"` is the chat with the owner (`"me"` means the same, for
+/// old configs), otherwise `@channel`, where the bot must be an admin.
 ///
 /// Resolved once, when the parts are written to the journal: changing `destination` in
 /// the config and restarting does not send the rest of an undelivered digest to another chat.
-pub async fn resolve_destination(client: &Client, destination: &str) -> Result<Destination> {
-    let peer = if destination == "me" {
-        client
-            .get_me()
-            .await
-            .context("could not get own profile")?
-            .to_ref()
-            .await
-            .map_err(|e| anyhow!("could not get a reference to own profile: {e}"))?
-            .ok_or_else(|| anyhow!("own profile is not available for sending"))?
+pub async fn resolve_destination(bot: &Bot, destination: &str) -> Result<Destination> {
+    let peer = if matches!(destination, "bot" | "me") {
+        bot.owner_ref().await?
     } else {
         let username = destination.trim_start_matches('@');
-        client
+        bot.client
             .resolve_username(username)
             .await
             .with_context(|| format!("could not resolve {destination}"))?
@@ -328,83 +323,5 @@ fn message_id(message: &tl::enums::Message) -> i32 {
         Message::Empty(m) => m.id,
         Message::Message(m) => m.id,
         Message::Service(m) => m.id,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use grammers_session::types::PeerKind;
-
-    #[test]
-    fn automatic_retry_stops_when_the_window_expires() {
-        let first = Utc::now();
-        let window = ChronoDuration::hours(2);
-        assert!(!retry_expired(first, Some(window), first + window));
-        assert!(retry_expired(
-            first,
-            Some(window),
-            first + window + ChronoDuration::seconds(1)
-        ));
-        assert!(!retry_expired(
-            first,
-            None,
-            first + ChronoDuration::days(30)
-        ));
-    }
-
-    #[test]
-    fn saved_destination_restores_the_same_peer() {
-        // The destination is fixed at `summarized` time: recovery must go to
-        // the same chat, not to the one that is in the config now.
-        let channel = Destination {
-            peer_id: -1001234567890,
-            access_hash: 42,
-        };
-        let peer = destination_ref(channel).unwrap();
-        assert_eq!(peer.id.kind(), PeerKind::Channel);
-        assert_eq!(peer.id.bare_id(), Some(1234567890));
-        assert_eq!(peer.auth.hash(), 42);
-
-        let me = Destination {
-            peer_id: 777000,
-            access_hash: 7,
-        };
-        let peer = destination_ref(me).unwrap();
-        assert_eq!(peer.id.kind(), PeerKind::User);
-        assert_eq!(peer.id.bare_id(), Some(777000));
-    }
-
-    #[test]
-    fn a_meaningless_destination_is_rejected_instead_of_guessed() {
-        let broken = Destination {
-            peer_id: 0,
-            access_hash: 0,
-        };
-        assert!(destination_ref(broken).is_err());
-    }
-
-    #[test]
-    fn sent_id_is_taken_from_short_updates() {
-        let updates =
-            tl::enums::Updates::UpdateShortSentMessage(tl::types::UpdateShortSentMessage {
-                out: true,
-                id: 555,
-                pts: 1,
-                pts_count: 1,
-                date: 0,
-                media: None,
-                entities: None,
-                ttl_period: None,
-            });
-        assert_eq!(sent_message_id(&updates), Some(555));
-    }
-
-    #[test]
-    fn missing_id_is_not_an_error_for_the_journal() {
-        // For some peers Telegram does not return an id: the delivery rule is
-        // delivered_at, not sent_msg_id.
-        let updates = tl::enums::Updates::TooLong;
-        assert_eq!(sent_message_id(&updates), None);
     }
 }

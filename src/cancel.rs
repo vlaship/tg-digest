@@ -65,38 +65,3 @@ impl Cancel {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::time::Duration;
-
-    #[tokio::test]
-    async fn cancel_is_visible_to_every_clone() {
-        let (source, cancel) = channel();
-        let clone = cancel.clone();
-        assert!(!clone.is_cancelled());
-
-        source.cancel();
-        assert!(cancel.is_cancelled());
-        assert!(clone.is_cancelled());
-        clone.cancelled().await;
-    }
-
-    #[tokio::test]
-    async fn sleep_returns_early_on_cancel() {
-        let (source, cancel) = channel();
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-            source.cancel();
-        });
-        assert!(cancel.sleep(Duration::from_secs(30)).await.is_err());
-    }
-
-    #[tokio::test]
-    async fn never_token_stays_quiet() {
-        let cancel = Cancel::never();
-        assert!(!cancel.is_cancelled());
-        assert!(cancel.sleep(Duration::from_millis(1)).await.is_ok());
-    }
-}

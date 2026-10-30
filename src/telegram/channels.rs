@@ -1,7 +1,7 @@
 //! Channel lookups and name refresh.
 //!
 //! The channel list itself lives only in the database and is managed with `/add`
-//! and `/rm` in Saved Messages. Here we find channels in Telegram and read their
+//! and `/rm` sent to the bot. Here we find channels in Telegram and read their
 //! titles and usernames again before every run.
 
 use anyhow::{Context, Result};
@@ -161,103 +161,4 @@ pub async fn describe(client: &Client, peer: ChannelPeer) -> Result<(Option<Stri
         resolved.username().map(str::to_string),
         resolved.name().unwrap_or("no title").to_string(),
     ))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn channel_names_are_read_from_both_chat_shapes() {
-        let channel = tl::enums::Chat::Channel(tl::types::Channel {
-            creator: false,
-            left: false,
-            broadcast: true,
-            verified: false,
-            megagroup: false,
-            restricted: false,
-            signatures: false,
-            min: false,
-            scam: false,
-            has_link: false,
-            has_geo: false,
-            slowmode_enabled: false,
-            call_active: false,
-            call_not_empty: false,
-            fake: false,
-            gigagroup: false,
-            noforwards: false,
-            join_to_send: false,
-            join_request: false,
-            forum: false,
-            stories_hidden: false,
-            stories_hidden_min: false,
-            stories_unavailable: false,
-            signature_profiles: false,
-            autotranslation: false,
-            broadcast_messages_allowed: false,
-            monoforum: false,
-            forum_tabs: false,
-            id: 7,
-            access_hash: Some(70),
-            title: "News".into(),
-            username: Some("news".into()),
-            photo: tl::enums::ChatPhoto::Empty,
-            date: 0,
-            restriction_reason: None,
-            admin_rights: None,
-            banned_rights: None,
-            default_banned_rights: None,
-            participants_count: None,
-            usernames: None,
-            stories_max_id: None,
-            color: None,
-            profile_color: None,
-            emoji_status: None,
-            level: None,
-            subscription_until_date: None,
-            bot_verification_icon: None,
-            send_paid_messages_stars: None,
-            linked_monoforum_id: None,
-        });
-        assert_eq!(
-            channel_names(&channel),
-            Some((7, Some("news".to_string()), "News".to_string()))
-        );
-
-        // A channel that became unavailable gives only the title — the username in the
-        // database must become empty, or the links lead nowhere.
-        let forbidden = tl::enums::Chat::ChannelForbidden(tl::types::ChannelForbidden {
-            broadcast: true,
-            megagroup: false,
-            monoforum: false,
-            id: 7,
-            access_hash: 70,
-            title: "News".into(),
-            until_date: None,
-        });
-        assert_eq!(
-            channel_names(&forbidden),
-            Some((7, None, "News".to_string()))
-        );
-
-        let group = tl::enums::Chat::Chat(tl::types::Chat {
-            creator: false,
-            left: false,
-            deactivated: false,
-            call_active: false,
-            call_not_empty: false,
-            noforwards: false,
-            id: 7,
-            title: "Group".into(),
-            photo: tl::enums::ChatPhoto::Empty,
-            participants_count: 0,
-            date: 0,
-            version: 0,
-            migrated_to: None,
-            admin_rights: None,
-            default_banned_rights: None,
-        });
-        assert_eq!(channel_names(&group), None);
-    }
 }

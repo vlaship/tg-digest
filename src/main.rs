@@ -1,8 +1,8 @@
 //! tg-digest — reads Telegram channels, summarizes them with Claude and posts
 //! a digest back to Telegram on the cron schedule from the config.
 //!
-//! The normal mode is `serve` in a container: the scheduler and the listener for
-//! commands in Saved Messages live in one process, channels and cursors in the
+//! The normal mode is `serve` in a container: the scheduler and the bot that listens
+//! for commands live in one process, channels and cursors in the
 //! database. The other CLI commands are for debugging: `login` once, and `preview` /
 //! `run --dry-run` to check the post selection and the prompt without posting anything.
 
@@ -59,7 +59,7 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Daemon: runs on schedule and commands from Saved Messages
+    /// Daemon: runs on schedule and commands to the bot
     Serve,
 }
 
@@ -84,7 +84,7 @@ async fn main() -> Result<()> {
         Command::Run { dry_run } => {
             if !dry_run {
                 bail!(
-                    "only the daemon posts: `serve` on schedule or /run in Saved Messages. \
+                    "only the daemon posts: `serve` on schedule or /run to the bot. \
                      To check, use `run --dry-run`"
                 );
             }
@@ -195,10 +195,12 @@ async fn prepare(cfg: Arc<Config>) -> Result<Arc<Runner>> {
     let session = telegram::client::connect(&cfg).await?;
     telegram::client::ensure_authorized(&session.client).await?;
 
+    // No bot: the debug commands never send anything.
     Ok(Arc::new(Runner::new(
         cfg,
         db,
         session.client,
+        None,
         Cancel::never(),
     )))
 }
@@ -215,8 +217,18 @@ async fn serve(cfg: Arc<Config>) -> Result<()> {
         );
     }
 
+    // The personal account reads the channels; it is also the owner of the bot.
     let session = telegram::client::connect(&cfg).await?;
     telegram::client::ensure_authorized(&session.client).await?;
+    let owner = session
+        .client
+        .get_me()
+        .await
+        .context("could not get own profile")?
+        .id();
+
+    // The bot talks to the owner: commands, replies, digests, notifications.
+    let (bot, bot_updates) = telegram::bot::connect(&cfg, owner).await?;
 
     let (source, cancel) = cancel::channel();
     tokio::spawn(watch_signals(source));
@@ -225,13 +237,14 @@ async fn serve(cfg: Arc<Config>) -> Result<()> {
         cfg.clone(),
         db.clone(),
         session.client,
+        Some(bot),
         cancel.clone(),
     ));
 
-    // The command listener and the scheduler are two tasks on one client. A revoked
-    // session breaks either of them, the process exits with a non-zero code, Docker
-    // restarts it, and the logs say what to do (`login`).
-    let listener = telegram::commands::listen(runner.clone(), session.updates, cancel.clone());
+    // The command listener and the scheduler are two tasks. A revoked session breaks
+    // either of them, the process exits with a non-zero code, Docker restarts it, and
+    // the logs say what to do (`login`).
+    let listener = telegram::commands::listen(runner.clone(), bot_updates, cancel.clone());
 
     tracing::info!(cron = %cfg.schedule.cron, tz = %cfg.schedule.timezone, "daemon started");
 
@@ -349,39 +362,4 @@ async fn first_signal() {
 #[cfg(not(unix))]
 async fn first_signal() {
     let _ = tokio::signal::ctrl_c().await;
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn shutdown_waits_for_publication_owned_by_either_loop() {
-        for publication_in_scheduler in [true, false] {
-            let (finished, recorded) = tokio::sync::oneshot::channel();
-            let publication = async {
-                tokio::task::yield_now().await;
-                finished.send(()).unwrap();
-                Ok(())
-            };
-            let idle = async { Ok(()) };
-            if publication_in_scheduler {
-                finish_service_loops(publication, idle).await.unwrap();
-            } else {
-                finish_service_loops(idle, publication).await.unwrap();
-            }
-            recorded
-                .await
-                .expect("delivery must be recorded before exit");
-        }
-    }
-
-    #[tokio::test]
-    async fn fatal_loop_error_stops_the_service() {
-        let result = finish_service_loops(std::future::pending(), async {
-            anyhow::bail!("session revoked")
-        })
-        .await;
-        assert!(result.is_err());
-    }
 }

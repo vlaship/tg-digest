@@ -3,7 +3,7 @@
 A Rust 2021 daemon. It reads a list of Telegram channels through MTProto, makes a
 summary of the posts with the Claude Messages API, and posts a digest back to
 Telegram on a cron schedule. Normally it runs in a container with `serve`. You
-control it with commands in Telegram Saved Messages.
+control it with commands to a Telegram bot, and the bot sends you the digests.
 
 The full design and the order of work are in [docs/PLAN.md](docs/PLAN.md). How to
 use it is in [README.md](README.md).
@@ -21,12 +21,12 @@ use it is in [README.md](README.md).
 | `src/telegram/client.rs` | connection, login, reading posts by cursor |
 | `src/telegram/channels.rs` | finding a channel for `/add`, reading titles and usernames before each run |
 | `src/telegram/publish.rs` | sending parts by `random_id`, delivery journal |
-| `src/telegram/commands.rs` | Saved Messages commands (`/add`, `/rm`, `/run`, `/status`, …) |
+| `src/telegram/bot.rs` | the bot: login with the token, the chat with the owner, notifications |
+| `src/telegram/commands.rs` | commands to the bot (`/add`, `/rm`, `/run`, `/status`, …), only from the owner |
 | `src/summarize.rs` | HTTP calls to the Anthropic Messages API, map-reduce |
 | `src/digest.rs` | JSON schema of the answer, link checks, Telegram-HTML rendering, splitting |
 | `Dockerfile`, `compose.yaml` | image and run; all state is in the `/data` volume |
 
-- Unit tests are inside the source modules.
 - `config.example.toml` is the config template.
 - `.agents/skills/tg-digest/` is the guide for running and debugging the service.
 - `target/` is build output, `out/` has generated previews, `data/` is the local
@@ -35,7 +35,7 @@ use it is in [README.md](README.md).
 ## Commands
 
 - `cargo build --release` — build the release binary. On Windows you need the MSVC build tools.
-- `cargo fmt`, `cargo clippy --all-targets`, `cargo test` — format, lint, test.
+- `cargo fmt`, `cargo clippy --all-targets` — format, lint.
 - `Copy-Item config.example.toml config.toml` — create a local config in PowerShell.
 - `cargo run -- --config config.toml login` — log in to the Telegram account.
 - `cargo run -- --config config.toml preview` — see the collected posts, no Anthropic call.
@@ -46,7 +46,7 @@ use it is in [README.md](README.md).
 The CLI default paths point to `/data`, the container volume. When you run
 locally, pass `--config` and change `session_file` / `db_file`.
 
-**Check before every commit:** `cargo fmt && cargo clippy --all-targets && cargo test`.
+**Check before every commit:** `cargo fmt && cargo clippy --all-targets`. The project has no tests.
 
 ## Language
 
@@ -65,11 +65,20 @@ add it to the example too. When you add a module, add it to the table above.
 Never commit runtime state.
 
 **The channel list lives only in the database.** It is managed with `/add` and
-`/rm` in Saved Messages. There is no Telegram folder, no `[[channels]]` in the
+`/rm` sent to the bot. There is no Telegram folder, no `[[channels]]` in the
 config, and no sync step. Titles and usernames are read again before every run
 (`refresh_channels`, one `channels.getChannels` call); this never changes the
 list. Otherwise a renamed channel would stay in the digest forever with an old
 link.
+
+**Two Telegram clients, two jobs.** The personal account (`[telegram]`,
+`tg.session`) only reads: it collects posts, resolves `/add`, refreshes names. A
+bot cannot do that — it reads only channels where it is an admin. The bot
+(`[bot]`, `bot.session`, logs in with the token on start) only talks: it takes
+commands, replies, and sends digests and notifications. The bot accepts commands
+only from the owner, which is the personal account; everyone else is ignored. A
+bot can write to a user only after the user wrote to it, so the owner sends
+`/start` once; the chat is then kept in `bot.session`.
 
 **grammers 0.10.** The crate is pre-1.0, and its API changed a lot after 0.7–0.9.
 You connect through `SenderPool`: `runner` runs as a separate task, `Client::new`
@@ -117,8 +126,8 @@ Telegram does not document how long it remembers `random_id`, so after
 decides (`/resume`).
 
 **Order for checking changes.** First `preview` (no tokens), then `run --dry-run`
-(nothing is posted), then the daemon with `destination = "me"` and `/run` from
-Saved Messages. Posting to a real channel is the last step. The CLI has no run
+(nothing is posted), then the daemon with `destination = "bot"` and `/run` to
+the bot. Posting to a real channel is the last step. The CLI has no run
 that posts: only the daemon posts (cron or `/run`). Otherwise two processes on one
 database would post two digests.
 
@@ -151,14 +160,6 @@ Use rustfmt defaults with four-space indentation. Use `snake_case` for modules a
 functions, `PascalCase` for types, and `SCREAMING_SNAKE_CASE` for constants. Follow
 the existing `anyhow` error context and `tracing` logging patterns.
 
-## Tests
-
-Use Rust's built-in `#[test]` in `#[cfg(test)] mod tests`. Name a test after the
-behavior it checks, for example `packs_blocks_without_exceeding_limit`. Database
-tests open an in-memory libsql connection, so they need no fixtures. Add
-regression tests when you change parsing, rendering, scheduling, collection or
-state. There is no coverage target.
-
 ## Commits and pull requests
 
 `main` is protected: no direct pushes, no force pushes. Every change goes through a
@@ -171,8 +172,8 @@ changes, add sample output.
 
 CI has two workflows:
 
-- `.github/workflows/cargo.yml` — on every push to any branch: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
-  `cargo test`, `cargo build --release`, all with `--locked`.
+- `.github/workflows/cargo.yml` — on every push to any branch: `cargo fmt --check`,
+  `cargo clippy --all-targets -- -D warnings`, `cargo build --release`, all with `--locked`.
 - `.github/workflows/docker.yml` — builds the image. A push to `main` or a `v*` tag
   publishes one image to `ghcr.io/vlaship/tg-digest`. A PR only builds it. A manual
   run only builds it, unless you tick "publish".

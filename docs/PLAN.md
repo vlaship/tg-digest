@@ -950,3 +950,16 @@ overrides for secrets are removed:
   in the container). Old keys `telegram.folder` and `[[channels]]` are ignored.
 
 The text above about folders and the seed is history: it describes earlier steps.
+
+## Update 2026-10-30: the bot, no tests
+
+- The owner talks to a Telegram bot (`[bot]`, token from @BotFather,
+  `telegram/bot.rs`). Commands go to the bot, and the bot sends replies, digests
+  (`destination = "bot"`, or `"@channel"` where the bot is an admin) and
+  notifications. Commands in Saved Messages are removed.
+- The personal account still reads the channels: a bot cannot.
+- The bot accepts commands only from the personal account. The owner sends
+  `/start` once, so the bot can write to them.
+- All unit tests and the `cargo test` CI step are removed at the owner's request.
+  The check is `cargo fmt && cargo clippy --all-targets` plus the live order:
+  `preview`, `run --dry-run`, `serve` + `/run`.

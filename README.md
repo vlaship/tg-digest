@@ -8,12 +8,13 @@ and posts the digest back to Telegram on a schedule.
 - **Summary.** It uses the Anthropic Messages API. Posts are grouped by topic. If
   several channels write about the same event, they become one item with a list
   of sources.
-- **Publishing.** The same account posts the digest: to Saved Messages or to your
-  own channel.
+- **Bot.** You talk to your own Telegram bot: you write commands to it, and it
+  sends you the replies, the digests and the notifications. It can also post the
+  digest to your channel. Only your account may give it commands.
 - **Schedule.** A cron expression in the config. You do not need a separate OS
   scheduler.
 - **Channel list.** Stored in the database. You add and remove channels with
-  commands in Saved Messages (`/add`, `/rm`), and control the service there too
+  commands to the bot (`/add`, `/rm`), and control the service there too
   (`/run`, `/list`, `/status`).
 
 ## Run in Docker (the normal way)
@@ -23,7 +24,8 @@ mounts as `/data`:
 
 - `config.toml` — all settings, including the secrets (API id and hash, phone,
   Anthropic key);
-- `tg.session` — the Telegram login, created by `login`;
+- `tg.session` — the Telegram login of your account, created by `login`;
+- `bot.session` — the bot login, created on the first start;
 - `digest.db` — the database.
 
 It survives image updates and `docker compose down`. `data/` is in `.gitignore`
@@ -41,6 +43,9 @@ docker compose run --rm -it tg-digest login   # one-time login: the code, and th
 docker compose up -d
 docker compose logs -f
 ```
+
+Then open your bot in Telegram and send it `/start`. A bot can write to you only
+after you wrote to it first; after that it remembers the chat.
 
 `restart: unless-stopped` starts the container again after a reboot.
 `catch_up = true` in the config runs a slot that was missed while the service
@@ -115,7 +120,13 @@ Fill in `config.toml`:
 
 1. `telegram.api_id` / `api_hash` — get them at <https://my.telegram.org>;
 2. `telegram.phone` — the phone number of the account that follows the channels;
-3. `anthropic.api_key`.
+3. `anthropic.api_key`;
+4. `bot.token` — create a bot with [@BotFather](https://t.me/BotFather): send it
+   `/newbot`, choose a name and a username, and copy the token it gives you.
+
+`telegram.destination = "bot"` (the default) sends the digests to the chat with
+the bot. To post to your channel instead, set `"@your_channel"` and make the bot
+an admin of that channel with the right to post.
 
 With Docker this file is `data/config.toml`. All settings come only from this
 file, the secrets too.
@@ -123,17 +134,17 @@ file, the secrets too.
 ### Channels
 
 The channel list is not in the config: it is stored in the database. Add a
-channel with `/add` in Saved Messages — by `@username`, by an invite link
+channel with `/add` to the bot — by `@username`, by a `t.me/name` link, by an invite link
 (`t.me/+…`, the account joins it) or by a numeric id (a private channel the
 account already follows). Remove it with `/rm`: the channel is turned off, not
 deleted, so `/list` still shows it. Titles and usernames are read again before
 every run, so a renamed channel keeps correct links.
 
-## Commands in Saved Messages
+## Commands to the bot
 
 | Command | What it does |
 |---|---|
-| `/add @channel`, `/add t.me/+link`, `/add id` | add the channel to the list |
+| `/add @channel`, `/add t.me/name`, `/add t.me/+link`, `/add id` | add the channel to the list |
 | `/rm @channel` · `/rm id` | turn the channel off |
 | `/list` | channels: id, username, on/off, cursor, last error |
 | `/reset id` | read the channel again from the `lookback_hours` window |
@@ -148,9 +159,10 @@ digest.
 
 ## Security
 
-`tg.session` gives full access to your Telegram account. It, the database and
-`config.toml` with the keys are in `.gitignore` (the `data/` folder). Do not
-commit them and do not copy them anywhere.
+`tg.session` gives full access to your Telegram account, and the bot token gives
+full control of the bot. They, `bot.session`, the database and `config.toml` with
+the keys are in `.gitignore` (the `data/` folder). Do not commit them and do not
+copy them anywhere. The bot answers only your account and ignores everyone else.
 
 ## Cost
 
