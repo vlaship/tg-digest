@@ -30,6 +30,7 @@ Commands:
 /rm @channel | id — remove a channel
 /list — channels, cursors, errors
 /reset id — read the channel again from the lookback_hours window
+/skip — move all channels to their newest message: older posts are skipped
 /run — run now (or deliver an undelivered digest)
 /status — last run: status, posts, tokens
 /last — send the last digest again
@@ -179,6 +180,7 @@ async fn handle(runner: &Arc<Runner>, user: PeerId, text: &str) -> Result<String
         "/add" => guarded(runner, add(runner, arg)).await,
         "/rm" => guarded(runner, remove(runner, arg)).await,
         "/reset" => guarded(runner, reset(runner, arg)).await,
+        "/skip" => guarded(runner, skip(runner)).await,
         "/last" => guarded(runner, last(runner)).await,
         other => Ok(format!("unknown command {other}\n\n{HELP}")),
     }
@@ -381,6 +383,41 @@ async fn remove(runner: &Arc<Runner>, arg: &str) -> Result<String> {
     runner.db.disable_channel(channel.id).await?;
 
     Ok(format!("disabled: {}, id {}", channel.title, channel.id))
+}
+
+/// `/skip`: move every enabled channel to its newest message, so the next digest
+/// has only posts that come after this. A channel that cannot be read keeps its cursor.
+async fn skip(runner: &Arc<Runner>) -> Result<String> {
+    let channels = runner.db.enabled_channels().await?;
+    if channels.is_empty() {
+        return Ok("no channels yet: add one with /add @channel".into());
+    }
+
+    let (mut moved, mut failed) = (0, Vec::new());
+    for channel in &channels {
+        let peer = channels::ChannelPeer {
+            id: channel.id,
+            access_hash: channel.access_hash,
+        };
+        match channels::last_message_id(&runner.client, peer).await {
+            Ok(Some(last)) => {
+                runner.db.set_cursor(channel.id, last).await?;
+                moved += 1;
+            }
+            Ok(None) => {}
+            Err(e) if crate::telegram::client::is_fatal(&e) => return Err(e),
+            Err(e) => failed.push(format!("{}: {e:#}", channel.label())),
+        }
+    }
+
+    let mut out = format!(
+        "moved {moved} of {} channels to their newest message: older posts are skipped",
+        channels.len()
+    );
+    if !failed.is_empty() {
+        out.push_str(&format!("\nnot moved:\n{}", failed.join("\n")));
+    }
+    Ok(out)
 }
 
 async fn reset(runner: &Arc<Runner>, arg: &str) -> Result<String> {

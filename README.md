@@ -149,6 +149,7 @@ every run, so a renamed channel keeps correct links.
 | `/rm @channel` · `/rm id` | turn the channel off |
 | `/list` | channels: id, username, on/off, cursor, last error |
 | `/reset id` | read the channel again from the `lookback_hours` window |
+| `/skip` | move all channels to their newest message: older posts are skipped |
 | `/run` | run now (or deliver an undelivered digest) |
 | `/status` | last run: status, posts, topics, tokens, parts |
 | `/last` | send the last digest again |
