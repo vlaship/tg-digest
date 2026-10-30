@@ -93,6 +93,8 @@ takes `handle`, updates come from `pool.updates`. The session is
 <https://docs.rs/grammers-client/0.10.0/>. Do not trust memory or examples from
 search — almost all of them use the old API.
 
+**Model providers.** `provider` is `anthropic` or `gemini`. When its limit is used up, the bot tells the owner and, if `fallback_provider` is set, offers `/fallback`. Nothing switches by itself. The choice is kept in the `settings` table (`/provider`), so the config value is only the default.
+
 **Anthropic API.** The model id comes from the config as it is. Do not add a date
 suffix. On `claude-opus-5` thinking is on by default — do not send `thinking`,
 `budget_tokens` or `temperature` (you get 400). For structured output use

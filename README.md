@@ -153,6 +153,8 @@ every run, so a renamed channel keeps correct links.
 | `/run` | run now (or deliver an undelivered digest) |
 | `/status` | last run: status, posts, topics, tokens, parts |
 | `/last` | send the last digest again |
+| `/provider [name]` | list the providers with their models, or switch (only the owner) |
+| `/fallback` | switch to `fallback_provider` and run now (only the owner) |
 | `/resume N` · `/abandon N` | deliver or cancel an undelivered run |
 | `/stop` · `/start` | stop or start getting digests for yourself, the owner too (commands still work) |
 | `/help` | list of commands |

@@ -15,6 +15,10 @@ pub struct Config {
     /// Which model writes the digest: "anthropic" (default) or "gemini".
     #[serde(default = "default_provider")]
     pub provider: String,
+    /// Where to switch when the limit of the current provider is used up. The bot
+    /// asks the owner first (`/fallback`); nothing switches by itself.
+    #[serde(default)]
+    pub fallback_provider: Option<String>,
     #[serde(default)]
     pub anthropic: Anthropic,
     #[serde(default)]
@@ -190,6 +194,28 @@ impl Config {
         Ok(cfg)
     }
 
+    /// The model id of a provider from `PROVIDERS`.
+    pub fn model_of(&self, provider: &str) -> &str {
+        match provider {
+            "gemini" => &self.gemini.model,
+            _ => &self.anthropic.model,
+        }
+    }
+
+    /// The provider name is known and its key is set.
+    pub fn check_provider(&self, name: &str) -> Result<()> {
+        match name {
+            "anthropic" if self.anthropic.api_key.is_empty() => {
+                bail!("anthropic.api_key is not set")
+            }
+            "gemini" if self.gemini.api_key.is_empty() => {
+                bail!("gemini.api_key is not set (get it at https://aistudio.google.com/apikey)")
+            }
+            "anthropic" | "gemini" => Ok(()),
+            other => bail!("must be \"anthropic\" or \"gemini\", not {other:?}"),
+        }
+    }
+
     /// We catch empty required fields here, not on the first network call:
     /// otherwise the error shows up in the middle of a night run as a 401.
     fn validate(&self) -> Result<()> {
@@ -199,15 +225,9 @@ impl Config {
         if self.telegram.phone.is_empty() {
             bail!("telegram.phone is not set");
         }
-        match self.provider.as_str() {
-            "anthropic" if self.anthropic.api_key.is_empty() => {
-                bail!("anthropic.api_key is not set")
-            }
-            "gemini" if self.gemini.api_key.is_empty() => {
-                bail!("gemini.api_key is not set (get it at https://aistudio.google.com/apikey)")
-            }
-            "anthropic" | "gemini" => {}
-            other => bail!("provider must be \"anthropic\" or \"gemini\", not {other:?}"),
+        self.check_provider(&self.provider).context("provider")?;
+        if let Some(fallback) = &self.fallback_provider {
+            self.check_provider(fallback).context("fallback_provider")?;
         }
         if self.telegram.lookback_hours <= 0 {
             bail!("telegram.lookback_hours must be greater than zero");
@@ -261,6 +281,9 @@ fn default_pause_ms() -> u64 {
 fn default_publish_retry_window_hours() -> i64 {
     2
 }
+/// All model providers the service knows.
+pub const PROVIDERS: [&str; 2] = ["anthropic", "gemini"];
+
 fn default_provider() -> String {
     "anthropic".into()
 }
