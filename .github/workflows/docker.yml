@@ -1,5 +1,7 @@
-# Builds the image. On main and on version tags it is pushed to GitHub Container
-# Registry (ghcr.io). Pull requests only build it: they never push.
+# Builds the Docker image.
+# - push to main and v* tags: build and push to GitHub Container Registry (ghcr.io);
+# - pull request: build only, never push;
+# - manual run: build only, unless you tick "publish".
 name: docker
 
 on:
@@ -8,17 +10,24 @@ on:
     tags: ["v*"]
   pull_request:
   workflow_dispatch:
+    inputs:
+      publish:
+        description: Push the image to ghcr.io
+        type: boolean
+        default: false
 
 permissions:
   contents: read
   packages: write
 
+# One run per ref. Old PR runs are cancelled, but a run on main or a tag is never
+# cancelled half way: the next one waits, so every push publishes its own image.
 concurrency:
   group: docker-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
-  PUSH: ${{ github.event_name != 'pull_request' }}
+  PUSH: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish) }}
 
 jobs:
   build:
@@ -56,6 +65,10 @@ jobs:
           push: ${{ env.PUSH == 'true' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          # Without these, buildx adds attestation manifests, and ghcr.io shows them
+          # as extra untagged "unknown/unknown" versions: one push must give one image.
+          provenance: false
+          sbom: false
           # Layer cache in GitHub Actions: the cargo dependency layer
           # is rebuilt only when Cargo.toml or Cargo.lock changes.
           cache-from: type=gha

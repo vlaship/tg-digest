@@ -162,6 +162,13 @@ state. There is no coverage target.
 
 Write short commit subjects in the imperative mood. A PR should explain the change,
 related issues, the effect on the config, and how you checked it. For rendering
-changes, add sample output. CI (`.github/workflows/docker.yml`) builds the Docker
-image on every push and PR. Pushes to `main` and `v*` tags also publish it to
-`ghcr.io/vlaship/tg-digest`; PRs only build it.
+changes, add sample output.
+
+CI has two workflows:
+
+- `.github/workflows/cargo.yml` — on every commit to any branch (and on PRs from
+  forks): `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
+  `cargo test`, `cargo build --release`, all with `--locked`.
+- `.github/workflows/docker.yml` — builds the image. A push to `main` or a `v*` tag
+  publishes one image to `ghcr.io/vlaship/tg-digest`. A PR only builds it. A manual
+  run only builds it, unless you tick "publish".
