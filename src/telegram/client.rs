@@ -18,6 +18,7 @@ use grammers_client::{tl, InvocationError, SenderPool};
 use grammers_session::storages::SqliteSession;
 use grammers_session::types::{PeerAuth, PeerId, PeerRef};
 use grammers_session::updates::UpdatesLike;
+use grammers_session::Session as _;
 use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::cancel::Cancel;
@@ -45,6 +46,16 @@ pub async fn connect(cfg: &Config) -> Result<Session> {
             .await
             .with_context(|| format!("could not open the session {}", cfg.telegram.session_file))?,
     );
+
+    // Without the own user in the session cache, grammers does not ask for the update
+    // state, and the command listener gets no updates.
+    let self_known = session
+        .peer(PeerId::self_user())
+        .await
+        .ok()
+        .flatten()
+        .is_some();
+    tracing::debug!(self_known, "session opened");
 
     let pool = SenderPool::new(session, cfg.telegram.api_id);
     let SenderPool {

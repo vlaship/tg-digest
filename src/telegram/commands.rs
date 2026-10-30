@@ -24,7 +24,10 @@ use crate::run::{Runner, TRIGGER_MANUAL};
 use crate::telegram::client::is_auth_error;
 use crate::telegram::{channels, publish};
 
+/// Our replies also come back as messages in Saved Messages. So no reply may start
+/// with `/`, or the service would take its own reply as a new command.
 const HELP: &str = "\
+Commands:
 /add @channel | link | id — add a channel
 /rm @channel | id — remove a channel
 /list — channels, cursors, errors
@@ -95,9 +98,17 @@ pub async fn listen(
         };
 
         let Update::NewMessage(message) = update else {
+            tracing::debug!("update skipped: not a new message");
             continue;
         };
-        if !message.outgoing() || message.peer_id() != me {
+        // Only the chat with ourselves. We do not check `outgoing()`: a message that the
+        // owner writes there from the phone comes with `out = false`.
+        if message.peer_id() != me {
+            tracing::debug!(
+                peer = ?message.peer_id(),
+                me = ?me,
+                "message skipped: not in Saved Messages"
+            );
             continue;
         }
         let text = message.text().trim().to_string();
@@ -398,7 +409,7 @@ async fn resolve_new_channel(runner: &Arc<Runner>, arg: &str) -> Result<channels
             .context("the link did not return a chat")?
     } else {
         client
-            .resolve_username(arg.trim_start_matches('@'))
+            .resolve_username(username_from(arg))
             .await
             .with_context(|| format!("could not resolve {arg}"))?
             .with_context(|| format!("channel {arg} not found"))?
@@ -420,6 +431,20 @@ async fn resolve_new_channel(runner: &Arc<Runner>, arg: &str) -> Result<channels
         id: reference.id.bare_id().context("the channel has no id")?,
         access_hash: reference.auth.hash(),
     })
+}
+
+/// The username from `@name`, `name`, `t.me/name` or `https://t.me/name/123`.
+fn username_from(arg: &str) -> &str {
+    let rest = arg
+        .trim()
+        .trim_start_matches("https://")
+        .trim_start_matches("http://");
+    let rest = rest
+        .strip_prefix("t.me/")
+        .or_else(|| rest.strip_prefix("telegram.me/"))
+        .unwrap_or(rest);
+    let name = rest.split(['/', '?']).next().unwrap_or(rest);
+    name.trim_start_matches('@')
 }
 
 fn peer_kind(peer: &Peer) -> &'static str {
@@ -450,6 +475,43 @@ mod tests {
             Client::new(pool.handle),
             Cancel::never(),
         ))
+    }
+
+    /// Replies come back into Saved Messages as new messages: one that starts with
+    /// `/` would be taken as a command, and the service would answer itself.
+    #[tokio::test]
+    async fn no_reply_looks_like_a_command() {
+        let runner = runner().await;
+        for command in [
+            "/help",
+            "/list",
+            "/status",
+            "/resume",
+            "/abandon",
+            "/rm",
+            "/add",
+            "/reset 1",
+            "/last",
+            "/nonsense",
+        ] {
+            let reply = handle(&runner, command).await.unwrap();
+            assert!(!reply.trim_start().starts_with('/'), "{command}: {reply}");
+        }
+    }
+
+    #[test]
+    fn username_is_taken_from_any_link_form() {
+        for arg in [
+            "@news",
+            "news",
+            "t.me/news",
+            "https://t.me/news",
+            "https://t.me/news/123",
+            "http://telegram.me/news?start=1",
+            " https://t.me/@news ",
+        ] {
+            assert_eq!(username_from(arg), "news", "{arg}");
+        }
     }
 
     #[tokio::test]
