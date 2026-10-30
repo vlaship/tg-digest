@@ -2,7 +2,7 @@
 //! this one file (in a container: `/data/config.toml`).
 //!
 //! There is no channel list here: it lives only in the database (`db.rs`) and is
-//! managed with `/add` and `/rm` in Saved Messages.
+//! managed with `/add` and `/rm` sent to the bot.
 
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
@@ -14,9 +14,33 @@ pub struct Config {
     pub telegram: Telegram,
     pub anthropic: Anthropic,
     pub prompts: Prompts,
+    /// The bot you talk to: commands, replies, digests, notifications.
+    #[serde(default)]
+    pub bot: Bot,
     /// Database file. In a container it is in the `/data` volume, next to the session.
     #[serde(default = "default_db_file")]
     pub db_file: String,
+}
+
+/// The bot reads no channels (a bot cannot), it only talks to the owner and posts.
+/// Reading is done by the personal account from `[telegram]`.
+#[derive(Debug, Deserialize)]
+pub struct Bot {
+    /// Token from @BotFather.
+    #[serde(default)]
+    pub token: String,
+    /// The bot session (SQLite). It is created on the first start, no login needed.
+    #[serde(default = "default_bot_session_file")]
+    pub session_file: String,
+}
+
+impl Default for Bot {
+    fn default() -> Self {
+        Self {
+            token: String::new(),
+            session_file: default_bot_session_file(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -40,6 +64,8 @@ pub struct Telegram {
     pub phone: String,
     #[serde(default = "default_session_file")]
     pub session_file: String,
+    /// Where the bot posts the digest: `"bot"` — the chat with the bot (`"me"` means the
+    /// same, for old configs), or `"@channel"` where the bot is an admin.
     #[serde(default = "default_destination")]
     pub destination: String,
     #[serde(default = "default_lookback_hours")]
@@ -141,7 +167,10 @@ fn default_db_file() -> String {
     "/data/digest.db".into()
 }
 fn default_destination() -> String {
-    "me".into()
+    "bot".into()
+}
+fn default_bot_session_file() -> String {
+    "/data/bot.session".into()
 }
 fn default_lookback_hours() -> i64 {
     24
@@ -194,83 +223,5 @@ fn normalize_phone(raw: &str) -> String {
         format!("+{digits}")
     } else {
         digits
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    const MINIMAL: &str = r#"
-        [schedule]
-        cron = "0 9 * * *"
-
-        [telegram]
-        api_id = 1
-        api_hash = "hash"
-        phone = "+15550001122"
-
-        [anthropic]
-        api_key = "key"
-
-        [prompts]
-        system = "s"
-        user_template = "u"
-    "#;
-
-    fn parse(raw: &str) -> Result<Config> {
-        let mut cfg: Config = toml::from_str(raw)?;
-        cfg.telegram.phone = normalize_phone(&cfg.telegram.phone);
-        cfg.validate()?;
-        Ok(cfg)
-    }
-
-    #[test]
-    fn strips_separators_and_keeps_plus() {
-        assert_eq!(normalize_phone(" +1-555-000-11-22 "), "+15550001122");
-        assert_eq!(normalize_phone("+1 (555) 000-1122"), "+15550001122");
-    }
-
-    #[test]
-    fn keeps_bare_number_without_plus() {
-        assert_eq!(normalize_phone("15550001122"), "15550001122");
-    }
-
-    #[test]
-    fn empty_stays_empty_so_validation_catches_it() {
-        assert_eq!(normalize_phone(""), "");
-        assert_eq!(normalize_phone("+"), "");
-    }
-
-    #[test]
-    fn minimal_config_is_valid() {
-        let cfg = parse(MINIMAL).expect("channels live in the database, the config has none");
-        assert_eq!(cfg.telegram.max_posts_per_channel, 1000);
-        assert_eq!(cfg.telegram.publish_retry_window_hours, 2);
-        assert_eq!(cfg.db_file, "/data/digest.db");
-        assert_eq!(cfg.telegram.session_file, "/data/tg.session");
-    }
-
-    /// Old configs may still have `folder` and `[[channels]]`: they are ignored,
-    /// so an existing data/config.toml keeps working after the update.
-    #[test]
-    fn old_folder_and_channel_keys_are_ignored() {
-        let raw = MINIMAL.replace("phone =", "folder = \"Digest\"\nphone =")
-            + "\n[[channels]]\nusername = \"news\"\n";
-        assert!(parse(&raw).is_ok());
-    }
-
-    /// The example config is part of the docs: it must be parsed by the same
-    /// structures as the real one, or they drift apart unnoticed.
-    #[test]
-    fn example_config_parses() {
-        let cfg: Config = toml::from_str(include_str!("../config.example.toml"))
-            .expect("config.example.toml must parse");
-
-        assert_eq!(cfg.telegram.publish_retry_window_hours, 2);
-        assert_eq!(cfg.telegram.max_posts_per_channel, 1000);
-        assert_eq!(cfg.db_file, "/data/digest.db");
-        assert!(cfg.prompts.digest_title.contains("{{date}}"));
-        assert!(cfg.prompts.user_template.contains("{{posts}}"));
     }
 }

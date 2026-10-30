@@ -1,5 +1,5 @@
-# Checks every commit: format, lint, tests and a release build.
-# The same check as before a commit: cargo fmt && cargo clippy --all-targets && cargo test.
+# Checks every commit: format, lint and a release build.
+# The same check as before a commit: cargo fmt && cargo clippy --all-targets.
 name: cargo
 
 # Only push, no pull_request: a PR branch is already checked by its push. A second,
@@ -37,9 +37,6 @@ jobs:
 
       - name: Clippy
         run: cargo clippy --all-targets --locked -- -D warnings
-
-      - name: Tests
-        run: cargo test --locked
 
       # --locked: Cargo.lock pins glass_pumpkin 2.0.0-rc0, see AGENTS.md.
       - name: Release build

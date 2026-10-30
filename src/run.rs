@@ -4,7 +4,7 @@
 //! here. It is taken with `try_lock` — nobody waits in a queue: a delayed
 //! `/reset` that fires five minutes later is more surprising than a refusal.
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use chrono::{Duration as ChronoDuration, Utc};
 use chrono_tz::Tz;
 use grammers_client::client::Client;
@@ -16,7 +16,8 @@ use crate::config::Config;
 use crate::db::{self, Db, Run};
 use crate::digest::{self, RenderOptions};
 use crate::summarize::Summarizer;
-use crate::telegram::{channels, client as tg, notify, publish};
+use crate::telegram::bot::Bot;
+use crate::telegram::{channels, client as tg, publish};
 
 pub const TRIGGER_CRON: &str = "cron";
 pub const TRIGGER_CATCH_UP: &str = "catch_up";
@@ -75,7 +76,11 @@ impl std::fmt::Display for Outcome {
 pub struct Runner {
     pub cfg: Arc<Config>,
     pub db: Arc<Db>,
+    /// The personal account: reads the channels.
     pub client: Client,
+    /// The bot: posts digests and notifications. `None` in the debug commands
+    /// (`preview`, `run --dry-run`): they never send anything.
+    pub bot: Option<Bot>,
     cancel: Cancel,
     /// One lock for the run and for commands that touch cursors.
     /// It replaces a lock file: there is one process in the container.
@@ -83,13 +88,35 @@ pub struct Runner {
 }
 
 impl Runner {
-    pub fn new(cfg: Arc<Config>, db: Arc<Db>, client: Client, cancel: Cancel) -> Self {
+    pub fn new(
+        cfg: Arc<Config>,
+        db: Arc<Db>,
+        client: Client,
+        bot: Option<Bot>,
+        cancel: Cancel,
+    ) -> Self {
         Self {
             cfg,
             db,
             client,
+            bot,
             cancel,
             lock: Mutex::new(()),
+        }
+    }
+
+    /// The bot, for everything that sends. Only `serve` has one.
+    pub fn bot(&self) -> Result<&Bot> {
+        self.bot
+            .as_ref()
+            .ok_or_else(|| anyhow!("sending needs the bot: only `serve` sends"))
+    }
+
+    /// A notification to the owner through the bot. Without a bot it only goes to the log.
+    async fn notify(&self, text: &str) {
+        match &self.bot {
+            Some(bot) => bot.notify(text).await,
+            None => tracing::warn!(%text, "notification (no bot in this command)"),
         }
     }
 
@@ -187,7 +214,7 @@ impl Runner {
                 run.id,
                 run.id
             );
-            notify(&self.client, &text).await;
+            self.notify(&text).await;
             self.db.mark_stale_notified(run.id).await?;
         }
         tracing::warn!(
@@ -200,18 +227,16 @@ impl Runner {
     async fn deliver(&self, run: &Run, resume: bool) -> Result<Outcome> {
         let window =
             (!resume).then(|| ChronoDuration::hours(self.cfg.telegram.publish_retry_window_hours));
-        match publish::deliver_pending(&self.client, &self.db, run, &self.cancel, window).await? {
+        let bot = self.bot()?;
+        match publish::deliver_pending(&bot.client, &self.db, run, &self.cancel, window).await? {
             None => {
                 self.db.complete_run(run.id, db::STATUS_OK).await?;
                 Ok(Outcome::Delivered(run.id))
             }
             Some(reason) => {
                 if !self.cancel.is_cancelled() {
-                    notify(
-                        &self.client,
-                        &format!("digest not fully delivered: {reason}"),
-                    )
-                    .await;
+                    self.notify(&format!("digest not fully delivered: {reason}"))
+                        .await;
                 }
                 Ok(Outcome::Pending(run.id, reason))
             }
@@ -247,13 +272,10 @@ impl Runner {
         let failed: Vec<i64> = collected.failures.iter().map(|(c, _)| c.id).collect();
         for (channel, reason) in &collected.failures {
             self.db.set_channel_error(channel.id, Some(reason)).await?;
-            notify(
-                &self.client,
-                &format!(
-                    "channel {} excluded from the run: {reason}",
-                    channel.label()
-                ),
-            )
+            self.notify(&format!(
+                "channel {} excluded from the run: {reason}",
+                channel.label()
+            ))
             .await;
         }
         for channel in channels.iter().filter(|c| !failed.contains(&c.id)) {
@@ -313,7 +335,11 @@ impl Runner {
         }
 
         let dest_label = self.cfg.telegram.destination.clone();
-        let dest = match publish::resolve_destination(&self.client, &dest_label).await {
+        let resolved = match self.bot() {
+            Ok(bot) => publish::resolve_destination(bot, &dest_label).await,
+            Err(e) => Err(e),
+        };
+        let dest = match resolved {
             Ok(dest) => dest,
             Err(e) => return self.fail(run_id, e).await,
         };
@@ -389,7 +415,7 @@ impl Runner {
         self.db.fail_run(run_id, &reason).await?;
 
         if !self.cancel.is_cancelled() {
-            notify(&self.client, &format!("digest not built: {reason}")).await;
+            self.notify(&format!("digest not built: {reason}")).await;
         }
         Ok(Outcome::Failed(run_id, reason))
     }

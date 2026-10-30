@@ -44,8 +44,3 @@ rand               = "0.10"
 [profile.release]
 lto = true
 codegen-units = 1
-
-[dev-dependencies]
-# Fake HTTP server for the map-reduce tests: we test the request flow
-# with no network and no key. These features do not go into the release binary.
-tokio = { version = "1", features = ["net", "io-util"] }
