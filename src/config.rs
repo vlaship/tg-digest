@@ -105,7 +105,7 @@ pub struct Anthropic {
     pub request_timeout_secs: u64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct Prompts {
     pub system: String,
     pub user_template: String,

@@ -19,7 +19,7 @@ use grammers_session::types::{PeerAuth, PeerId, PeerRef};
 use std::time::Duration;
 
 use crate::cancel::Cancel;
-use crate::db::{Db, Destination, Run};
+use crate::db::{Chunk, Db, Destination, Run};
 use crate::telegram::bot::Bot;
 use crate::telegram::client::{flood_wait, is_auth_error};
 
@@ -74,6 +74,56 @@ pub async fn resolve_destination(bot: &Bot, destination: &str) -> Result<Destina
             .ok_or_else(|| anyhow!("destination {destination} has no id"))?,
         access_hash: peer.auth.hash(),
     })
+}
+
+/// Everybody who gets the digest. The first one is the main destination of the
+/// delivery journal, the rest get copies.
+///
+/// For a channel this is only the channel: it already reaches everyone who follows it.
+/// For the chat with the bot: the owner, then the other allowed users — except those
+/// who sent `/stop`. The list may be empty: then nobody wants the digest.
+///
+/// The owner who did not write to the bot yet is an error, as before. Another user
+/// who never wrote to the bot cannot get messages from it, so they are skipped with a
+/// warning instead of failing the run.
+pub async fn recipients(bot: &Bot, db: &Db, destination: &str) -> Result<Vec<Destination>> {
+    if !matches!(destination, "bot" | "me") {
+        return Ok(vec![resolve_destination(bot, destination).await?]);
+    }
+
+    let muted = db.muted_users().await?;
+    let is_muted = |user: grammers_session::types::PeerId| {
+        user.bare_id().is_some_and(|id| muted.contains(&id))
+    };
+
+    let mut out = Vec::new();
+    if !is_muted(bot.owner) {
+        out.push(to_destination(bot.owner_ref().await?));
+    }
+    for user in bot.others().filter(|&u| !is_muted(u)) {
+        match bot.user_ref(user).await {
+            Ok(peer) => out.push(to_destination(peer)),
+            Err(e) => tracing::warn!(
+                user = ?user.bare_id(),
+                error = %format!("{e:#}"),
+                "allowed user does not get the digest"
+            ),
+        }
+    }
+    Ok(out)
+}
+
+fn to_destination(peer: PeerRef) -> Destination {
+    Destination {
+        peer_id: peer.id.bot_api_dialog_id_unchecked(),
+        access_hash: peer.auth.hash(),
+    }
+}
+
+/// The `random_id` of a copy for another recipient: different for each recipient, but
+/// the same on every retry, so Telegram still drops duplicates.
+fn copy_random_id(random_id: i64, peer_id: i64) -> i64 {
+    random_id ^ peer_id.wrapping_mul(0x9E37_79B9_7F4A_7C15_u64 as i64)
 }
 
 pub fn destination_ref(dest: Destination) -> Result<PeerRef> {
@@ -153,11 +203,24 @@ pub async fn deliver_pending(
         .destination()
         .ok_or_else(|| anyhow!("run #{} has no fixed destination", run.id))?;
     let peer = destination_ref(dest)?;
+    let extras = run
+        .extra_dests
+        .iter()
+        .map(|d| destination_ref(*d))
+        .collect::<Result<Vec<_>>>()?;
 
     db.mark_publishing(run.id).await?;
     let chunks = db.chunks(run.id).await?;
     let total = chunks.len();
-    let mut first_send_at = run.first_send_at;
+    let mut send = Sender {
+        client,
+        db,
+        run,
+        cancel,
+        retry_window,
+        first_send_at: run.first_send_at,
+        total,
+    };
 
     for chunk in chunks.iter().filter(|c| c.delivered_at.is_none()) {
         // We check the shutdown token BETWEEN parts: sending itself is not cancelled,
@@ -172,62 +235,39 @@ pub async fn deliver_pending(
             return Ok(Some("stopped by signal".into()));
         }
 
-        let mut attempt = 0;
-        loop {
-            if cancel.is_cancelled() {
-                return Ok(Some("stopped by signal".into()));
-            }
-            if first_send_at.is_some_and(|first| retry_expired(first, retry_window, Utc::now())) {
-                return Ok(Some(format!(
-                    "auto-retry window is over: /resume {} or /abandon {}",
-                    run.id, run.id
-                )));
-            }
-            db.mark_first_send(run.id).await?;
-            first_send_at.get_or_insert(Utc::now());
-            attempt += 1;
-            match send_chunk(client, peer, &chunk.html, chunk.random_id).await {
-                SendOutcome::Delivered { sent_msg_id } => {
-                    db.mark_delivered(run.id, chunk.idx, sent_msg_id).await?;
-                    tracing::info!(
-                        run = run.id,
-                        part = chunk.idx + 1,
-                        of = total,
-                        msg_id = ?sent_msg_id,
-                        "part delivered"
-                    );
-                    break;
-                }
-                SendOutcome::Auth(e) => {
-                    return Err(anyhow::Error::new(e).context("Telegram session is not valid"))
-                }
-                SendOutcome::Rejected(reason) => {
-                    return Ok(Some(format!(
-                        "part {}/{total} refused: {reason}",
-                        chunk.idx + 1
-                    )))
-                }
-                SendOutcome::Wait(wait, reason) => {
-                    if attempt >= MAX_ATTEMPTS {
-                        return Ok(Some(give_up(chunk.idx, total, attempt, &reason)));
-                    }
-                    tracing::warn!(run = run.id, part = chunk.idx + 1, ?wait, %reason, "FLOOD_WAIT, waiting");
-                    if cancel.sleep(wait).await.is_err() {
-                        return Ok(Some("stopped by signal".into()));
-                    }
-                }
-                SendOutcome::Unclear(reason) => {
-                    if attempt >= MAX_ATTEMPTS {
-                        return Ok(Some(give_up(chunk.idx, total, attempt, &reason)));
-                    }
-                    let delay = Duration::from_secs(2u64.pow(attempt));
-                    tracing::warn!(run = run.id, part = chunk.idx + 1, ?delay, %reason, "unclear result, retry with the same random_id");
-                    if cancel.sleep(delay).await.is_err() {
-                        return Ok(Some("stopped by signal".into()));
-                    }
+        // The main destination decides the delivery: if it fails, the run waits.
+        let sent_msg_id = match send.part(peer, chunk, chunk.random_id).await? {
+            Attempt::Delivered(id) => id,
+            Attempt::Stop(reason) => return Ok(Some(reason)),
+        };
+
+        // Copies for the other users. A failure here does not hold the digest for the
+        // owner: it is only logged. On a retry the same `random_id` keeps them unique.
+        for extra in &extras {
+            let random_id = copy_random_id(chunk.random_id, extra.id.bot_api_dialog_id_unchecked());
+            if let Attempt::Stop(reason) = send.part(*extra, chunk, random_id).await? {
+                tracing::warn!(
+                    run = run.id,
+                    part = chunk.idx + 1,
+                    user = ?extra.id.bare_id(),
+                    %reason,
+                    "copy for an allowed user not delivered"
+                );
+                if cancel.is_cancelled() {
+                    return Ok(Some("stopped by signal".into()));
                 }
             }
         }
+
+        db.mark_delivered(run.id, chunk.idx, sent_msg_id).await?;
+        tracing::info!(
+            run = run.id,
+            part = chunk.idx + 1,
+            of = total,
+            msg_id = ?sent_msg_id,
+            copies = extras.len(),
+            "part delivered"
+        );
     }
 
     // The completion rule is delivered_at for all parts, not sent_msg_id.
@@ -242,6 +282,84 @@ pub async fn deliver_pending(
         Ok(None)
     } else {
         Ok(Some(format!("parts not delivered: {pending} of {total}")))
+    }
+}
+
+/// How sending one part to one recipient ended.
+enum Attempt {
+    Delivered(Option<i32>),
+    /// Stop here: the reason goes to the owner, the run stays in `publishing`.
+    Stop(String),
+}
+
+/// What all sends of one delivery share: the retry rules and the time of the
+/// first attempt, from which the retry window is counted.
+struct Sender<'a> {
+    client: &'a Client,
+    db: &'a Db,
+    run: &'a Run,
+    cancel: &'a Cancel,
+    retry_window: Option<ChronoDuration>,
+    first_send_at: Option<DateTime<Utc>>,
+    total: usize,
+}
+
+impl Sender<'_> {
+    /// Send one part to one recipient, retrying an unclear result with the same
+    /// `random_id`. Only a dead session is an error: then the daemon must exit.
+    async fn part(&mut self, peer: PeerRef, chunk: &Chunk, random_id: i64) -> Result<Attempt> {
+        let (run, total) = (self.run, self.total);
+        let mut attempt = 0;
+        loop {
+            if self.cancel.is_cancelled() {
+                return Ok(Attempt::Stop("stopped by signal".into()));
+            }
+            if self
+                .first_send_at
+                .is_some_and(|first| retry_expired(first, self.retry_window, Utc::now()))
+            {
+                return Ok(Attempt::Stop(format!(
+                    "auto-retry window is over: /resume {} or /abandon {}",
+                    run.id, run.id
+                )));
+            }
+            self.db.mark_first_send(run.id).await?;
+            self.first_send_at.get_or_insert(Utc::now());
+            attempt += 1;
+            match send_chunk(self.client, peer, &chunk.html, random_id).await {
+                SendOutcome::Delivered { sent_msg_id } => {
+                    return Ok(Attempt::Delivered(sent_msg_id))
+                }
+                SendOutcome::Auth(e) => {
+                    return Err(anyhow::Error::new(e).context("Telegram session is not valid"))
+                }
+                SendOutcome::Rejected(reason) => {
+                    return Ok(Attempt::Stop(format!(
+                        "part {}/{total} refused: {reason}",
+                        chunk.idx + 1
+                    )))
+                }
+                SendOutcome::Wait(wait, reason) => {
+                    if attempt >= MAX_ATTEMPTS {
+                        return Ok(Attempt::Stop(give_up(chunk.idx, total, attempt, &reason)));
+                    }
+                    tracing::warn!(run = run.id, part = chunk.idx + 1, ?wait, %reason, "FLOOD_WAIT, waiting");
+                    if self.cancel.sleep(wait).await.is_err() {
+                        return Ok(Attempt::Stop("stopped by signal".into()));
+                    }
+                }
+                SendOutcome::Unclear(reason) => {
+                    if attempt >= MAX_ATTEMPTS {
+                        return Ok(Attempt::Stop(give_up(chunk.idx, total, attempt, &reason)));
+                    }
+                    let delay = Duration::from_secs(2u64.pow(attempt));
+                    tracing::warn!(run = run.id, part = chunk.idx + 1, ?delay, %reason, "unclear result, retry with the same random_id");
+                    if self.cancel.sleep(delay).await.is_err() {
+                        return Ok(Attempt::Stop("stopped by signal".into()));
+                    }
+                }
+            }
+        }
     }
 }
 

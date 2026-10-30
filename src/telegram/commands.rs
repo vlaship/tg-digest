@@ -12,6 +12,7 @@ use grammers_client::client::UpdatesConfiguration;
 use grammers_client::message::InputMessage;
 use grammers_client::peer::Peer;
 use grammers_client::update::Update;
+use grammers_session::types::PeerId;
 use grammers_session::updates::UpdatesLike;
 use std::sync::Arc;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -29,11 +30,14 @@ Commands:
 /rm @channel | id — remove a channel
 /list — channels, cursors, errors
 /reset id — read the channel again from the lookback_hours window
+/skip — move all channels to their newest message: older posts are skipped
 /run — run now (or deliver an undelivered digest)
 /status — last run: status, posts, tokens
 /last — send the last digest again
 /resume N — deliver an old run (a duplicate is possible)
 /abandon N — cancel an undelivered run
+/stop — stop getting digests (commands still work)
+/start — get digests again
 /help — this help";
 
 /// Run the updates loop until the shutdown signal comes.
@@ -116,7 +120,7 @@ pub async fn listen(
         let runner = runner.clone();
         let cancel = cancel.clone();
         commands.spawn(async move {
-            let reply = match handle(&runner, &text).await {
+            let reply = match handle(&runner, user, &text).await {
                 Ok(reply) => reply,
                 Err(e) if crate::telegram::client::is_fatal(&e) => return Err(e),
                 // We show a command error to the owner, we do not hide it in the log.
@@ -146,7 +150,7 @@ pub async fn listen(
     }
 }
 
-async fn handle(runner: &Arc<Runner>, text: &str) -> Result<String> {
+async fn handle(runner: &Arc<Runner>, user: PeerId, text: &str) -> Result<String> {
     let mut parts = text.splitn(2, char::is_whitespace);
     // Telegram may add the bot name: `/list@my_digest_bot`.
     let command = parts
@@ -158,7 +162,9 @@ async fn handle(runner: &Arc<Runner>, text: &str) -> Result<String> {
     let arg = parts.next().unwrap_or("").trim();
 
     match command {
-        "/help" | "/start" => Ok(HELP.into()),
+        "/help" => Ok(HELP.into()),
+        "/start" => subscribe(runner, user, true).await,
+        "/stop" => subscribe(runner, user, false).await,
         "/list" => list(runner).await,
         "/status" => status(runner).await,
         "/run" => Ok(runner.trigger(TRIGGER_MANUAL).await?.to_string()),
@@ -174,6 +180,7 @@ async fn handle(runner: &Arc<Runner>, text: &str) -> Result<String> {
         "/add" => guarded(runner, add(runner, arg)).await,
         "/rm" => guarded(runner, remove(runner, arg)).await,
         "/reset" => guarded(runner, reset(runner, arg)).await,
+        "/skip" => guarded(runner, skip(runner)).await,
         "/last" => guarded(runner, last(runner)).await,
         other => Ok(format!("unknown command {other}\n\n{HELP}")),
     }
@@ -202,6 +209,18 @@ where
         ));
     }
     action.await
+}
+
+/// `/start` and `/stop`: turn the digest on or off for the user who wrote, the owner
+/// too. Commands and (for the owner) notifications keep working either way.
+async fn subscribe(runner: &Arc<Runner>, user: PeerId, on: bool) -> Result<String> {
+    let id = user.bare_id().unwrap_or_default();
+    runner.db.set_muted(id, !on).await?;
+    Ok(if on {
+        format!("digests are on for you.\n\n{HELP}")
+    } else {
+        "digests are off for you. Send /start to turn them on again.".into()
+    })
 }
 
 async fn list(runner: &Arc<Runner>) -> Result<String> {
@@ -301,14 +320,53 @@ async fn add(runner: &Arc<Runner>, arg: &str) -> Result<String> {
         return Ok("a channel is needed: /add @name, /add https://t.me/+invite or /add id".into());
     }
 
+    // Already in the list: say so and touch nothing, its cursor stays. For a username
+    // or an id the database answers without a request to Telegram.
+    let invite = arg.contains("t.me/+") || arg.contains("joinchat");
+    if !invite {
+        if let Some(channel) = runner.db.find_channel(username_from(arg)).await? {
+            if channel.enabled {
+                return Ok(already_added(&channel));
+            }
+        }
+    }
+
     let peer = resolve_new_channel(runner, arg).await?;
+    // An invite link is resolved only now, so check again by id.
+    if let Some(channel) = runner.db.channel(peer.id).await? {
+        if channel.enabled {
+            return Ok(already_added(&channel));
+        }
+    }
+
     let (username, title) = channels::describe(&runner.client, peer).await?;
     runner
         .db
         .upsert_channel(peer.id, peer.access_hash, username.as_deref(), &title)
         .await?;
 
-    Ok(format!("added: {title}, id {}", peer.id))
+    // Start from the newest message: only posts after adding go into the digest.
+    // If we cannot read it, the channel keeps cursor 0 (the lookback_hours window).
+    match channels::last_message_id(&runner.client, peer).await {
+        Ok(Some(last)) => runner.db.set_cursor(peer.id, last).await?,
+        Ok(None) => {}
+        Err(e) => {
+            tracing::warn!(error = %format!("{e:#}"), channel = peer.id, "could not read the last message, the lookback window is used")
+        }
+    }
+
+    Ok(format!(
+        "added: {title}, id {}. Only new posts from now on go into the digest \
+         (/reset {} reads the last lookback_hours too)",
+        peer.id, peer.id
+    ))
+}
+
+fn already_added(channel: &Channel) -> String {
+    format!(
+        "already in the list: {}, id {}. /list shows all channels",
+        channel.title, channel.id
+    )
 }
 
 async fn remove(runner: &Arc<Runner>, arg: &str) -> Result<String> {
@@ -325,6 +383,41 @@ async fn remove(runner: &Arc<Runner>, arg: &str) -> Result<String> {
     runner.db.disable_channel(channel.id).await?;
 
     Ok(format!("disabled: {}, id {}", channel.title, channel.id))
+}
+
+/// `/skip`: move every enabled channel to its newest message, so the next digest
+/// has only posts that come after this. A channel that cannot be read keeps its cursor.
+async fn skip(runner: &Arc<Runner>) -> Result<String> {
+    let channels = runner.db.enabled_channels().await?;
+    if channels.is_empty() {
+        return Ok("no channels yet: add one with /add @channel".into());
+    }
+
+    let (mut moved, mut failed) = (0, Vec::new());
+    for channel in &channels {
+        let peer = channels::ChannelPeer {
+            id: channel.id,
+            access_hash: channel.access_hash,
+        };
+        match channels::last_message_id(&runner.client, peer).await {
+            Ok(Some(last)) => {
+                runner.db.set_cursor(channel.id, last).await?;
+                moved += 1;
+            }
+            Ok(None) => {}
+            Err(e) if crate::telegram::client::is_fatal(&e) => return Err(e),
+            Err(e) => failed.push(format!("{}: {e:#}", channel.label())),
+        }
+    }
+
+    let mut out = format!(
+        "moved {moved} of {} channels to their newest message: older posts are skipped",
+        channels.len()
+    );
+    if !failed.is_empty() {
+        out.push_str(&format!("\nnot moved:\n{}", failed.join("\n")));
+    }
+    Ok(out)
 }
 
 async fn reset(runner: &Arc<Runner>, arg: &str) -> Result<String> {
@@ -358,14 +451,20 @@ async fn last(runner: &Arc<Runner>) -> Result<String> {
     }
 
     let bot = runner.bot()?;
-    let dest = publish::resolve_destination(bot, &runner.cfg.telegram.destination).await?;
-    publish::resend(
-        &bot.client,
-        publish::destination_ref(dest)?,
-        &chunks,
-        runner.cancellation(),
-    )
-    .await?;
+    let recipients = publish::recipients(bot, &runner.db, &runner.cfg.telegram.destination).await?;
+    if recipients.is_empty() {
+        return Ok("everybody turned the digest off with /stop: nothing is sent".into());
+    }
+    // A failure for one recipient does not stop the others; it is only logged.
+    for dest in recipients {
+        let peer = publish::destination_ref(dest)?;
+        if let Err(e) = publish::resend(&bot.client, peer, &chunks, runner.cancellation()).await {
+            if crate::telegram::client::is_fatal(&e) {
+                return Err(e);
+            }
+            tracing::warn!(error = %format!("{e:#}"), "/last for one recipient failed");
+        }
+    }
 
     Ok(format!(
         "run #{} sent again to {} ({} parts)",

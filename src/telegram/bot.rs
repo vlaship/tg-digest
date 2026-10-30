@@ -81,17 +81,24 @@ impl Bot {
     /// `access_hash` comes in that message, and grammers keeps it in the bot session.
     /// So it survives restarts, `/start` is needed only once.
     pub async fn owner_ref(&self) -> Result<PeerRef> {
+        self.user_ref(self.owner).await
+    }
+
+    /// The chat with any user, if the user has written to the bot before.
+    pub async fn user_ref(&self, user: PeerId) -> Result<PeerRef> {
         let info = self
             .session
-            .peer(self.owner)
+            .peer(user)
             .await
             .map_err(|e| anyhow!("could not read the bot session: {e}"))?
             .ok_or_else(|| anyhow!(SEND_START))?;
         let auth = info.auth().ok_or_else(|| anyhow!(SEND_START))?;
-        Ok(PeerRef {
-            id: self.owner,
-            auth,
-        })
+        Ok(PeerRef { id: user, auth })
+    }
+
+    /// Allowed users except the owner: they also get the digests.
+    pub fn others(&self) -> impl Iterator<Item = PeerId> + '_ {
+        self.allowed.iter().copied().filter(|&u| u != self.owner)
     }
 
     /// Whether this user may give commands.
