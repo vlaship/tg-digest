@@ -32,7 +32,8 @@ Toolchain: `cargo --version`. If the command is missing, the install steps are i
 
 Working config: `config.toml` (not `config.example.toml`). If it is missing, copy
 the example and name the fields the owner must fill in: `telegram.api_id`,
-`telegram.api_hash`, `telegram.phone`, `anthropic.api_key`, `telegram.folder`.
+`telegram.api_hash`, `telegram.phone`, `anthropic.api_key`. Channels are not in the
+config: the owner adds them with `/add` in Saved Messages.
 
 **Never print the content of `config.toml`, `tg.session` or `digest.db`
 to a log or a reply** — they hold keys, account access and digest texts.
@@ -46,7 +47,7 @@ only after the previous one is clean.
 |---|---|---|---|
 | 1 | `cargo build` | compilation | — |
 | 2 | `cargo test` | answer parsing, rendering, cursors, map-reduce flow | — |
-| 3 | `cargo run -- --config config.toml preview` | folder content, cursors, album merging, short post filter | free, no LLM call |
+| 3 | `cargo run -- --config config.toml preview` | channels from the database, cursors, album merging, short post filter | free, no LLM call |
 | 4 | `cargo run -- --config config.toml run --dry-run` | digest quality: are duplicates merged, are links right | costs tokens, posts nothing |
 | 5 | `serve` + `/run` with `destination = "me"` | the full publish: markup, splitting, no link previews | the post goes to Saved Messages |
 | 6 | `destination = "@channel"` | — | subscribers see it |
@@ -81,7 +82,7 @@ locked, as it would be on Windows.
 
 ## Commands in Saved Messages
 
-`/help` shows the list. Channel management (`/add`, `/rm`, `/sync`), diagnostics
+`/help` shows the list. Channel management (`/add`, `/rm`, `/reset`), diagnostics
 (`/list`, `/status`), a run (`/run`), a repeat (`/last`) and handling an
 undelivered run (`/resume N`, `/abandon N`).
 
@@ -156,10 +157,6 @@ signatures at <https://docs.rs/grammers-client/0.10.0/>, not in search examples 
 they target the old API.
 
 **`not logged in to Telegram`** — run `login`.
-
-**`folder … has an automatic rule`** — the folder has a flag on, like "Channels"
-or "Unread". The content of such a folder is calculated, so sync is turned off on
-purpose: remove the flag and call `/sync`.
 
 **`channel excluded from the run`** — it hit `max_posts_per_channel` or the
 channel cannot be read. The cursor did not move, the next run reads the rest;

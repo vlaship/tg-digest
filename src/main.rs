@@ -188,14 +188,12 @@ async fn dry_run_once(cfg: Arc<Config>) -> Result<()> {
     Ok(())
 }
 
-/// Common setup for the debug commands: database, client, login check,
-/// channel seed. They do not need a shutdown token — the process runs once.
+/// Common setup for the debug commands: database, client, login check.
+/// They do not need a shutdown token — the process runs once.
 async fn prepare(cfg: Arc<Config>) -> Result<Arc<Runner>> {
     let db = Arc::new(Db::open(&cfg.db_file).await?.preview_copy().await?);
     let session = telegram::client::connect(&cfg).await?;
     telegram::client::ensure_authorized(&session.client).await?;
-
-    seed_if_empty(&cfg, &db, &session.client).await?;
 
     Ok(Arc::new(Runner::new(
         cfg,
@@ -203,25 +201,6 @@ async fn prepare(cfg: Arc<Config>) -> Result<Arc<Runner>> {
         session.client,
         Cancel::never(),
     )))
-}
-
-/// `[[channels]]` from the config is only a seed for an empty database: after that
-/// the list lives in the Telegram folder and in the database.
-async fn seed_if_empty(
-    cfg: &Config,
-    db: &Db,
-    client: &grammers_client::client::Client,
-) -> Result<()> {
-    if !db.channels().await?.is_empty() {
-        return Ok(());
-    }
-    let seeds = cfg.seed_channels();
-    if seeds.is_empty() {
-        return Ok(());
-    }
-    let added = telegram::folder::seed(client, db, &seeds).await?;
-    tracing::info!(added, "channels from the config copied to the database");
-    Ok(())
 }
 
 async fn serve(cfg: Arc<Config>) -> Result<()> {
@@ -238,7 +217,6 @@ async fn serve(cfg: Arc<Config>) -> Result<()> {
 
     let session = telegram::client::connect(&cfg).await?;
     telegram::client::ensure_authorized(&session.client).await?;
-    seed_if_empty(&cfg, &db, &session.client).await?;
 
     let (source, cancel) = cancel::channel();
     tokio::spawn(watch_signals(source));

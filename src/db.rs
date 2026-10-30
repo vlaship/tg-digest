@@ -238,7 +238,8 @@ impl Db {
 
     // --------------------------------------------------------------- channels
 
-    /// Debug commands may sync folders, but must not reset daemon cursors.
+    /// Debug commands (`preview`, `run --dry-run`) work on a copy: refreshing names there
+    /// must not change the daemon database.
     pub async fn preview_copy(&self) -> Result<Self> {
         let copy = Self::open(":memory:").await?;
         for channel in self.channels().await? {
@@ -291,7 +292,7 @@ impl Db {
         Ok(collect_channels(rows).await?.pop())
     }
 
-    /// A channel from the folder. Returns `true` if the cursor was reset: the channel is
+    /// A channel from `/add`. Returns `true` if the cursor was reset: the channel is
     /// new or came back from the disabled ones (otherwise a channel disabled for a month
     /// would bring a month of posts when it comes back).
     pub async fn upsert_channel(
@@ -340,24 +341,6 @@ impl Db {
         }
     }
 
-    /// Channels that are not in the folder are not deleted but disabled: `/list` still
-    /// shows them together with the last error.
-    pub async fn disable_channels_except(&self, keep: &[i64]) -> Result<Vec<Channel>> {
-        let mut disabled = Vec::new();
-        for channel in self.enabled_channels().await? {
-            if !keep.contains(&channel.id) {
-                self.conn
-                    .execute(
-                        "UPDATE channels SET enabled = 0 WHERE id = ?1",
-                        params![channel.id],
-                    )
-                    .await?;
-                disabled.push(channel);
-            }
-        }
-        Ok(disabled)
-    }
-
     pub async fn set_channel_error(&self, id: i64, error: Option<&str>) -> Result<()> {
         self.conn
             .execute(
@@ -371,7 +354,7 @@ impl Db {
     /// Update only the title and the username.
     ///
     /// Separate from `upsert_channel`, because that one treats the channel as
-    /// coming from the folder and may reset the cursor: updating names has nothing
+    /// coming from `/add` and may reset the cursor: updating names has nothing
     /// to do with the channel list.
     pub async fn update_channel_names(
         &self,
@@ -388,7 +371,7 @@ impl Db {
         Ok(())
     }
 
-    /// Disable a channel by hand (`/rm` without a folder).
+    /// `/rm`: disable a channel. It is not deleted: `/list` still shows it.
     pub async fn disable_channel(&self, id: i64) -> Result<bool> {
         let affected = self
             .conn
@@ -812,7 +795,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn preview_folder_changes_do_not_change_persistent_cursors() {
+    async fn preview_changes_do_not_change_persistent_cursors() {
         let db = memory_db().await;
         db.upsert_channel(1, 7, None, "News").await.unwrap();
         set_cursor(&db, 1, 500).await;
@@ -865,7 +848,7 @@ mod tests {
         let db = memory_db().await;
         assert!(db.upsert_channel(1, 7, Some("news"), "News").await.unwrap());
         set_cursor(&db, 1, 500).await;
-        db.disable_channels_except(&[]).await.unwrap();
+        db.disable_channel(1).await.unwrap();
 
         assert!(db.upsert_channel(1, 7, Some("news"), "News").await.unwrap());
         let channel = db.channel(1).await.unwrap().unwrap();

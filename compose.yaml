@@ -4,18 +4,12 @@ services:
     image: tg-digest
     restart: unless-stopped
 
-    # All state is in the host folder ./data, mounted as /data:
-    # config.toml, tg.session, digest.db. It survives image updates and `down`.
+    # All settings and state are in the host folder ./data, mounted as /data:
+    # config.toml (with the secrets), tg.session, digest.db. It survives image updates
+    # and `down`. ./data is in .gitignore and .dockerignore.
     # tg.session gives full access to the Telegram account. It is not "just a cache".
     volumes:
       - ./data:/data
-
-    # Secrets: TG_API_ID, TG_API_HASH, TG_PHONE, ANTHROPIC_API_KEY from .env next to
-    # this file (copy .env.example). Each one overrides the value from config.toml;
-    # an empty value counts as "not set". .env is in .gitignore and .dockerignore.
-    env_file:
-      - path: .env
-        required: false
 
     # Anything not yet saved can be stopped, but sending one part must not be cut.
     # 30 seconds is enough to finish the current part and close the transaction.

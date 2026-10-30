@@ -16,7 +16,7 @@ use crate::config::Config;
 use crate::db::{self, Db, Run};
 use crate::digest::{self, RenderOptions};
 use crate::summarize::Summarizer;
-use crate::telegram::{client as tg, folder, notify, publish};
+use crate::telegram::{channels, client as tg, notify, publish};
 
 pub const TRIGGER_CRON: &str = "cron";
 pub const TRIGGER_CATCH_UP: &str = "catch_up";
@@ -80,8 +80,6 @@ pub struct Runner {
     /// One lock for the run and for commands that touch cursors.
     /// It replaces a lock file: there is one process in the container.
     lock: Mutex<()>,
-    /// The last folder complaint — so we do not send it to Saved Messages every hour.
-    folder_warning: Mutex<Option<String>>,
 }
 
 impl Runner {
@@ -92,7 +90,6 @@ impl Runner {
             client,
             cancel,
             lock: Mutex::new(()),
-            folder_warning: Mutex::new(None),
         }
     }
 
@@ -397,18 +394,12 @@ impl Runner {
         Ok(Outcome::Failed(run_id, reason))
     }
 
-    /// Bring the database in line with Telegram before collecting.
+    /// Read channel titles and usernames again before collecting.
     ///
-    /// With a folder this is a full sync. Without a folder `/add` and `/rm` manage the
-    /// list, but titles and usernames must still be read again: a renamed channel
-    /// would otherwise stay in the digest forever with a stale link.
+    /// The list itself is managed only by `/add` and `/rm`, this never changes it.
+    /// But a renamed channel would otherwise stay in the digest forever with a stale link.
     pub async fn refresh_channels(&self) -> Result<()> {
-        if self.cfg.telegram.folder.is_some() {
-            self.sync_folder().await?;
-            return Ok(());
-        }
-
-        match folder::refresh_names(&self.client, &self.db).await {
+        match channels::refresh_names(&self.client, &self.db).await {
             Ok(_) => Ok(()),
             Err(e) if tg::is_fatal(&e) => Err(e),
             // We could not read the names again — this is no reason to cancel the run:
@@ -418,44 +409,5 @@ impl Runner {
                 Ok(())
             }
         }
-    }
-
-    /// The folder is the single source of truth about channels, but its problems must
-    /// not break the run: if the sync fails, we work from the database.
-    pub async fn sync_folder(&self) -> Result<Option<folder::SyncReport>> {
-        let Some(title) = self.cfg.telegram.folder.as_deref() else {
-            return Ok(None);
-        };
-
-        let report = match folder::sync(&self.client, &self.db, title).await {
-            Ok(report) => report,
-            Err(e) if tg::is_fatal(&e) => return Err(e),
-            Err(e) => {
-                let text = format!("folder {title:?} not synced: {e:#}");
-                tracing::warn!("{text}");
-                self.warn_once(text).await;
-                return Ok(None);
-            }
-        };
-
-        match &report.refused {
-            Some(reason) => {
-                tracing::warn!("{reason}");
-                self.warn_once(reason.clone()).await;
-            }
-            None => *self.folder_warning.lock().await = None,
-        }
-        Ok(Some(report))
-    }
-
-    /// The same folder complaint goes to Saved Messages once, not on
-    /// every trigger.
-    async fn warn_once(&self, text: String) {
-        let mut last = self.folder_warning.lock().await;
-        if last.as_deref() == Some(text.as_str()) {
-            return;
-        }
-        notify(&self.client, &text).await;
-        *last = Some(text);
     }
 }

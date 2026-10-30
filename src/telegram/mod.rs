@@ -2,9 +2,9 @@
 //!
 //! The Bot API does not fit here: a bot reads only channels where it is an admin.
 
+pub mod channels;
 pub mod client;
 pub mod commands;
-pub mod folder;
 pub mod publish;
 
 use grammers_client::client::Client;

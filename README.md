@@ -12,27 +12,29 @@ and posts the digest back to Telegram on a schedule.
   own channel.
 - **Schedule.** A cron expression in the config. You do not need a separate OS
   scheduler.
-- **Channel list.** A Telegram folder that you fill by hand on your phone. You
-  control the service with commands in Saved Messages (`/run`, `/list`, `/status`).
+- **Channel list.** Stored in the database. You add and remove channels with
+  commands in Saved Messages (`/add`, `/rm`), and control the service there too
+  (`/run`, `/list`, `/status`).
 
 ## Run in Docker (the normal way)
 
-Two things live outside the image:
+Everything lives outside the image, in the host folder **`data/`**, which compose
+mounts as `/data`:
 
-- **`.env`** next to `compose.yaml` — the secrets (`TG_API_ID`, `TG_API_HASH`,
-  `TG_PHONE`, `ANTHROPIC_API_KEY`). Compose passes them to the container.
-- **`data/`** — a host folder mounted as `/data`: `config.toml` (schedule, prompts,
-  limits), `tg.session` and the database `digest.db`. It survives image updates
-  and `docker compose down`. Back it up, and keep it private: `tg.session` gives
-  full access to your Telegram account.
+- `config.toml` — all settings, including the secrets (API id and hash, phone,
+  Anthropic key);
+- `tg.session` — the Telegram login, created by `login`;
+- `digest.db` — the database.
 
-Both are in `.gitignore`.
+It survives image updates and `docker compose down`. `data/` is in `.gitignore`
+and `.dockerignore`. Back it up, and keep it private: it has your keys, and
+`tg.session` gives full access to your Telegram account.
 
 ```powershell
-# Do not overwrite existing files: they already have your secrets and state.
-if (-not (Test-Path .env)) { Copy-Item .env.example .env }   # then fill in .env
 New-Item -ItemType Directory -Force data | Out-Null
+# Do not overwrite an existing config: it already has your secrets.
 if (-not (Test-Path data\config.toml)) { Copy-Item config.example.toml data\config.toml }
+# Now fill in data\config.toml (see "Settings" below).
 
 docker compose build                          # build the image first, or login runs in the old one
 docker compose run --rm -it tg-digest login   # one-time login: the code, and the password if you use 2FA
@@ -99,8 +101,8 @@ cargo run -- --config config.toml serve          # the daemon: schedule + comman
 
 The CLI has no run that posts. Only the daemon posts: on the schedule or after
 the `/run` command. Otherwise two processes on one database could post two
-digests. `preview` and `run --dry-run` use a copy of the channel list in memory:
-in these commands the folder sync does not change the saved channels or cursors.
+digests. `preview` and `run --dry-run` use a copy of the database in memory:
+they do not change the saved channels or cursors.
 
 When the daemon starts, it always checks for an undelivered digest, whatever
 `catch_up` and `run_on_start` say. A fresh one is delivered. For an old one it
@@ -113,41 +115,36 @@ Fill in `config.toml`:
 
 1. `telegram.api_id` / `api_hash` — get them at <https://my.telegram.org>;
 2. `telegram.phone` — the phone number of the account that follows the channels;
-3. `anthropic.api_key`;
-4. `telegram.folder` — the name of the Telegram folder with the channel list.
+3. `anthropic.api_key`.
 
-With Docker, put items 1–3 into `.env` instead (see `.env.example`): `TG_API_ID`,
-`TG_API_HASH`, `TG_PHONE` and `ANTHROPIC_API_KEY` override the values from the TOML,
-so `config.toml` can keep its empty placeholders. An empty value in `.env` keeps
-the one from `config.toml`.
+With Docker this file is `data/config.toml`. All settings come only from this
+file, the secrets too.
 
 ### Channels
 
-You build the folder by hand in the Telegram app. To add a channel, drag it into
-the folder. To remove it, drag it out. A folder with automatic rules ("Channels",
-"Unread") is refused: its content is calculated, and a sync would turn off all
-channels at once.
-
-`[[channels]]` in the config is only a seed for an empty database on the first
-start.
+The channel list is not in the config: it is stored in the database. Add a
+channel with `/add` in Saved Messages — by `@username`, by an invite link
+(`t.me/+…`, the account joins it) or by a numeric id (a private channel the
+account already follows). Remove it with `/rm`: the channel is turned off, not
+deleted, so `/list` still shows it. Titles and usernames are read again before
+every run, so a renamed channel keeps correct links.
 
 ## Commands in Saved Messages
 
 | Command | What it does |
 |---|---|
-| `/add @channel`, `/add t.me/+link`, `/add id` | join the channel and put it in the folder |
-| `/rm @channel` · `/rm id` | remove it from the folder |
+| `/add @channel`, `/add t.me/+link`, `/add id` | add the channel to the list |
+| `/rm @channel` · `/rm id` | turn the channel off |
 | `/list` | channels: id, username, on/off, cursor, last error |
 | `/reset id` | read the channel again from the `lookback_hours` window |
 | `/run` | run now (or deliver an undelivered digest) |
 | `/status` | last run: status, posts, topics, tokens, parts |
 | `/last` | send the last digest again |
 | `/resume N` · `/abandon N` | deliver or cancel an undelivered run |
-| `/sync` | read the folder again |
 | `/help` | list of commands |
 
-Notifications also come there: a failed run, an excluded channel, a folder with
-automatic rules, an undelivered digest.
+Notifications also come there: a failed run, an excluded channel, an undelivered
+digest.
 
 ## Security
 
