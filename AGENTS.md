@@ -76,7 +76,8 @@ link.
 bot cannot do that — it reads only channels where it is an admin. The bot
 (`[bot]`, `bot.session`, logs in with the token on start) only talks: it takes
 commands, replies, and sends digests and notifications. The bot accepts commands
-only from the owner, which is the personal account; everyone else is ignored. A
+only from the owner (the personal account) and `bot.allowed_users`; everyone else
+is ignored (logged with the user id). Digests and notifications go to the owner. A
 bot can write to a user only after the user wrote to it, so the owner sends
 `/start` once; the chat is then kept in `bot.session`.
 
