@@ -86,6 +86,10 @@ pub struct Telegram {
     /// How many channels are read at the same time.
     #[serde(default = "default_parallel_channels")]
     pub parallel_channels: usize,
+    /// After a delivered (or empty) run, mark the read posts as read in Telegram, so
+    /// the channels do not keep unread counters for news the digest already told.
+    #[serde(default = "default_true")]
+    pub mark_read: bool,
     /// For how many hours the daemon itself retries an undelivered digest. After this
     /// window the retry is manual only (`/resume`), see docs/PLAN.md 9.3.
     #[serde(default = "default_publish_retry_window_hours")]
@@ -191,6 +195,9 @@ fn default_max_posts() -> usize {
 }
 fn default_min_post_chars() -> usize {
     30
+}
+fn default_true() -> bool {
+    true
 }
 fn default_parallel_channels() -> usize {
     5

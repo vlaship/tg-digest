@@ -71,6 +71,11 @@ pause_between_channels_ms = 1500
 # bring FLOOD_WAIT from Telegram.
 parallel_channels = 5
 
+# After a delivered digest, mark the posts as read in Telegram for your account, so
+# the channels do not keep unread counters. Only your account: other users keep
+# their own read state.
+mark_read = true
+
 # For how many hours the daemon itself retries an undelivered digest. This is a
 # retry policy, not a safety limit: Telegram does not document how long it keeps
 # random_id for deduplication. After this window the owner retries with /resume.

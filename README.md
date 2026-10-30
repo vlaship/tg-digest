@@ -160,6 +160,8 @@ every run, so a renamed channel keeps correct links.
 Each digest goes to you and to every user in `bot.allowed_users` who has started
 the bot, except those who sent `/stop` (you can send it too).
 A story from the last digest is not sent again, unless there is real news about it.
+After a delivered digest the posts are marked as read in Telegram for your account
+(`telegram.mark_read`), so the channels do not keep unread counters.
 Notifications come only to you: a failed run, an excluded channel, an undelivered
 digest.
 

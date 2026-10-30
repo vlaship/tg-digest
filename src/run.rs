@@ -231,6 +231,7 @@ impl Runner {
         match publish::deliver_pending(&bot.client, &self.db, run, &self.cancel, window).await? {
             None => {
                 self.db.complete_run(run.id, db::STATUS_OK).await?;
+                self.mark_read(&run.cursors).await;
                 Ok(Outcome::Delivered(run.id))
             }
             Some(reason) => {
@@ -411,6 +412,14 @@ impl Runner {
         }
     }
 
+    /// The cursors are applied: mark those posts as read in Telegram too
+    /// (`telegram.mark_read`). Only for the personal account; errors go to the log.
+    async fn mark_read(&self, cursors: &std::collections::BTreeMap<i64, i32>) {
+        if self.cfg.telegram.mark_read && !cursors.is_empty() {
+            channels::mark_read(&self.client, &self.db, cursors).await;
+        }
+    }
+
     async fn finish_empty(
         &self,
         run_id: i64,
@@ -421,6 +430,7 @@ impl Runner {
             .save_empty_cursors(run_id, &collected.cursors, collected.posts.len(), usage)
             .await?;
         self.db.complete_run(run_id, db::STATUS_EMPTY).await?;
+        self.mark_read(&collected.cursors).await;
         Ok(Outcome::Finished {
             run: run_id,
             status: db::STATUS_EMPTY.into(),
