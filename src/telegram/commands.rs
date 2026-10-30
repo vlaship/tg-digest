@@ -19,6 +19,7 @@ use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::task::JoinSet;
 
 use crate::cancel::Cancel;
+use crate::config::PROVIDERS;
 use crate::db::Channel;
 use crate::run::{Runner, TRIGGER_MANUAL};
 use crate::telegram::client::is_auth_error;
@@ -33,6 +34,8 @@ Commands:
 /skip — move all channels to their newest message: older posts are skipped
 /run — run now (or deliver an undelivered digest)
 /status — last run: status, posts, tokens
+/provider [name] — list the model providers, or switch (owner)
+/fallback — switch to the fallback provider and run now (owner)
 /last — send the last digest again
 /resume N — deliver an old run (a duplicate is possible)
 /abandon N — cancel an undelivered run
@@ -174,6 +177,8 @@ async fn handle(runner: &Arc<Runner>, user: PeerId, text: &str) -> Result<String
     match command {
         "/help" => Ok(HELP.into()),
         "/start" => subscribe(runner, user, true).await,
+        "/provider" => provider(runner, user, arg).await,
+        "/fallback" => fallback(runner, user).await,
         "/stop" => subscribe(runner, user, false).await,
         "/list" => list(runner).await,
         "/status" => status(runner).await,
@@ -223,6 +228,59 @@ where
 
 /// `/start` and `/stop`: turn the digest on or off for the user who wrote, the owner
 /// too. Commands and (for the owner) notifications keep working either way.
+/// `/provider` shows the model provider, `/provider name` switches it. Only the owner:
+/// the owner pays for the keys and gets the limit notices.
+async fn provider(runner: &Arc<Runner>, user: PeerId, arg: &str) -> Result<String> {
+    let current = runner.provider().await;
+    if arg.is_empty() {
+        let cfg = &runner.cfg;
+        let mut out = String::from("Model providers:");
+        for name in PROVIDERS {
+            let mark = if name == current { "✅" } else { "•" };
+            out.push_str(&format!("\n{mark} {name} — {}", cfg.model_of(name)));
+            if name == current {
+                out.push_str(" (now)");
+            }
+            if cfg.fallback_provider.as_deref() == Some(name) {
+                out.push_str(" (fallback)");
+            }
+            if cfg.check_provider(name).is_err() {
+                out.push_str(" — no key in the config");
+            }
+        }
+        out.push_str("\n\n/provider name — switch (only the owner)");
+        return Ok(out);
+    }
+    if runner.bot()?.owner != user {
+        return Ok("only the owner can switch the provider".into());
+    }
+    match runner.set_provider(arg).await {
+        Ok(()) => Ok(format!("model provider: {arg} (was {current})")),
+        Err(e) => Ok(format!("cannot switch to {arg}: {e:#}")),
+    }
+}
+
+/// The owner agrees to the fallback provider after a limit notice: switch and
+/// build the digest at once.
+async fn fallback(runner: &Arc<Runner>, user: PeerId) -> Result<String> {
+    if runner.bot()?.owner != user {
+        return Ok("only the owner can switch the provider".into());
+    }
+    let Some(fallback) = runner.cfg.fallback_provider.clone() else {
+        return Ok("fallback_provider is not set in the config".into());
+    };
+    let current = runner.provider().await;
+    if fallback != current {
+        if let Err(e) = runner.set_provider(&fallback).await {
+            return Ok(format!("cannot switch to {fallback}: {e:#}"));
+        }
+    }
+    let outcome = runner.trigger(TRIGGER_MANUAL).await?;
+    Ok(format!(
+        "model provider: {fallback} (was {current}). /provider {current} switches back.\n\n{outcome}"
+    ))
+}
+
 async fn subscribe(runner: &Arc<Runner>, user: PeerId, on: bool) -> Result<String> {
     let id = user.bare_id().unwrap_or_default();
     runner.db.set_muted(id, !on).await?;
@@ -556,7 +614,10 @@ fn is_slow(text: &str) -> bool {
         .split('@')
         .next()
         .unwrap_or_default();
-    matches!(command, "/run" | "/resume" | "/last" | "/skip" | "/add")
+    matches!(
+        command,
+        "/run" | "/resume" | "/last" | "/skip" | "/add" | "/fallback"
+    )
 }
 
 /// The username from `@name`, `name`, `t.me/name` or `https://t.me/name/123`.

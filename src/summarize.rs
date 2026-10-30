@@ -190,8 +190,8 @@ pub struct Summary {
 }
 
 impl Summarizer {
-    pub fn new(cfg: &Config) -> Result<Self> {
-        let (backend, timeout) = if cfg.provider == "gemini" {
+    pub fn new(cfg: &Config, provider: &str) -> Result<Self> {
+        let (backend, timeout) = if provider == "gemini" {
             let g = &cfg.gemini;
             let backend = Backend::Gemini {
                 api_key: g.api_key.clone(),
@@ -216,7 +216,7 @@ impl Summarizer {
             .build()
             .context("could not create the HTTP client")?;
 
-        let model = if cfg.provider == "gemini" {
+        let model = if provider == "gemini" {
             cfg.gemini.model.clone()
         } else {
             cfg.anthropic.model.clone()
