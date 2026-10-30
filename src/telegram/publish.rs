@@ -16,12 +16,14 @@ use grammers_client::client::Client;
 use grammers_client::parsers::parse_html_message;
 use grammers_client::{tl, InvocationError};
 use grammers_session::types::{PeerAuth, PeerId, PeerRef};
+use std::path::Path;
 use std::time::Duration;
 
 use crate::cancel::Cancel;
 use crate::db::{Chunk, Db, Destination, Run};
 use crate::telegram::bot::Bot;
 use crate::telegram::client::{flood_wait, is_auth_error};
+use crate::telegram::photos;
 
 /// Pause between parts of a long digest, so Telegram does not see it as flooding.
 const PAUSE_BETWEEN_CHUNKS: Duration = Duration::from_millis(700);
@@ -166,7 +168,144 @@ pub async fn send_chunk(client: &Client, peer: PeerRef, html: &str, random_id: i
         rich_message: None,
     };
 
-    match client.invoke(&request).await {
+    outcome(client.invoke(&request).await)
+}
+
+/// The Bot API limit for a photo caption, in UTF-16 units of the text without markup.
+const MAX_CAPTION: usize = 1024;
+
+/// The part text fits in a photo caption.
+pub fn fits_caption(html: &str) -> bool {
+    parse_html_message(html).0.encode_utf16().count() <= MAX_CAPTION
+}
+
+/// One attempt to send a part with photos: one photo, or an album with the caption
+/// on the first photo. Album items get `random_id + position`, the same on every retry.
+pub async fn send_photos(
+    client: &Client,
+    peer: PeerRef,
+    html: &str,
+    photos: &[Vec<u8>],
+    random_id: i64,
+) -> SendOutcome {
+    let (message, entities) = parse_html_message(html);
+    let entities = (!entities.is_empty()).then_some(entities);
+
+    let mut uploaded = Vec::with_capacity(photos.len());
+    for (pos, data) in photos.iter().enumerate() {
+        let mut stream = std::io::Cursor::new(data.as_slice());
+        match client
+            .upload_stream(&mut stream, data.len(), format!("{pos}.jpg"))
+            .await
+        {
+            Ok(file) => uploaded.push(tl::enums::InputMedia::UploadedPhoto(
+                tl::types::InputMediaUploadedPhoto {
+                    spoiler: false,
+                    live_photo: false,
+                    file: file.raw,
+                    stickers: None,
+                    ttl_seconds: None,
+                    video: None,
+                },
+            )),
+            Err(e) => return SendOutcome::Unclear(format!("photo upload failed: {e}")),
+        }
+    }
+
+    if uploaded.len() == 1 {
+        let request = tl::functions::messages::SendMedia {
+            silent: false,
+            background: false,
+            clear_draft: false,
+            noforwards: false,
+            update_stickersets_order: false,
+            invert_media: false,
+            allow_paid_floodskip: false,
+            peer: peer.into(),
+            reply_to: None,
+            media: uploaded.remove(0),
+            message,
+            random_id,
+            reply_markup: None,
+            entities,
+            schedule_date: None,
+            schedule_repeat_period: None,
+            send_as: None,
+            quick_reply_shortcut: None,
+            effect: None,
+            allow_paid_stars: None,
+            suggested_post: None,
+        };
+        return outcome(client.invoke(&request).await);
+    }
+
+    // An album takes only photos that are already on the server: each one goes
+    // through `messages.uploadMedia` first.
+    let mut items = Vec::with_capacity(uploaded.len());
+    for (pos, media) in uploaded.into_iter().enumerate() {
+        let request = tl::functions::messages::UploadMedia {
+            business_connection_id: None,
+            peer: peer.into(),
+            media,
+        };
+        let photo = match client.invoke(&request).await {
+            Ok(tl::enums::MessageMedia::Photo(tl::types::MessageMediaPhoto {
+                photo: Some(tl::enums::Photo::Photo(photo)),
+                ..
+            })) => photo,
+            Ok(other) => {
+                return SendOutcome::Rejected(format!("unexpected upload answer: {other:?}"))
+            }
+            Err(e) => return outcome(Err(e)),
+        };
+        let (message, entities) = if pos == 0 {
+            (message.clone(), entities.clone())
+        } else {
+            (String::new(), None)
+        };
+        items.push(tl::enums::InputSingleMedia::Media(
+            tl::types::InputSingleMedia {
+                media: tl::enums::InputMedia::Photo(tl::types::InputMediaPhoto {
+                    spoiler: false,
+                    live_photo: false,
+                    id: tl::enums::InputPhoto::Photo(tl::types::InputPhoto {
+                        id: photo.id,
+                        access_hash: photo.access_hash,
+                        file_reference: photo.file_reference,
+                    }),
+                    ttl_seconds: None,
+                    video: None,
+                }),
+                random_id: random_id.wrapping_add(pos as i64),
+                message,
+                entities,
+            },
+        ));
+    }
+
+    let request = tl::functions::messages::SendMultiMedia {
+        silent: false,
+        background: false,
+        clear_draft: false,
+        noforwards: false,
+        update_stickersets_order: false,
+        invert_media: false,
+        allow_paid_floodskip: false,
+        peer: peer.into(),
+        reply_to: None,
+        multi_media: items,
+        schedule_date: None,
+        send_as: None,
+        quick_reply_shortcut: None,
+        effect: None,
+        allow_paid_stars: None,
+    };
+    outcome(client.invoke(&request).await)
+}
+
+/// What an answer of Telegram to a send means for the delivery.
+fn outcome(result: Result<tl::enums::Updates, InvocationError>) -> SendOutcome {
+    match result {
         Ok(updates) => SendOutcome::Delivered {
             sent_msg_id: sent_message_id(&updates),
         },
@@ -196,6 +335,7 @@ pub async fn deliver_pending(
     client: &Client,
     db: &Db,
     run: &Run,
+    photos_dir: &Path,
     cancel: &Cancel,
     retry_window: Option<ChronoDuration>,
 ) -> Result<Option<String>> {
@@ -235,8 +375,22 @@ pub async fn deliver_pending(
             return Ok(Some("stopped by signal".into()));
         }
 
+        // Photos that are lost (the folder was deleted by hand) do not hold the digest:
+        // the text goes without them, and a part with only photos is skipped.
+        let photos = match photos::load(photos_dir, run.id, chunk.idx as usize, chunk.photos) {
+            Ok(photos) => photos,
+            Err(e) => {
+                tracing::warn!(run = run.id, part = chunk.idx + 1, error = %format!("{e:#}"), "photos not found, sending the text only");
+                Vec::new()
+            }
+        };
+        if photos.is_empty() && chunk.html.is_empty() {
+            db.mark_delivered(run.id, chunk.idx, None).await?;
+            continue;
+        }
+
         // The main destination decides the delivery: if it fails, the run waits.
-        let sent_msg_id = match send.part(peer, chunk, chunk.random_id).await? {
+        let sent_msg_id = match send.part(peer, chunk, &photos, chunk.random_id).await? {
             Attempt::Delivered(id) => id,
             Attempt::Stop(reason) => return Ok(Some(reason)),
         };
@@ -245,7 +399,7 @@ pub async fn deliver_pending(
         // owner: it is only logged. On a retry the same `random_id` keeps them unique.
         for extra in &extras {
             let random_id = copy_random_id(chunk.random_id, extra.id.bot_api_dialog_id_unchecked());
-            if let Attempt::Stop(reason) = send.part(*extra, chunk, random_id).await? {
+            if let Attempt::Stop(reason) = send.part(*extra, chunk, &photos, random_id).await? {
                 tracing::warn!(
                     run = run.id,
                     part = chunk.idx + 1,
@@ -307,7 +461,13 @@ struct Sender<'a> {
 impl Sender<'_> {
     /// Send one part to one recipient, retrying an unclear result with the same
     /// `random_id`. Only a dead session is an error: then the daemon must exit.
-    async fn part(&mut self, peer: PeerRef, chunk: &Chunk, random_id: i64) -> Result<Attempt> {
+    async fn part(
+        &mut self,
+        peer: PeerRef,
+        chunk: &Chunk,
+        photos: &[Vec<u8>],
+        random_id: i64,
+    ) -> Result<Attempt> {
         let (run, total) = (self.run, self.total);
         let mut attempt = 0;
         loop {
@@ -326,7 +486,12 @@ impl Sender<'_> {
             self.db.mark_first_send(run.id).await?;
             self.first_send_at.get_or_insert(Utc::now());
             attempt += 1;
-            match send_chunk(self.client, peer, &chunk.html, random_id).await {
+            let sent = if photos.is_empty() {
+                send_chunk(self.client, peer, &chunk.html, random_id).await
+            } else {
+                send_photos(self.client, peer, &chunk.html, photos, random_id).await
+            };
+            match sent {
                 SendOutcome::Delivered { sent_msg_id } => {
                     return Ok(Attempt::Delivered(sent_msg_id))
                 }

@@ -120,6 +120,16 @@ pub async fn listen(
         let runner = runner.clone();
         let cancel = cancel.clone();
         commands.spawn(async move {
+            // A long command says at once that it has started: otherwise the chat is
+            // silent for minutes and it looks like nothing happened.
+            if is_slow(&text) {
+                let note = InputMessage::new()
+                    .text("⏳ working on it, this can take a few minutes…")
+                    .link_preview(false);
+                if let Err(e) = message.respond(note).await {
+                    tracing::warn!(error = %e, "could not send the working note");
+                }
+            }
             let reply = match handle(&runner, user, &text).await {
                 Ok(reply) => reply,
                 Err(e) if crate::telegram::client::is_fatal(&e) => return Err(e),
@@ -445,6 +455,8 @@ async fn last(runner: &Arc<Runner>) -> Result<String> {
         .await?
         .into_iter()
         .map(|c| c.html)
+        // Photo-only parts: their files are deleted after delivery, /last sends the text.
+        .filter(|html| !html.is_empty())
         .collect();
     if chunks.is_empty() {
         return Ok(format!("run #{} has no saved parts", run.id));
@@ -532,6 +544,19 @@ async fn resolve_new_channel(runner: &Arc<Runner>, arg: &str) -> Result<channels
         id: reference.id.bare_id().context("the channel has no id")?,
         access_hash: reference.auth.hash(),
     })
+}
+
+/// Commands that can take a long time: they read channels, call the model or send a
+/// digest. The bot answers them with a "working on it" note first.
+fn is_slow(text: &str) -> bool {
+    let command = text
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .split('@')
+        .next()
+        .unwrap_or_default();
+    matches!(command, "/run" | "/resume" | "/last" | "/skip" | "/add")
 }
 
 /// The username from `@name`, `name`, `t.me/name` or `https://t.me/name/123`.

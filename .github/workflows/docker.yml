@@ -1,6 +1,6 @@
 # Builds the Docker image.
 # - push to main and v* tags: build and push to GitHub Container Registry (ghcr.io);
-# - pull request: build only, never push;
+# - branches and pull requests: only by hand (Actions → docker → Run workflow), to save CI;
 # - manual run: build only, unless you tick "publish".
 name: docker
 
@@ -8,7 +8,6 @@ on:
   push:
     branches: [main]
     tags: ["v*"]
-  pull_request:
   workflow_dispatch:
     inputs:
       publish:
@@ -20,11 +19,11 @@ permissions:
   contents: read
   packages: write
 
-# One run per ref. Old PR runs are cancelled, but a run on main or a tag is never
-# cancelled half way: the next one waits, so every push publishes its own image.
+# One run per ref. A run on main or a tag is never cancelled half way: the next one
+# waits, so every push publishes its own image.
 concurrency:
   group: docker-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: false
 
 env:
   PUSH: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish) }}

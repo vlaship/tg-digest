@@ -13,11 +13,11 @@ use tokio::sync::{Mutex, MutexGuard};
 
 use crate::cancel::Cancel;
 use crate::config::{Config, Prompts};
-use crate::db::{self, Db, Run};
+use crate::db::{self, Db, NewChunk, Run};
 use crate::digest::{self, RenderOptions};
 use crate::summarize::Summarizer;
 use crate::telegram::bot::Bot;
-use crate::telegram::{channels, client as tg, publish};
+use crate::telegram::{channels, client as tg, photos, publish};
 
 pub const TRIGGER_CRON: &str = "cron";
 pub const TRIGGER_CATCH_UP: &str = "catch_up";
@@ -181,6 +181,7 @@ impl Runner {
             ));
         }
         self.db.abandon_run(run_id).await?;
+        photos::remove(&self.photos_dir(), run_id);
         Ok(Outcome::Abandoned(run_id))
     }
 
@@ -228,9 +229,14 @@ impl Runner {
         let window =
             (!resume).then(|| ChronoDuration::hours(self.cfg.telegram.publish_retry_window_hours));
         let bot = self.bot()?;
-        match publish::deliver_pending(&bot.client, &self.db, run, &self.cancel, window).await? {
+        let dir = self.photos_dir();
+        match publish::deliver_pending(&bot.client, &self.db, run, &dir, &self.cancel, window)
+            .await?
+        {
             None => {
                 self.db.complete_run(run.id, db::STATUS_OK).await?;
+                photos::remove(&dir, run.id);
+                self.mark_read(&run.cursors).await;
                 Ok(Outcome::Delivered(run.id))
             }
             Some(reason) => {
@@ -289,7 +295,7 @@ impl Runner {
             return self.finish_empty(run_id, &collected, (None, None)).await;
         }
 
-        let summarizer = match Summarizer::new(&self.cfg.anthropic) {
+        let summarizer = match Summarizer::new(&self.cfg) {
             Ok(s) => s,
             Err(e) => return self.fail(run_id, e).await,
         };
@@ -318,7 +324,7 @@ impl Runner {
         let mut digest = summary.digest;
         digest::drop_foreign_sources(&mut digest, &collected.posts);
 
-        let chunks = digest::render_html(
+        let chunks = digest::render_parts(
             &digest,
             &RenderOptions {
                 digest_title: &self.cfg.prompts.digest_title,
@@ -369,10 +375,9 @@ impl Runner {
         let dest = recipients.remove(0);
         let extra_dests = recipients;
 
-        let journal: Vec<(String, i64)> = chunks
-            .iter()
-            .map(|html| (html.clone(), rand::random()))
-            .collect();
+        let journal = self
+            .with_photos(run_id, &digest, chunks, &collected.posts)
+            .await;
 
         self.db
             .save_summary(
@@ -411,6 +416,95 @@ impl Runner {
         }
     }
 
+    fn photos_dir(&self) -> std::path::PathBuf {
+        photos::dir(&self.cfg.db_file)
+    }
+
+    /// The journal parts with the photos of each topic. If the topic is one message and
+    /// its text fits in a photo caption, it goes as one message with the photos.
+    /// Otherwise the photos go first, then the text. A photo that could not be
+    /// downloaded is only logged: the digest is sent without it.
+    async fn with_photos(
+        &self,
+        run_id: i64,
+        digest: &digest::Digest,
+        parts: Vec<digest::Part>,
+        posts: &[digest::Post],
+    ) -> Vec<NewChunk> {
+        let dir = self.photos_dir();
+        let mut journal = Vec::with_capacity(parts.len());
+        let mut done = std::collections::HashSet::new();
+
+        for (i, part) in parts.iter().enumerate() {
+            let text = NewChunk {
+                html: part.html.clone(),
+                random_id: rand::random(),
+                photos: 0,
+            };
+            let Some(topic) = part.topic.filter(|t| done.insert(*t)) else {
+                journal.push(text);
+                continue;
+            };
+
+            let files = self.topic_photos(&digest.topics[topic], posts).await;
+            if files.is_empty() {
+                journal.push(text);
+                continue;
+            }
+            if let Err(e) = photos::save(&dir, run_id, journal.len(), &files) {
+                tracing::warn!(error = %format!("{e:#}"), "could not save the photos");
+                journal.push(text);
+                continue;
+            }
+
+            let one_message = parts.get(i + 1).map(|next| next.topic) != Some(Some(topic));
+            let in_caption = one_message && publish::fits_caption(&part.html);
+            tracing::info!(
+                topic = %digest.topics[topic].title,
+                photos = files.len(),
+                kb = files.iter().map(Vec::len).sum::<usize>() / 1024,
+                in_caption,
+                "photos added to the topic"
+            );
+            if in_caption {
+                journal.push(NewChunk {
+                    photos: files.len(),
+                    ..text
+                });
+            } else {
+                journal.push(NewChunk {
+                    html: String::new(),
+                    random_id: rand::random(),
+                    photos: files.len(),
+                });
+                journal.push(text);
+            }
+        }
+        journal
+    }
+
+    async fn topic_photos(&self, topic: &digest::Topic, posts: &[digest::Post]) -> Vec<Vec<u8>> {
+        let Some((channel_id, ids)) = digest::pick_photos(topic, posts) else {
+            tracing::debug!(topic = %topic.title, "no photos in the sources of the topic");
+            return Vec::new();
+        };
+        match photos::download(&self.client, &self.db, channel_id, &ids).await {
+            Ok(files) => files,
+            Err(e) => {
+                tracing::warn!(error = %format!("{e:#}"), topic = %topic.title, "photos not added");
+                Vec::new()
+            }
+        }
+    }
+
+    /// The cursors are applied: mark those posts as read in Telegram too
+    /// (`telegram.mark_read`). Only for the personal account; errors go to the log.
+    async fn mark_read(&self, cursors: &std::collections::BTreeMap<i64, i32>) {
+        if self.cfg.telegram.mark_read && !cursors.is_empty() {
+            channels::mark_read(&self.client, &self.db, cursors).await;
+        }
+    }
+
     async fn finish_empty(
         &self,
         run_id: i64,
@@ -421,6 +515,7 @@ impl Runner {
             .save_empty_cursors(run_id, &collected.cursors, collected.posts.len(), usage)
             .await?;
         self.db.complete_run(run_id, db::STATUS_EMPTY).await?;
+        self.mark_read(&collected.cursors).await;
         Ok(Outcome::Finished {
             run: run_id,
             status: db::STATUS_EMPTY.into(),
@@ -447,7 +542,19 @@ impl Runner {
         self.db.fail_run(run_id, &reason).await?;
 
         if !self.cancel.is_cancelled() {
-            self.notify(&format!("digest not built: {reason}")).await;
+            let limit = error
+                .chain()
+                .find_map(|e| e.downcast_ref::<crate::summarize::LimitReached>());
+            let text = match limit {
+                Some(limit) => format!(
+                    "⚠️ the {} API limit is used up, the digest is not built.\n\
+                     The posts are kept and go into the next run. \
+                     Wait for the limit to reset, or switch the model in the config.\n\n{}",
+                    limit.api, limit.details
+                ),
+                None => format!("digest not built: {reason}"),
+            };
+            self.notify(&text).await;
         }
         Ok(Outcome::Failed(run_id, reason))
     }

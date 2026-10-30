@@ -146,7 +146,7 @@ async fn dry_run_once(cfg: Arc<Config>) -> Result<()> {
         return Ok(());
     }
 
-    let summarizer = Summarizer::new(&cfg.anthropic)?;
+    let summarizer = Summarizer::new(&cfg)?;
     let summary = summarizer
         .summarize(
             &cfg.prompts,

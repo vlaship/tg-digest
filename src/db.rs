@@ -79,6 +79,9 @@ const MIGRATIONS: &[&str] = &[
     // 6: short topics of the digest (JSON list of strings), so the next run can skip
     // stories that were already sent.
     "ALTER TABLE runs ADD COLUMN digest_topics TEXT",
+    // 7: how many photos a part has. The files are in the photos folder
+    // (`photos.rs`), downloaded once at `summarized` time.
+    "ALTER TABLE run_chunks ADD COLUMN photos INTEGER NOT NULL DEFAULT 0",
 ];
 
 /// A channel in the database. `id` is the "bare" Telegram channel id (positive,
@@ -160,10 +163,20 @@ impl Run {
 #[derive(Debug, Clone)]
 pub struct Chunk {
     pub idx: i64,
+    /// Text of the part. With photos it is their caption, it may be empty.
     pub html: String,
     pub random_id: i64,
     pub delivered_at: Option<DateTime<Utc>>,
     pub sent_msg_id: Option<i64>,
+    /// How many photos go with the part (files in `photos.rs`), 0 for a text part.
+    pub photos: usize,
+}
+
+/// A part to write into the journal.
+pub struct NewChunk {
+    pub html: String,
+    pub random_id: i64,
+    pub photos: usize,
 }
 
 /// Where the digest went (or will go). Resolved once, when the parts are written.
@@ -573,7 +586,7 @@ impl Db {
         dest_label: &str,
         dest: Destination,
         extra_dests: &[Destination],
-        chunks: &[(String, i64)],
+        chunks: &[NewChunk],
     ) -> Result<()> {
         let tx = self.conn.transaction().await?;
         tx.execute(
@@ -598,10 +611,17 @@ impl Db {
         )
         .await?;
 
-        for (idx, (html, random_id)) in chunks.iter().enumerate() {
+        for (idx, chunk) in chunks.iter().enumerate() {
             tx.execute(
-                "INSERT INTO run_chunks (run_id, idx, html, random_id) VALUES (?1, ?2, ?3, ?4)",
-                params![run_id, idx as i64, html.as_str(), *random_id],
+                "INSERT INTO run_chunks (run_id, idx, html, random_id, photos)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    run_id,
+                    idx as i64,
+                    chunk.html.as_str(),
+                    chunk.random_id,
+                    chunk.photos as i64
+                ],
             )
             .await?;
         }
@@ -670,7 +690,7 @@ impl Db {
         let mut rows = self
             .conn
             .prepare(
-                "SELECT idx, html, random_id, delivered_at, sent_msg_id
+                "SELECT idx, html, random_id, delivered_at, sent_msg_id, photos
                  FROM run_chunks WHERE run_id = ?1 ORDER BY idx",
             )
             .await?
@@ -685,6 +705,7 @@ impl Db {
                 random_id: row.get(2)?,
                 delivered_at: parse_time(row.get::<Option<String>>(3)?)?,
                 sent_msg_id: row.get(4)?,
+                photos: row.get::<i64>(5)? as usize,
             });
         }
         Ok(out)

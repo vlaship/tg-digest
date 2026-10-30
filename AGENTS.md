@@ -21,9 +21,10 @@ use it is in [README.md](README.md).
 | `src/telegram/client.rs` | connection, login, reading posts by cursor |
 | `src/telegram/channels.rs` | finding a channel for `/add`, reading titles and usernames before each run |
 | `src/telegram/publish.rs` | sending parts by `random_id`, delivery journal |
+| `src/telegram/photos.rs` | photos for topics: download by the personal account, files in `/data/photos` until the run is done |
 | `src/telegram/bot.rs` | the bot: login with the token, the chat with the owner, notifications |
 | `src/telegram/commands.rs` | commands to the bot (`/add`, `/rm`, `/run`, `/status`, …), only from the owner |
-| `src/summarize.rs` | HTTP calls to the Anthropic Messages API, map-reduce |
+| `src/summarize.rs` | HTTP calls to the model API (Anthropic or Gemini, `provider`), map-reduce |
 | `src/digest.rs` | JSON schema of the answer, link checks, Telegram-HTML rendering, splitting |
 | `Dockerfile`, `compose.yaml` | image and run; all state is in the `/data` volume |
 
@@ -172,7 +173,7 @@ the existing `anyhow` error context and `tracing` logging patterns.
 ## Commits and pull requests
 
 `main` is protected: no direct pushes, no force pushes. Every change goes through a
-branch and a pull request, and the `check` (cargo) and `build` (docker) jobs must
+branch and a pull request, and the `check` (cargo) job must
 pass before the merge.
 
 Write short commit subjects in the imperative mood. A PR should explain the change,
@@ -181,8 +182,13 @@ changes, add sample output.
 
 CI has two workflows:
 
-- `.github/workflows/cargo.yml` — on every push to any branch: `cargo fmt --check`,
-  `cargo clippy --all-targets -- -D warnings`, `cargo build --release`, all with `--locked`.
-- `.github/workflows/docker.yml` — builds the image. A push to `main` or a `v*` tag
-  publishes one image to `ghcr.io/vlaship/tg-digest`. A PR only builds it. A manual
-  run only builds it, unless you tick "publish".
+- `.github/workflows/cargo.yml` — on every push to a branch except `main`:
+  `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
+  `cargo build --release`, all with `--locked`.
+- `.github/workflows/docker.yml` — a push to `main` or a `v*` tag builds and
+  publishes one image to `ghcr.io/vlaship/tg-digest`. On branches and PRs it runs
+  only by hand (Actions → docker → Run workflow); a manual run only builds, unless
+  you tick "publish".
+
+CI costs money: push only when the owner asks, and test locally first
+(`docker compose up -d --build`).
