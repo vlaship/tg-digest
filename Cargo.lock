@@ -2288,6 +2288,7 @@ dependencies = [
  "chrono-tz",
  "clap",
  "croner",
+ "futures-util",
  "grammers-client",
  "grammers-session",
  "libsql",

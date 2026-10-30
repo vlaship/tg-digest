@@ -83,6 +83,9 @@ pub struct Telegram {
     pub min_post_chars: usize,
     #[serde(default = "default_pause_ms")]
     pub pause_between_channels_ms: u64,
+    /// How many channels are read at the same time.
+    #[serde(default = "default_parallel_channels")]
+    pub parallel_channels: usize,
     /// For how many hours the daemon itself retries an undelivered digest. After this
     /// window the retry is manual only (`/resume`), see docs/PLAN.md 9.3.
     #[serde(default = "default_publish_retry_window_hours")]
@@ -152,6 +155,9 @@ impl Config {
         if self.telegram.lookback_hours <= 0 {
             bail!("telegram.lookback_hours must be greater than zero");
         }
+        if self.telegram.parallel_channels == 0 {
+            bail!("telegram.parallel_channels must be greater than zero");
+        }
         if self.telegram.max_posts_per_channel == 0 {
             bail!("telegram.max_posts_per_channel must be greater than zero");
         }
@@ -185,6 +191,9 @@ fn default_max_posts() -> usize {
 }
 fn default_min_post_chars() -> usize {
     30
+}
+fn default_parallel_channels() -> usize {
+    5
 }
 fn default_pause_ms() -> u64 {
     1500

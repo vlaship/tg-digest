@@ -10,9 +10,12 @@
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use std::collections::{BTreeMap, HashMap};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures_util::StreamExt;
 use grammers_client::client::{Client, SignInError};
 use grammers_client::{tl, InvocationError, SenderPool};
 use grammers_session::storages::SqliteSession;
@@ -198,18 +201,36 @@ pub async fn collect_posts(
         failures: Vec::new(),
     };
 
-    for (index, channel) in channels.iter().enumerate() {
-        if cancel.is_cancelled() {
-            bail!("collection stopped by signal");
-        }
-        if index > 0 {
-            // A pause between channels is the cheapest protection from FLOOD_WAIT.
-            if cancel.sleep(pause).await.is_err() {
-                bail!("collection stopped by signal");
-            }
-        }
+    // Up to `parallel_channels` channels are read at the same time. `buffered` gives the
+    // results back in the original order: the map-reduce split needs the posts of one
+    // channel to come in a row.
+    let parallel = cfg.telegram.parallel_channels.max(1);
+    // Boxed with an explicit `Send`: a stream of borrowing closures does not prove `Send`
+    // for every lifetime, and a run is spawned from the command listener.
+    let jobs: Vec<Job<'_>> = channels
+        .iter()
+        .enumerate()
+        .map(|(index, channel)| -> Job<'_> {
+            Box::pin(async move {
+                // A pause between channels is the cheapest protection from FLOOD_WAIT.
+                // The first `parallel` channels start at once, every next one waits.
+                if index >= parallel && cancel.sleep(pause).await.is_err() {
+                    return (channel, Err(ChannelError::Cancelled));
+                }
+                if cancel.is_cancelled() {
+                    return (channel, Err(ChannelError::Cancelled));
+                }
+                (
+                    channel,
+                    fetch_channel(client, cfg, channel, since, cancel).await,
+                )
+            })
+        })
+        .collect();
+    let mut results = futures_util::stream::iter(jobs).buffered(parallel);
 
-        match fetch_channel(client, cfg, channel, since, cancel).await {
+    while let Some((channel, result)) = results.next().await {
+        match result {
             Ok(batch) => {
                 tracing::info!(
                     channel = %channel.label(),
@@ -243,6 +264,10 @@ pub async fn collect_posts(
 
     Ok(collected)
 }
+
+/// Reading of one channel, ready to run next to the others.
+type Job<'a> =
+    Pin<Box<dyn Future<Output = (&'a Channel, Result<Batch, ChannelError>)> + Send + 'a>>;
 
 enum ChannelError {
     /// The channel drops out of this run; we do not move the cursor, the digest is built

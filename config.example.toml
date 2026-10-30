@@ -64,8 +64,12 @@ max_posts_per_channel = 1000
 # Posts shorter than this are dropped (stickers, "media only", one-word reactions)
 min_post_chars = 30
 
-# Pause between channels, to avoid FLOOD_WAIT
+# Pause before the next channel in each parallel lane, to avoid FLOOD_WAIT
 pause_between_channels_ms = 1500
+
+# How many channels are read at the same time. More is faster, but too many can
+# bring FLOOD_WAIT from Telegram.
+parallel_channels = 5
 
 # For how many hours the daemon itself retries an undelivered digest. This is a
 # retry policy, not a safety limit: Telegram does not document how long it keeps
