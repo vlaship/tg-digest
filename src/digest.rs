@@ -26,6 +26,8 @@ pub struct Post {
     /// Where the repost is from, if it is a repost: without the label the model sees a repost
     /// and the original as two different news items and does not merge them into one item.
     pub origin: Option<String>,
+    /// Ids of the messages with a photo: one for a post, several for an album.
+    pub photos: Vec<i32>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -157,6 +159,28 @@ pub fn drop_foreign_sources(digest: &mut Digest, posts: &[Post]) -> usize {
         });
     }
     dropped
+}
+
+/// Telegram puts at most 10 photos in one album.
+pub const MAX_PHOTOS: usize = 10;
+
+/// Photos for a topic: all photos of ONE source post — the one with the most photos,
+/// the first source on a tie. Photos of different channels are not mixed: often it
+/// is the same picture twice. Returns `(channel_id, message ids)`.
+pub fn pick_photos(topic: &Topic, posts: &[Post]) -> Option<(i64, Vec<i32>)> {
+    let mut best: Option<&Post> = None;
+    for source in &topic.sources {
+        let Some(post) = posts.iter().find(|p| p.url == source.url) else {
+            continue;
+        };
+        if post.photos.len() > best.map_or(0, |b| b.photos.len()) {
+            best = Some(post);
+        }
+    }
+    best.map(|post| {
+        let ids = post.photos.iter().take(MAX_PHOTOS).copied().collect();
+        (post.channel_id, ids)
+    })
 }
 
 /// Input for the model: posts grouped by channel, each with a link —
@@ -370,6 +394,20 @@ pub fn format_partials(parts: &[Digest]) -> String {
 /// Rendering to Telegram-HTML. We build the markup ourselves and do not ask the model: fixing
 /// broken markdown from an LLM costs more than building HTML from the structure.
 pub fn render_html(digest: &Digest, opts: &RenderOptions) -> Vec<String> {
+    render_parts(digest, opts)
+        .into_iter()
+        .map(|part| part.html)
+        .collect()
+}
+
+/// One message of the digest and the topic it belongs to (`None` for the title and
+/// "In short"): photos are added to the messages of a topic.
+pub struct Part {
+    pub html: String,
+    pub topic: Option<usize>,
+}
+
+pub fn render_parts(digest: &Digest, opts: &RenderOptions) -> Vec<Part> {
     if digest.is_empty() {
         return Vec::new();
     }
@@ -395,9 +433,12 @@ pub fn render_html(digest: &Digest, opts: &RenderOptions) -> Vec<String> {
         }
         blocks.push(tldr);
     }
-    let mut messages = pack(blocks);
+    let mut messages: Vec<Part> = pack(blocks)
+        .into_iter()
+        .map(|html| Part { html, topic: None })
+        .collect();
 
-    for topic in &digest.topics {
+    for (index, topic) in digest.topics.iter().enumerate() {
         let mut block = format!(
             "<b>{}</b>\n{}",
             escape(&topic.title),
@@ -411,7 +452,10 @@ pub fn render_html(digest: &Digest, opts: &RenderOptions) -> Vec<String> {
                 .collect();
             block.push_str(&format!("\n{}", links.join(" · ")));
         }
-        messages.extend(pack(vec![block]));
+        messages.extend(pack(vec![block]).into_iter().map(|html| Part {
+            html,
+            topic: Some(index),
+        }));
     }
 
     messages

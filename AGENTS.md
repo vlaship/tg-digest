@@ -21,6 +21,7 @@ use it is in [README.md](README.md).
 | `src/telegram/client.rs` | connection, login, reading posts by cursor |
 | `src/telegram/channels.rs` | finding a channel for `/add`, reading titles and usernames before each run |
 | `src/telegram/publish.rs` | sending parts by `random_id`, delivery journal |
+| `src/telegram/photos.rs` | photos for topics: download by the personal account, files in `/data/photos` until the run is done |
 | `src/telegram/bot.rs` | the bot: login with the token, the chat with the owner, notifications |
 | `src/telegram/commands.rs` | commands to the bot (`/add`, `/rm`, `/run`, `/status`, …), only from the owner |
 | `src/summarize.rs` | HTTP calls to the model API (Anthropic or Gemini, `provider`), map-reduce |

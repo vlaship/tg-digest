@@ -13,11 +13,11 @@ use tokio::sync::{Mutex, MutexGuard};
 
 use crate::cancel::Cancel;
 use crate::config::{Config, Prompts};
-use crate::db::{self, Db, Run};
+use crate::db::{self, Db, NewChunk, Run};
 use crate::digest::{self, RenderOptions};
 use crate::summarize::Summarizer;
 use crate::telegram::bot::Bot;
-use crate::telegram::{channels, client as tg, publish};
+use crate::telegram::{channels, client as tg, photos, publish};
 
 pub const TRIGGER_CRON: &str = "cron";
 pub const TRIGGER_CATCH_UP: &str = "catch_up";
@@ -181,6 +181,7 @@ impl Runner {
             ));
         }
         self.db.abandon_run(run_id).await?;
+        photos::remove(&self.photos_dir(), run_id);
         Ok(Outcome::Abandoned(run_id))
     }
 
@@ -228,9 +229,13 @@ impl Runner {
         let window =
             (!resume).then(|| ChronoDuration::hours(self.cfg.telegram.publish_retry_window_hours));
         let bot = self.bot()?;
-        match publish::deliver_pending(&bot.client, &self.db, run, &self.cancel, window).await? {
+        let dir = self.photos_dir();
+        match publish::deliver_pending(&bot.client, &self.db, run, &dir, &self.cancel, window)
+            .await?
+        {
             None => {
                 self.db.complete_run(run.id, db::STATUS_OK).await?;
+                photos::remove(&dir, run.id);
                 self.mark_read(&run.cursors).await;
                 Ok(Outcome::Delivered(run.id))
             }
@@ -319,7 +324,7 @@ impl Runner {
         let mut digest = summary.digest;
         digest::drop_foreign_sources(&mut digest, &collected.posts);
 
-        let chunks = digest::render_html(
+        let chunks = digest::render_parts(
             &digest,
             &RenderOptions {
                 digest_title: &self.cfg.prompts.digest_title,
@@ -370,10 +375,9 @@ impl Runner {
         let dest = recipients.remove(0);
         let extra_dests = recipients;
 
-        let journal: Vec<(String, i64)> = chunks
-            .iter()
-            .map(|html| (html.clone(), rand::random()))
-            .collect();
+        let journal = self
+            .with_photos(run_id, &digest, chunks, &collected.posts)
+            .await;
 
         self.db
             .save_summary(
@@ -409,6 +413,78 @@ impl Runner {
                 topics: digest.topics.len(),
             }),
             other => Ok(other),
+        }
+    }
+
+    fn photos_dir(&self) -> std::path::PathBuf {
+        photos::dir(&self.cfg.db_file)
+    }
+
+    /// The journal parts with the photos of each topic. If the topic is one message and
+    /// its text fits in a photo caption, it goes as one message with the photos.
+    /// Otherwise the photos go first, then the text. A photo that could not be
+    /// downloaded is only logged: the digest is sent without it.
+    async fn with_photos(
+        &self,
+        run_id: i64,
+        digest: &digest::Digest,
+        parts: Vec<digest::Part>,
+        posts: &[digest::Post],
+    ) -> Vec<NewChunk> {
+        let dir = self.photos_dir();
+        let mut journal = Vec::with_capacity(parts.len());
+        let mut done = std::collections::HashSet::new();
+
+        for (i, part) in parts.iter().enumerate() {
+            let text = NewChunk {
+                html: part.html.clone(),
+                random_id: rand::random(),
+                photos: 0,
+            };
+            let Some(topic) = part.topic.filter(|t| done.insert(*t)) else {
+                journal.push(text);
+                continue;
+            };
+
+            let files = self.topic_photos(&digest.topics[topic], posts).await;
+            if files.is_empty() {
+                journal.push(text);
+                continue;
+            }
+            if let Err(e) = photos::save(&dir, run_id, journal.len(), &files) {
+                tracing::warn!(error = %format!("{e:#}"), "could not save the photos");
+                journal.push(text);
+                continue;
+            }
+
+            let one_message = parts.get(i + 1).map(|next| next.topic) != Some(Some(topic));
+            if one_message && publish::fits_caption(&part.html) {
+                journal.push(NewChunk {
+                    photos: files.len(),
+                    ..text
+                });
+            } else {
+                journal.push(NewChunk {
+                    html: String::new(),
+                    random_id: rand::random(),
+                    photos: files.len(),
+                });
+                journal.push(text);
+            }
+        }
+        journal
+    }
+
+    async fn topic_photos(&self, topic: &digest::Topic, posts: &[digest::Post]) -> Vec<Vec<u8>> {
+        let Some((channel_id, ids)) = digest::pick_photos(topic, posts) else {
+            return Vec::new();
+        };
+        match photos::download(&self.client, &self.db, channel_id, &ids).await {
+            Ok(files) => files,
+            Err(e) => {
+                tracing::warn!(error = %format!("{e:#}"), topic = %topic.title, "photos not added");
+                Vec::new()
+            }
         }
     }
 

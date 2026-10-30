@@ -455,6 +455,8 @@ async fn last(runner: &Arc<Runner>) -> Result<String> {
         .await?
         .into_iter()
         .map(|c| c.html)
+        // Photo-only parts: their files are deleted after delivery, /last sends the text.
+        .filter(|html| !html.is_empty())
         .collect();
     if chunks.is_empty() {
         return Ok(format!("run #{} has no saved parts", run.id));
