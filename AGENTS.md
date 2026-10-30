@@ -170,8 +170,7 @@ changes, add sample output.
 
 CI has two workflows:
 
-- `.github/workflows/cargo.yml` — on every commit to any branch (and on PRs from
-  forks): `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
+- `.github/workflows/cargo.yml` — on every push to any branch: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
   `cargo test`, `cargo build --release`, all with `--locked`.
 - `.github/workflows/docker.yml` — builds the image. A push to `main` or a `v*` tag
   publishes one image to `ghcr.io/vlaship/tg-digest`. A PR only builds it. A manual
