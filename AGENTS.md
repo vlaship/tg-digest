@@ -160,14 +160,17 @@ state. There is no coverage target.
 
 ## Commits and pull requests
 
+`main` is protected: no direct pushes, no force pushes. Every change goes through a
+branch and a pull request, and the `check` (cargo) and `build` (docker) jobs must
+pass before the merge.
+
 Write short commit subjects in the imperative mood. A PR should explain the change,
 related issues, the effect on the config, and how you checked it. For rendering
 changes, add sample output.
 
 CI has two workflows:
 
-- `.github/workflows/cargo.yml` — on every commit to any branch (and on PRs from
-  forks): `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
+- `.github/workflows/cargo.yml` — on every push to any branch: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
   `cargo test`, `cargo build --release`, all with `--locked`.
 - `.github/workflows/docker.yml` — builds the image. A push to `main` or a `v*` tag
   publishes one image to `ghcr.io/vlaship/tg-digest`. A PR only builds it. A manual
