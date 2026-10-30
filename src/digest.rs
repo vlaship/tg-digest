@@ -345,6 +345,8 @@ pub fn render_html(digest: &Digest, opts: &RenderOptions) -> Vec<String> {
         return Vec::new();
     }
 
+    // The first message is the title with "In short", then every topic is its own
+    // message. `pack` still cuts a block that alone is longer than the limit.
     let mut blocks: Vec<String> = Vec::new();
 
     let date = opts
@@ -364,6 +366,7 @@ pub fn render_html(digest: &Digest, opts: &RenderOptions) -> Vec<String> {
         }
         blocks.push(tldr);
     }
+    let mut messages = pack(blocks);
 
     for topic in &digest.topics {
         let mut block = format!(
@@ -379,10 +382,10 @@ pub fn render_html(digest: &Digest, opts: &RenderOptions) -> Vec<String> {
                 .collect();
             block.push_str(&format!("\n{}", links.join(" · ")));
         }
-        blocks.push(block);
+        messages.extend(pack(vec![block]));
     }
 
-    pack(blocks)
+    messages
 }
 
 /// We put blocks into messages by the limit, without cutting a topic in half.
