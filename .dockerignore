@@ -3,7 +3,6 @@ out/
 data/
 .git/
 config.toml
-.env
 tg.session*
 *.db
 docs/

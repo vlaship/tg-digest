@@ -17,22 +17,23 @@ and posts the digest back to Telegram on a schedule.
 
 ## Run in Docker (the normal way)
 
-Two things live outside the image:
+Everything lives outside the image, in the host folder **`data/`**, which compose
+mounts as `/data`:
 
-- **`.env`** next to `compose.yaml` — the secrets (`TG_API_ID`, `TG_API_HASH`,
-  `TG_PHONE`, `ANTHROPIC_API_KEY`). Compose passes them to the container.
-- **`data/`** — a host folder mounted as `/data`: `config.toml` (schedule, prompts,
-  limits), `tg.session` and the database `digest.db`. It survives image updates
-  and `docker compose down`. Back it up, and keep it private: `tg.session` gives
-  full access to your Telegram account.
+- `config.toml` — all settings, including the secrets (API id and hash, phone,
+  Anthropic key);
+- `tg.session` — the Telegram login, created by `login`;
+- `digest.db` — the database.
 
-Both are in `.gitignore`.
+It survives image updates and `docker compose down`. `data/` is in `.gitignore`
+and `.dockerignore`. Back it up, and keep it private: it has your keys, and
+`tg.session` gives full access to your Telegram account.
 
 ```powershell
-# Do not overwrite existing files: they already have your secrets and state.
-if (-not (Test-Path .env)) { Copy-Item .env.example .env }   # then fill in .env
 New-Item -ItemType Directory -Force data | Out-Null
+# Do not overwrite an existing config: it already has your secrets.
 if (-not (Test-Path data\config.toml)) { Copy-Item config.example.toml data\config.toml }
+# Now fill in data\config.toml (see "Settings" below).
 
 docker compose build                          # build the image first, or login runs in the old one
 docker compose run --rm -it tg-digest login   # one-time login: the code, and the password if you use 2FA
@@ -116,10 +117,7 @@ Fill in `config.toml`:
 3. `anthropic.api_key`;
 4. `telegram.folder` — the name of the Telegram folder with the channel list.
 
-With Docker, put items 1–3 into `.env` instead (see `.env.example`): `TG_API_ID`,
-`TG_API_HASH`, `TG_PHONE` and `ANTHROPIC_API_KEY` override the values from the TOML,
-so `config.toml` can keep its empty placeholders. An empty value in `.env` keeps
-the one from `config.toml`.
+With Docker this file is `data/config.toml`.
 
 ### Channels
 
