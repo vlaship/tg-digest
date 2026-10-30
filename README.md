@@ -34,6 +34,17 @@ docker compose logs -f
 `catch_up = true` in the config runs a slot that was missed while the service
 was down.
 
+### Ready image
+
+CI publishes the image to GitHub Container Registry:
+
+- `ghcr.io/vlaship/tg-digest:latest` — the last build of `main`;
+- `ghcr.io/vlaship/tg-digest:sha-<commit>` — one exact commit;
+- `ghcr.io/vlaship/tg-digest:1.2.3` and `:1.2` — from a `v1.2.3` git tag.
+
+To use it instead of a local build, change `image:` in `compose.yaml` to one of
+these tags and run `docker compose pull` instead of `docker compose build`.
+
 Stopping (`docker stop`) is safe. Collecting posts and the model request stop at
 once. The current part of the digest is sent to the end. Anything not delivered
 is sent after the next start.
