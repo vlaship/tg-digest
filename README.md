@@ -10,7 +10,8 @@ and posts the digest back to Telegram on a schedule.
   of sources.
 - **Bot.** You talk to your own Telegram bot: you write commands to it, and it
   sends you the replies, the digests and the notifications. It can also post the
-  digest to your channel. Only your account may give it commands.
+  digest to your channel. Only your account and the users in `bot.allowed_users`
+  may give it commands.
 - **Schedule.** A cron expression in the config. You do not need a separate OS
   scheduler.
 - **Channel list.** Stored in the database. You add and remove channels with
@@ -162,7 +163,9 @@ digest.
 `tg.session` gives full access to your Telegram account, and the bot token gives
 full control of the bot. They, `bot.session`, the database and `config.toml` with
 the keys are in `.gitignore` (the `data/` folder). Do not commit them and do not
-copy them anywhere. The bot answers only your account and ignores everyone else.
+copy them anywhere. The bot answers only your account and the user ids in
+`bot.allowed_users`, and ignores everyone else. To stop strangers adding the bot
+to groups, send @BotFather `/setjoingroups` → Disable.
 
 ## Cost
 

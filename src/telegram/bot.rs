@@ -27,6 +27,8 @@ pub struct Bot {
     /// The owner is the personal account from `[telegram]`. Only this user may give
     /// commands, and the bot writes only to this user (or to a channel).
     pub owner: PeerId,
+    /// Who may give commands: the owner and `bot.allowed_users`.
+    allowed: Vec<PeerId>,
 }
 
 /// Connect the bot and log in with the token. A bot needs no code and no password,
@@ -55,10 +57,19 @@ pub async fn connect(cfg: &Config, owner: PeerId) -> Result<(Bot, UnboundedRecei
         tracing::info!(bot = ?me.username(), "bot logged in");
     }
 
+    let mut allowed = vec![owner];
+    for &id in &cfg.bot.allowed_users {
+        match PeerId::user(id) {
+            Some(peer) => allowed.push(peer),
+            None => bail!("bot.allowed_users: {id} is not a Telegram user id"),
+        }
+    }
+
     let bot = Bot {
         client: session.client,
         session: session.session,
         owner,
+        allowed,
     };
     Ok((bot, session.updates))
 }
@@ -81,6 +92,11 @@ impl Bot {
             id: self.owner,
             auth,
         })
+    }
+
+    /// Whether this user may give commands.
+    pub fn is_allowed(&self, user: PeerId) -> bool {
+        self.allowed.contains(&user)
     }
 
     /// A short notification to the owner.

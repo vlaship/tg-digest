@@ -1,7 +1,7 @@
 //! Controlling the service with commands to the bot.
 //!
-//! The bot listens to updates and reacts **only** to messages from the owner (the
-//! personal account from `[telegram]`) in the private chat with the bot. Anybody can
+//! The bot listens to updates and reacts **only** to allowed users: the owner (the
+//! personal account from `[telegram]`) and `bot.allowed_users`. Anybody can
 //! write to a bot, so everybody else is ignored.
 //!
 //! Channels are named by `@username` or by numeric `id`: private channels have
@@ -43,7 +43,6 @@ pub async fn listen(
     cancel: Cancel,
 ) -> Result<()> {
     let bot = runner.bot()?;
-    let owner = bot.owner;
 
     let mut stream = bot
         .client
@@ -94,14 +93,17 @@ pub async fn listen(
             tracing::debug!("update skipped: not a new message");
             continue;
         };
-        // Only what the owner writes to the bot in the private chat. The bot's own
-        // replies are outgoing, so they never come back as commands.
-        if message.outgoing() || message.peer_id() != owner {
-            tracing::debug!(
-                peer = ?message.peer_id(),
-                owner = ?owner,
-                outgoing = message.outgoing(),
-                "message skipped: not from the owner"
+        // The bot's own replies are outgoing, so they never come back as commands.
+        if message.outgoing() {
+            continue;
+        }
+        // In a private chat with the bot the peer is the user who wrote.
+        let user = message.peer_id();
+        if !bot.is_allowed(user) {
+            // Info, not debug: the owner finds the id here to add it to allowed_users.
+            tracing::info!(
+                user = ?user.bare_id(),
+                "message ignored: user is not in bot.allowed_users"
             );
             continue;
         }
@@ -110,7 +112,7 @@ pub async fn listen(
             continue;
         }
 
-        tracing::info!(command = %text, "command from the owner");
+        tracing::info!(command = %text, "command from an allowed user");
         let runner = runner.clone();
         let cancel = cancel.clone();
         commands.spawn(async move {
