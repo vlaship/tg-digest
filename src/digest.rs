@@ -41,6 +41,35 @@ impl Digest {
     pub fn is_empty(&self) -> bool {
         self.topics.is_empty()
     }
+
+    /// Why the answer looks broken, if it does. Sometimes the model writes the short
+    /// summary in full, but then only a few topics and a stub like "placeholder". Such
+    /// a digest must not be posted: the cursors would move, and the news would be lost.
+    pub fn defect(&self) -> Option<String> {
+        if self.topics.len() < self.tldr.len() {
+            return Some(format!(
+                "{} items in the short summary, but only {} topics",
+                self.tldr.len(),
+                self.topics.len()
+            ));
+        }
+        for topic in &self.topics {
+            let title = topic.title.trim();
+            let summary = topic.summary.trim();
+            if title.is_empty() || summary.is_empty() || is_stub(title) || is_stub(summary) {
+                return Some(format!("a topic is a stub: title {title:?}"));
+            }
+        }
+        None
+    }
+}
+
+fn is_stub(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    ["placeholder", "todo", "tbd", "lorem ipsum", "..."]
+        .iter()
+        .any(|stub| lower == *stub)
+        || lower.contains("placeholder")
 }
 
 #[derive(Debug, Deserialize)]

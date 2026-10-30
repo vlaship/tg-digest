@@ -15,6 +15,8 @@ use crate::digest::{self, Digest, Post};
 
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 const MAX_ATTEMPTS: u32 = 4;
+/// How many times we ask the model when its answer is broken (`Digest::defect`).
+const MAX_BROKEN_ANSWERS: u32 = 2;
 
 /// Above this size we switch to map-reduce: we condense the input in parts, then
 /// reduce the summaries into one digest. The model context is 1M tokens, so the limit
@@ -306,12 +308,24 @@ impl Summarizer {
             "messages": [{ "role": "user", "content": user }]
         });
 
-        let response = tokio::select! {
-            _ = cancel.cancelled() => bail!("model request stopped by the shutdown signal"),
-            result = self.post_with_retries(&body) => result?,
-        };
-
-        parse_summary(response)
+        // A broken answer (see `Digest::defect`) is asked again once. If the second
+        // one is broken too, the run fails and the cursors do not move.
+        let mut attempt = 1;
+        loop {
+            let response = tokio::select! {
+                _ = cancel.cancelled() => bail!("model request stopped by the shutdown signal"),
+                result = self.post_with_retries(&body) => result?,
+            };
+            let summary = parse_summary(response)?;
+            let Some(defect) = summary.digest.defect() else {
+                return Ok(summary);
+            };
+            if attempt >= MAX_BROKEN_ANSWERS {
+                bail!("the model answer is broken again ({defect}), nothing is posted");
+            }
+            tracing::warn!(%defect, attempt, "the model answer is broken, asking again");
+            attempt += 1;
+        }
     }
 
     /// We retry only what makes sense to retry: 429 (by `retry-after`),
