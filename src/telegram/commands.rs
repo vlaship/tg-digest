@@ -318,7 +318,25 @@ async fn add(runner: &Arc<Runner>, arg: &str) -> Result<String> {
         return Ok("a channel is needed: /add @name, /add https://t.me/+invite or /add id".into());
     }
 
+    // Already in the list: say so and touch nothing, its cursor stays. For a username
+    // or an id the database answers without a request to Telegram.
+    let invite = arg.contains("t.me/+") || arg.contains("joinchat");
+    if !invite {
+        if let Some(channel) = runner.db.find_channel(username_from(arg)).await? {
+            if channel.enabled {
+                return Ok(already_added(&channel));
+            }
+        }
+    }
+
     let peer = resolve_new_channel(runner, arg).await?;
+    // An invite link is resolved only now, so check again by id.
+    if let Some(channel) = runner.db.channel(peer.id).await? {
+        if channel.enabled {
+            return Ok(already_added(&channel));
+        }
+    }
+
     let (username, title) = channels::describe(&runner.client, peer).await?;
     runner
         .db
@@ -326,6 +344,13 @@ async fn add(runner: &Arc<Runner>, arg: &str) -> Result<String> {
         .await?;
 
     Ok(format!("added: {title}, id {}", peer.id))
+}
+
+fn already_added(channel: &Channel) -> String {
+    format!(
+        "already in the list: {}, id {}. /list shows all channels",
+        channel.title, channel.id
+    )
 }
 
 async fn remove(runner: &Arc<Runner>, arg: &str) -> Result<String> {
