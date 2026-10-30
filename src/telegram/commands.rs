@@ -19,6 +19,7 @@ use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::task::JoinSet;
 
 use crate::cancel::Cancel;
+use crate::config::PROVIDERS;
 use crate::db::Channel;
 use crate::run::{Runner, TRIGGER_MANUAL};
 use crate::telegram::client::is_auth_error;
@@ -33,7 +34,7 @@ Commands:
 /skip — move all channels to their newest message: older posts are skipped
 /run — run now (or deliver an undelivered digest)
 /status — last run: status, posts, tokens
-/provider [name] — show or switch the model provider (owner)
+/provider [name] — list the model providers, or switch (owner)
 /fallback — switch to the fallback provider and run now (owner)
 /last — send the last digest again
 /resume N — deliver an old run (a duplicate is possible)
@@ -232,11 +233,23 @@ where
 async fn provider(runner: &Arc<Runner>, user: PeerId, arg: &str) -> Result<String> {
     let current = runner.provider().await;
     if arg.is_empty() {
-        let fallback = runner.cfg.fallback_provider.as_deref().unwrap_or("not set");
-        return Ok(format!(
-            "model provider: {current}\nfallback: {fallback}\n\
-             /provider anthropic | gemini — switch"
-        ));
+        let cfg = &runner.cfg;
+        let mut out = String::from("Model providers:");
+        for name in PROVIDERS {
+            let mark = if name == current { "✅" } else { "•" };
+            out.push_str(&format!("\n{mark} {name} — {}", cfg.model_of(name)));
+            if name == current {
+                out.push_str(" (now)");
+            }
+            if cfg.fallback_provider.as_deref() == Some(name) {
+                out.push_str(" (fallback)");
+            }
+            if cfg.check_provider(name).is_err() {
+                out.push_str(" — no key in the config");
+            }
+        }
+        out.push_str("\n\n/provider name — switch (only the owner)");
+        return Ok(out);
     }
     if runner.bot()?.owner != user {
         return Ok("only the owner can switch the provider".into());

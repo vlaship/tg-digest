@@ -194,6 +194,14 @@ impl Config {
         Ok(cfg)
     }
 
+    /// The model id of a provider from `PROVIDERS`.
+    pub fn model_of(&self, provider: &str) -> &str {
+        match provider {
+            "gemini" => &self.gemini.model,
+            _ => &self.anthropic.model,
+        }
+    }
+
     /// The provider name is known and its key is set.
     pub fn check_provider(&self, name: &str) -> Result<()> {
         match name {
@@ -273,6 +281,9 @@ fn default_pause_ms() -> u64 {
 fn default_publish_retry_window_hours() -> i64 {
     2
 }
+/// All model providers the service knows.
+pub const PROVIDERS: [&str; 2] = ["anthropic", "gemini"];
+
 fn default_provider() -> String {
     "anthropic".into()
 }
