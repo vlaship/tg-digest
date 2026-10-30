@@ -7,7 +7,7 @@
 # config.toml is in .gitignore — it never goes into the repository.
 # All settings come only from this file, the secrets too.
 #
-# Channels are not set here: add them with /add in Saved Messages. The list is
+# Channels are not set here: add them with /add in the chat with the bot. The list is
 # stored in the database.
 
 # Database: channels, cursors, journal of runs and digest parts.
@@ -44,8 +44,9 @@ phone    = "+1-000-00-00"
 # WARNING: it gives full access to the account — do not commit it or copy it anywhere.
 session_file = "/data/tg.session"
 
-# Where to post the digest: "me" = Saved Messages, or "@my_channel"
-destination = "me"
+# Where the bot posts the digest: "bot" = the chat with the bot (you see it there),
+# or "@my_channel" — then the bot must be an admin of that channel.
+destination = "bot"
 
 # Time window for a new channel (one with no cursor yet) and for a channel after
 # /reset. For other channels the limit is the cursor: a channel that failed for
@@ -68,6 +69,20 @@ pause_between_channels_ms = 1500
 # retry policy, not a safety limit: Telegram does not document how long it keeps
 # random_id for deduplication. After this window the owner retries with /resume.
 publish_retry_window_hours = 2
+
+# ---------------------------------------------------------------------- bot --
+# The bot you talk to: you write commands to it, and it writes back the replies,
+# the digests and the notifications. The personal account above still reads the
+# channels (a bot cannot read channels where it is not an admin).
+#
+# Create a bot with @BotFather (/newbot) and paste its token here. Then open the
+# bot in Telegram and send it /start once: a bot can write to you only after that.
+# Only the account from [telegram] may give the bot commands.
+[bot]
+token = ""
+
+# Bot session (SQLite), created on the first start. No login is needed for a bot.
+session_file = "/data/bot.session"
 
 # ---------------------------------------------------------------- anthropic --
 [anthropic]

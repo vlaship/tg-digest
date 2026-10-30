@@ -32,19 +32,26 @@ const MAX_ATTEMPTS: u32 = 4;
 /// its cursor does not move, the digest is built from the other channels.
 const MAX_FLOOD_WAIT: Duration = Duration::from_secs(600);
 
-/// The client together with the updates receiver: the listener for Saved Messages
-/// commands takes it from here, because the pool has exactly one receiver.
+/// A connected client together with its session and updates receiver. The pool has
+/// exactly one receiver, so whoever listens for updates takes it from here.
 pub struct Session {
     pub client: Client,
+    pub session: Arc<SqliteSession>,
     pub updates: UnboundedReceiver<UpdatesLike>,
 }
 
-/// Connect to Telegram and start the background task of the network pool.
+/// Connect the personal account: it reads the channels.
 pub async fn connect(cfg: &Config) -> Result<Session> {
+    open(&cfg.telegram.session_file, cfg.telegram.api_id).await
+}
+
+/// Open a session file, connect to Telegram and start the background task of the
+/// network pool. Used for the personal account and for the bot.
+pub async fn open(session_file: &str, api_id: i32) -> Result<Session> {
     let session = Arc::new(
-        SqliteSession::open(&cfg.telegram.session_file)
+        SqliteSession::open(session_file)
             .await
-            .with_context(|| format!("could not open the session {}", cfg.telegram.session_file))?,
+            .with_context(|| format!("could not open the session {session_file}"))?,
     );
 
     // Without the own user in the session cache, grammers does not ask for the update
@@ -55,9 +62,9 @@ pub async fn connect(cfg: &Config) -> Result<Session> {
         .ok()
         .flatten()
         .is_some();
-    tracing::debug!(self_known, "session opened");
+    tracing::debug!(session_file, self_known, "session opened");
 
-    let pool = SenderPool::new(session, cfg.telegram.api_id);
+    let pool = SenderPool::new(session.clone(), api_id);
     let SenderPool {
         runner,
         handle,
@@ -69,6 +76,7 @@ pub async fn connect(cfg: &Config) -> Result<Session> {
 
     Ok(Session {
         client: Client::new(handle),
+        session,
         updates,
     })
 }
@@ -494,237 +502,4 @@ fn prompt(label: &str) -> Result<String> {
     let mut buf = String::new();
     stdin().read_line(&mut buf)?;
     Ok(buf)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn at(minutes: i64) -> DateTime<Utc> {
-        DateTime::parse_from_rfc3339("2026-09-15T00:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc)
-            + ChronoDuration::minutes(minutes)
-    }
-
-    fn message(id: i32, group: Option<i64>, text: &str) -> RawMessage {
-        RawMessage {
-            id,
-            date: at(id as i64),
-            grouped_id: group,
-            text: text.into(),
-            forward: None,
-        }
-    }
-
-    fn forwarded(id: i32, group: Option<i64>, text: &str, from: Forward) -> RawMessage {
-        RawMessage {
-            forward: Some(from),
-            ..message(id, group, text)
-        }
-    }
-
-    fn channel(id: i64, username: Option<&str>, title: &str) -> Channel {
-        Channel {
-            id,
-            access_hash: 1,
-            username: username.map(str::to_string),
-            title: title.into(),
-            enabled: true,
-            last_msg_id: 0,
-            last_error: None,
-        }
-    }
-
-    #[test]
-    fn album_parts_become_one_post_linked_to_the_first() {
-        let raw = vec![
-            message(12, Some(7), ""),
-            message(11, Some(7), "caption under the album, long enough"),
-            message(10, Some(7), ""),
-        ];
-        let batch = assemble(&raw, 10);
-        assert_eq!(batch.posts.len(), 1);
-        assert_eq!(batch.posts[0].msg_id, 10);
-        assert_eq!(batch.max_id_seen, 12);
-    }
-
-    #[test]
-    fn cursor_counts_filtered_out_messages_too() {
-        // An album without a caption and a sticker are filtered out, but the cursor must
-        // move past them: otherwise the next run reads the album again and shows it twice.
-        let raw = vec![
-            message(30, Some(1), ""),
-            message(29, Some(1), ""),
-            message(28, None, "ok"),
-            message(27, None, "a post long enough to pass the filter"),
-        ];
-        let batch = assemble(&raw, 10);
-        assert_eq!(batch.posts.len(), 1);
-        assert_eq!(batch.posts[0].msg_id, 27);
-        assert_eq!(batch.max_id_seen, 30);
-    }
-
-    #[test]
-    fn posts_come_out_oldest_first() {
-        let raw = vec![
-            message(3, None, "third post, long enough to pass"),
-            message(1, None, "first post, long enough to pass"),
-            message(2, None, "second post, long enough to pass"),
-        ];
-        let batch = assemble(&raw, 10);
-        let ids: Vec<i32> = batch.posts.iter().map(|p| p.msg_id).collect();
-        assert_eq!(ids, vec![1, 2, 3]);
-    }
-
-    #[test]
-    fn empty_channel_leaves_the_cursor_alone() {
-        let batch = assemble(&[], 10);
-        assert_eq!(batch.max_id_seen, 0);
-        assert!(batch.posts.is_empty());
-    }
-
-    #[test]
-    fn border_is_the_cursor_when_there_is_one() {
-        let since = at(100);
-        // Old by date, but above the cursor — we take it: the channel could fail for three days.
-        assert!(!reached_border(50, at(0), 40, since));
-        assert!(reached_border(40, at(200), 40, since));
-    }
-
-    #[test]
-    fn border_is_the_date_window_for_a_fresh_channel() {
-        let since = at(100);
-        assert!(!reached_border(50, at(120), 0, since));
-        assert!(reached_border(50, at(90), 0, since));
-    }
-
-    #[test]
-    fn hidden_link_is_appended_once() {
-        let entities = vec![
-            tl::enums::MessageEntity::TextUrl(tl::types::MessageEntityTextUrl {
-                offset: 0,
-                length: 4,
-                url: "https://example.com/a".into(),
-            }),
-            tl::enums::MessageEntity::Bold(tl::types::MessageEntityBold {
-                offset: 0,
-                length: 4,
-            }),
-        ];
-        let out = with_hidden_links("here", Some(&entities));
-        assert!(out.contains("https://example.com/a"));
-
-        // An address that is already visible in the text is not added a second time.
-        let out = with_hidden_links("see https://example.com/a", Some(&entities));
-        assert_eq!(out, "see https://example.com/a");
-    }
-
-    #[test]
-    fn repost_keeps_the_source_channel() {
-        let raw = vec![forwarded(
-            5,
-            None,
-            "news retold long enough to pass",
-            Forward {
-                name: None,
-                channel_id: Some(777),
-                post_id: Some(42),
-            },
-        )];
-        let batch = assemble(&raw, 10);
-        assert_eq!(
-            batch.posts[0].forward.as_ref().unwrap().channel_id,
-            Some(777)
-        );
-    }
-
-    #[test]
-    fn album_takes_the_source_from_whichever_part_has_it() {
-        let from = Forward {
-            name: Some("Original source".into()),
-            channel_id: None,
-            post_id: None,
-        };
-        let raw = vec![
-            message(12, Some(7), ""),
-            forwarded(11, Some(7), "caption under the album, long enough", from),
-            message(10, Some(7), ""),
-        ];
-        let batch = assemble(&raw, 10);
-        assert_eq!(batch.posts.len(), 1);
-        assert_eq!(
-            batch.posts[0].forward.as_ref().unwrap().name.as_deref(),
-            Some("Original source")
-        );
-    }
-
-    #[test]
-    fn a_repost_from_a_tracked_channel_points_at_the_original_post() {
-        let channels = vec![channel(777, Some("source"), "Original source")];
-        let origin = describe_origin(
-            &Forward {
-                name: None,
-                channel_id: Some(777),
-                post_id: Some(42),
-            },
-            &channels,
-        );
-        assert_eq!(origin, "Original source (https://t.me/source/42)");
-    }
-
-    #[test]
-    fn a_repost_from_an_unknown_channel_falls_back_to_whatever_telegram_gave() {
-        let channels = vec![channel(1, None, "Our channel")];
-
-        assert_eq!(
-            describe_origin(
-                &Forward {
-                    name: Some("Other channel".into()),
-                    channel_id: Some(999),
-                    post_id: Some(1),
-                },
-                &channels
-            ),
-            "Other channel"
-        );
-        assert_eq!(
-            describe_origin(
-                &Forward {
-                    name: None,
-                    channel_id: Some(999),
-                    post_id: None,
-                },
-                &channels
-            ),
-            "channel id 999"
-        );
-        assert_eq!(
-            describe_origin(&Forward::default(), &channels),
-            "hidden source"
-        );
-    }
-
-    #[test]
-    fn a_message_without_a_forward_header_has_no_origin() {
-        assert_eq!(forward_origin(None), None);
-
-        // A fully hidden forward: no name, no id — nothing to mark it with.
-        let empty = tl::enums::MessageFwdHeader::Header(tl::types::MessageFwdHeader {
-            imported: false,
-            saved_out: false,
-            from_id: None,
-            from_name: None,
-            date: 0,
-            channel_post: None,
-            post_author: None,
-            saved_from_peer: None,
-            saved_from_msg_id: None,
-            saved_from_id: None,
-            saved_from_name: None,
-            saved_date: None,
-            psa_type: None,
-        });
-        assert_eq!(forward_origin(Some(&empty)), None);
-    }
 }
