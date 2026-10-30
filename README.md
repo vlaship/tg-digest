@@ -145,17 +145,22 @@ every run, so a renamed channel keeps correct links.
 
 | Command | What it does |
 |---|---|
-| `/add @channel`, `/add t.me/name`, `/add t.me/+link`, `/add id` | add the channel to the list |
+| `/add @channel`, `/add t.me/name`, `/add t.me/+link`, `/add id` | add the channel; only posts after adding go into the digest |
 | `/rm @channel` · `/rm id` | turn the channel off |
 | `/list` | channels: id, username, on/off, cursor, last error |
 | `/reset id` | read the channel again from the `lookback_hours` window |
+| `/skip` | move all channels to their newest message: older posts are skipped |
 | `/run` | run now (or deliver an undelivered digest) |
 | `/status` | last run: status, posts, topics, tokens, parts |
 | `/last` | send the last digest again |
 | `/resume N` · `/abandon N` | deliver or cancel an undelivered run |
+| `/stop` · `/start` | stop or start getting digests for yourself, the owner too (commands still work) |
 | `/help` | list of commands |
 
-Notifications also come there: a failed run, an excluded channel, an undelivered
+Each digest goes to you and to every user in `bot.allowed_users` who has started
+the bot, except those who sent `/stop` (you can send it too).
+A story from the last digest is not sent again, unless there is real news about it.
+Notifications come only to you: a failed run, an excluded channel, an undelivered
 digest.
 
 ## Security

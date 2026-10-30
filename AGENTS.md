@@ -77,7 +77,11 @@ bot cannot do that — it reads only channels where it is an admin. The bot
 (`[bot]`, `bot.session`, logs in with the token on start) only talks: it takes
 commands, replies, and sends digests and notifications. The bot accepts commands
 only from the owner (the personal account) and `bot.allowed_users`; everyone else
-is ignored (logged with the user id). Digests and notifications go to the owner. A
+is ignored (logged with the user id). Digests go to the owner and the allowed users,
+except those who sent `/stop` (`muted_users`) — the owner can opt out too. The first
+recipient is the main destination of the journal, the others get copies; a failed
+copy never holds the main delivery. If everybody opted out, the run ends `empty`.
+Notifications go only to the owner. A
 bot can write to a user only after the user wrote to it, so the owner sends
 `/start` once; the chat is then kept in `bot.session`.
 
@@ -111,6 +115,10 @@ map-reduce (`summarize.rs`):
   put in `sources`, and everything fails the check.
 - `max_posts_per_channel` is a safety limit. A channel that hits it is removed
   from the run completely, and its cursor does not move.
+
+**No story twice in a row.** Each run saves its topics (`runs.digest_topics`). The
+next run adds the topics of the last delivered digest to the system prompt and asks
+the model not to repeat them, only to write what is really new.
 
 **A repost is marked with its source.** Without the "repost from: …" label the
 model sees a repost and its original as two news items and does not merge them.
