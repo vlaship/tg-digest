@@ -49,6 +49,10 @@ CI publishes the image to GitHub Container Registry:
   git push origin v1.2.3
   ```
 
+Pull requests only build the image, they do not publish it. To build it by hand
+without publishing, run the `docker` workflow from the Actions tab (or
+`gh workflow run docker`); tick "publish" only if you want to push the result.
+
 To use it instead of a local build, change `image:` in `compose.yaml` to one of
 these tags and run `docker compose pull` instead of `docker compose build`.
 
