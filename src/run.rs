@@ -15,7 +15,7 @@ use crate::cancel::Cancel;
 use crate::config::{Config, Prompts};
 use crate::db::{self, Db, NewChunk, Run};
 use crate::digest::{self, RenderOptions};
-use crate::summarize::Summarizer;
+use crate::summarize::{ApiError, ApiErrorKind, Summarizer};
 use crate::telegram::bot::Bot;
 use crate::telegram::{channels, client as tg, photos, publish};
 
@@ -67,7 +67,7 @@ impl std::fmt::Display for Outcome {
                 f,
                 "run #{run}: {status}, posts {posts}, topics {topics}"
             ),
-            Outcome::Failed(id, reason) => write!(f, "run #{id} failed: {reason}"),
+            Outcome::Failed(id, reason) => write!(f, "run #{id}: {reason}"),
             Outcome::Abandoned(id) => write!(
                 f,
                 "run #{id} cancelled, cursors not moved — the posts go into the next digest"
@@ -294,7 +294,7 @@ impl Runner {
         let collected =
             match tg::collect_posts(&self.client, &self.cfg, &channels, &self.cancel).await {
                 Ok(collected) => collected,
-                Err(e) => return self.fail(run_id, e).await,
+                Err(e) => return self.fail(run_id, trigger, e).await,
             };
 
         // An excluded channel is a reason for a notification: we cannot silently lose
@@ -322,7 +322,7 @@ impl Runner {
         let provider = self.provider().await;
         let summarizer = match Summarizer::new(&self.cfg, &provider) {
             Ok(s) => s,
-            Err(e) => return self.fail(run_id, e).await,
+            Err(e) => return self.fail(run_id, trigger, e).await,
         };
         // A channel often writes about yesterday's story again in a new post: tell the
         // model what the last digest already had.
@@ -343,7 +343,7 @@ impl Runner {
             .await
         {
             Ok(summary) => summary,
-            Err(e) => return self.fail(run_id, e).await,
+            Err(e) => return self.fail(run_id, trigger, e).await,
         };
 
         let mut digest = summary.digest;
@@ -379,7 +379,7 @@ impl Runner {
         };
         let dest = match resolved {
             Ok(dest) => dest,
-            Err(e) => return self.fail(run_id, e).await,
+            Err(e) => return self.fail(run_id, trigger, e).await,
         };
 
         let journal = self
@@ -531,49 +531,78 @@ impl Runner {
     }
 
     /// The run did not reach the model answer: nothing is saved, the cursors are safe.
-    async fn fail(&self, run_id: i64, error: anyhow::Error) -> Result<Outcome> {
+    ///
+    /// The full error goes to the log and the database; the owner gets a short text
+    /// in plain words (`friendly_error`). A `/run` gets it as the reply, so we do not
+    /// send it a second time as a notification.
+    async fn fail(&self, run_id: i64, trigger: &str, error: anyhow::Error) -> Result<Outcome> {
         if tg::is_fatal(&error) {
             // There is no point in waiting out a revoked session — let it fail upwards.
             self.db.fail_run(run_id, &format!("{error:#}")).await?;
             return Err(error);
         }
 
-        let reason = if self.cancel.is_cancelled() {
-            "cancelled".to_string()
-        } else {
-            format!("{error:#}")
-        };
+        if self.cancel.is_cancelled() {
+            tracing::error!(run = run_id, "run cancelled");
+            self.db.fail_run(run_id, "cancelled").await?;
+            return Ok(Outcome::Failed(run_id, "cancelled".into()));
+        }
 
+        let reason = format!("{error:#}");
         tracing::error!(run = run_id, %reason, "run finished with an error");
         self.db.fail_run(run_id, &reason).await?;
 
-        if !self.cancel.is_cancelled() {
-            let limit = error
-                .chain()
-                .find_map(|e| e.downcast_ref::<crate::summarize::LimitReached>());
-            let text = match limit {
-                Some(limit) => {
-                    let current = self.provider().await;
-                    let choice = match &self.cfg.fallback_provider {
-                        Some(fallback) if *fallback != current => format!(
-                            "Switch to {fallback} and build the digest now? Send /fallback.\n\
-                             Later, /provider {current} switches back."
-                        ),
-                        _ => "Wait for the limit to reset, or set fallback_provider \
-                              in the config."
-                            .to_string(),
-                    };
-                    format!(
-                        "⚠️ the {} API limit is used up, the digest is not built.\n\
-                         The posts are kept and go into the next run.\n\n{choice}\n\n{}",
-                        limit.api, limit.details
-                    )
-                }
-                None => format!("digest not built: {reason}"),
-            };
+        let text = self.friendly_error(&error).await;
+        if trigger != TRIGGER_MANUAL {
             self.notify(&text).await;
         }
-        Ok(Outcome::Failed(run_id, reason))
+        Ok(Outcome::Failed(run_id, text))
+    }
+
+    /// What went wrong and what to do, in plain words, without a JSON dump.
+    async fn friendly_error(&self, error: &anyhow::Error) -> String {
+        const KEPT: &str = "The posts are kept and go into the next run.";
+        let Some(api_error) = error.chain().find_map(|e| e.downcast_ref::<ApiError>()) else {
+            // Not an API error: the first line of the reason is enough, the rest is in the log.
+            let reason = format!("{error:#}");
+            let short: String = reason
+                .lines()
+                .next()
+                .unwrap_or("")
+                .chars()
+                .take(300)
+                .collect();
+            return format!("⚠️ The digest is not built: {short}\n{KEPT}");
+        };
+
+        let api = api_error.api;
+        let current = self.provider().await;
+        let fallback = match &self.cfg.fallback_provider {
+            Some(fallback) if *fallback != current => Some(fallback.clone()),
+            _ => None,
+        };
+        let switch = |otherwise: &str| match &fallback {
+            Some(fallback) => format!(
+                "Switch to {fallback} and build the digest now? Send /fallback.\n\
+                 Later, /provider {current} switches back."
+            ),
+            None => otherwise.to_string(),
+        };
+
+        match api_error.kind {
+            ApiErrorKind::Limit => format!(
+                "⚠️ The {api} limit is used up, the digest is not built.\n{KEPT}\n\n{}",
+                switch("Wait for the limit to reset, or set fallback_provider in the config.")
+            ),
+            ApiErrorKind::Unavailable => format!(
+                "⚠️ {api} is overloaded and did not answer, the digest is not built.\n{KEPT}\n\n{}",
+                switch("Send /run later to try again, or switch the provider with /provider.")
+            ),
+            ApiErrorKind::Auth => format!(
+                "⚠️ {api} did not accept the API key, the digest is not built.\n{KEPT}\n\n\
+                 Check {current}.api_key in config.toml."
+            ),
+        }
     }
 
     /// Read channel titles and usernames again before collecting.

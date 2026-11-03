@@ -114,7 +114,8 @@ Fill in `config.toml`:
 
 1. `telegram.api_id` / `api_hash` — get them at <https://my.telegram.org>;
 2. `telegram.phone` — the phone number of the account that follows the channels;
-3. `anthropic.api_key`, or `provider = "gemini"` and `gemini.api_key` (from https://aistudio.google.com/apikey);
+3. `anthropic.api_key`, or `provider = "gemini"` and `gemini.api_key` (from https://aistudio.google.com/apikey),
+   or `provider = "openrouter"` with `openrouter.api_key` and `openrouter.model` (from https://openrouter.ai/keys);
 4. `bot.token` — create a bot with [@BotFather](https://t.me/BotFather): send it
    `/newbot`, choose a name and a username, and copy the token it gives you.
 
