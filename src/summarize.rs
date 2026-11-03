@@ -1,4 +1,5 @@
-//! Calls to the model API: Anthropic Messages, Google Gemini or OpenRouter (`provider`).
+//! Calls to the model API: Anthropic Messages, Google Gemini or OpenRouter
+//! (`model` in the config, `[providers]`).
 //!
 //! There is no official Rust SDK, so we call HTTP directly with reqwest —
 //! this is the normal way for languages without an SDK.
@@ -11,7 +12,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crate::cancel::Cancel;
-use crate::config::{Config, Prompts};
+use crate::config::{ModelSpec, Prompts, ProviderKind};
 use crate::digest::{self, Digest, Post};
 
 const ANTHROPIC_VERSION: &str = "2023-06-01";
@@ -111,7 +112,7 @@ impl Limits {
 pub struct Summarizer {
     http: reqwest::Client,
     backend: Backend,
-    /// Model id, only for the log.
+    /// `provider/model`, only for the log.
     model: String,
     limits: Limits,
     /// OpenRouter only: the model hosts do not support a strict JSON schema
@@ -123,78 +124,41 @@ pub struct Summarizer {
 /// OpenRouter says this when no host of the model supports a parameter we sent.
 const NO_ENDPOINTS: &str = "No endpoints found that can handle the requested parameters";
 
-/// Which API writes the digest. A copy of the settings without a lifetime tied to
-/// the whole Config.
-enum Backend {
-    Anthropic {
-        api_key: String,
-        api_url: String,
-        model: String,
-        effort: String,
-        max_tokens: u32,
-    },
-    Gemini {
-        api_key: String,
-        /// With the model id already in it.
-        api_url: String,
-        max_tokens: u32,
-    },
-    /// OpenRouter: one key for many models, the OpenAI chat format.
-    OpenRouter {
-        api_key: String,
-        api_url: String,
-        model: String,
-        max_tokens: u32,
-        reasoning: bool,
-    },
-}
+/// Which API writes the digest: a copy of the model settings from the config.
+struct Backend(ModelSpec);
 
 impl Backend {
     fn name(&self) -> &'static str {
-        match self {
-            Backend::Anthropic { .. } => "Anthropic",
-            Backend::Gemini { .. } => "Gemini",
-            Backend::OpenRouter { .. } => "OpenRouter",
-        }
+        self.0.kind.api_name()
     }
 
     /// `json_object`: only for OpenRouter, see `Summarizer::json_object`.
     fn body(&self, system: &str, user: &str, json_object: bool) -> Value {
-        match self {
+        let m = &self.0;
+        match m.kind {
             // thinking is on by default on claude-opus-5 — we do not pass the parameter.
             // temperature and budget_tokens return 400 on this model.
-            Backend::Anthropic {
-                model,
-                effort,
-                max_tokens,
-                ..
-            } => json!({
-                "model": model,
-                "max_tokens": max_tokens,
+            ProviderKind::Anthropic => json!({
+                "model": m.id,
+                "max_tokens": m.max_tokens,
                 "output_config": {
-                    "effort": effort,
+                    "effort": m.effort,
                     "format": { "type": "json_schema", "schema": digest::response_schema() }
                 },
                 "system": system,
                 "messages": [{ "role": "user", "content": user }]
             }),
-            Backend::Gemini { max_tokens, .. } => json!({
+            ProviderKind::Gemini => json!({
                 "systemInstruction": { "parts": [{ "text": system }] },
                 "contents": [{ "role": "user", "parts": [{ "text": user }] }],
                 "generationConfig": {
-                    "maxOutputTokens": max_tokens,
+                    "maxOutputTokens": m.max_tokens,
                     "responseMimeType": "application/json",
                     "responseJsonSchema": digest::response_schema()
                 }
             }),
-            // `require_parameters`: OpenRouter sends the request only to hosts that
-            // support `response_format`, otherwise the answer may be free text.
-            Backend::OpenRouter {
-                model,
-                max_tokens,
-                reasoning,
-                ..
-            } => {
+            // The OpenAI chat format.
+            ProviderKind::OpenRouter => {
                 let (system, format) = if json_object {
                     let system = format!(
                         "{system}\n\nAnswer with JSON only, no other text. \
@@ -213,9 +177,11 @@ impl Backend {
                     });
                     (system.to_string(), format)
                 };
+                // `require_parameters`: OpenRouter sends the request only to hosts that
+                // support `response_format`, otherwise the answer may be free text.
                 let mut body = json!({
-                    "model": model,
-                    "max_tokens": max_tokens,
+                    "model": m.id,
+                    "max_tokens": m.max_tokens,
                     "messages": [
                         { "role": "system", "content": system },
                         { "role": "user", "content": user }
@@ -226,7 +192,7 @@ impl Backend {
                 // The model thinks before it answers: slower and more tokens, but it
                 // often groups the news better. Not sent when off, so a model
                 // without reasoning still finds a host.
-                if *reasoning {
+                if m.reasoning {
                     body["reasoning"] = json!({ "enabled": true });
                 }
                 body
@@ -235,30 +201,27 @@ impl Backend {
     }
 
     fn request(&self, http: &reqwest::Client) -> reqwest::RequestBuilder {
-        match self {
-            Backend::Anthropic {
-                api_key, api_url, ..
-            } => http
-                .post(api_url)
-                .header("x-api-key", api_key)
+        let m = &self.0;
+        match m.kind {
+            ProviderKind::Anthropic => http
+                .post(&m.api_url)
+                .header("x-api-key", &m.api_key)
                 .header("anthropic-version", ANTHROPIC_VERSION),
-            Backend::Gemini {
-                api_key, api_url, ..
-            } => http.post(api_url).header("x-goog-api-key", api_key),
-            Backend::OpenRouter {
-                api_key, api_url, ..
-            } => http
-                .post(api_url)
-                .bearer_auth(api_key)
+            ProviderKind::Gemini => http
+                .post(m.api_url.replace("{model}", &m.id))
+                .header("x-goog-api-key", &m.api_key),
+            ProviderKind::OpenRouter => http
+                .post(&m.api_url)
+                .bearer_auth(&m.api_key)
                 .header("X-Title", "tg-digest"),
         }
     }
 
     fn parse(&self, response: Value) -> Result<Summary> {
-        match self {
-            Backend::Anthropic { .. } => parse_summary(response),
-            Backend::Gemini { .. } => parse_gemini(response),
-            Backend::OpenRouter { .. } => parse_openrouter(response),
+        match self.0.kind {
+            ProviderKind::Anthropic => parse_summary(response),
+            ProviderKind::Gemini => parse_gemini(response),
+            ProviderKind::OpenRouter => parse_openrouter(response),
         }
     }
 }
@@ -273,51 +236,17 @@ pub struct Summary {
 }
 
 impl Summarizer {
-    pub fn new(cfg: &Config, provider: &str) -> Result<Self> {
-        let (backend, timeout, max_input_chars) = match provider {
-            "gemini" => {
-                let g = &cfg.gemini;
-                let backend = Backend::Gemini {
-                    api_key: g.api_key.clone(),
-                    api_url: g.api_url.replace("{model}", &g.model),
-                    max_tokens: g.max_tokens,
-                };
-                (backend, g.request_timeout_secs, g.max_input_chars)
-            }
-            "openrouter" => {
-                let o = &cfg.openrouter;
-                let backend = Backend::OpenRouter {
-                    api_key: o.api_key.clone(),
-                    api_url: o.api_url.clone(),
-                    model: o.model.clone(),
-                    max_tokens: o.max_tokens,
-                    reasoning: o.reasoning,
-                };
-                (backend, o.request_timeout_secs, o.max_input_chars)
-            }
-            _ => {
-                let a = &cfg.anthropic;
-                let backend = Backend::Anthropic {
-                    api_key: a.api_key.clone(),
-                    api_url: a.api_url.clone(),
-                    model: a.model.clone(),
-                    effort: a.effort.clone(),
-                    max_tokens: a.max_tokens,
-                };
-                (backend, a.request_timeout_secs, a.max_input_chars)
-            }
-        };
-
+    pub fn new(model: &ModelSpec) -> Result<Self> {
         let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(timeout))
+            .timeout(Duration::from_secs(model.request_timeout_secs))
             .build()
             .context("could not create the HTTP client")?;
 
         Ok(Self {
             http,
-            backend,
-            model: cfg.model_of(provider).to_string(),
-            limits: Limits::new(max_input_chars),
+            model: model.key.clone(),
+            limits: Limits::new(model.max_input_chars),
+            backend: Backend(model.clone()),
             json_object: AtomicBool::new(false),
         })
     }
@@ -548,7 +477,7 @@ impl Summarizer {
             let response = match result {
                 Ok(response) => response,
                 Err(e)
-                    if matches!(self.backend, Backend::OpenRouter { .. })
+                    if self.backend.0.kind == ProviderKind::OpenRouter
                         && !json_object
                         && format!("{e:#}").contains(NO_ENDPOINTS) =>
                 {
@@ -755,7 +684,7 @@ fn parse_summary(response: Value) -> Result<Summary> {
         bail!("the model refused the request (stop_reason=refusal): {details}");
     }
     if stop_reason == "max_tokens" {
-        bail!("the answer was cut at max_tokens — raise anthropic.max_tokens in the config");
+        bail!("the answer was cut at max_tokens — raise max_tokens of the model in the config");
     }
 
     let usage = |field: &str| {
@@ -819,7 +748,7 @@ fn parse_gemini(response: Value) -> Result<Summary> {
         .and_then(Value::as_str)
         .unwrap_or("");
     if finish_reason == "MAX_TOKENS" {
-        bail!("the answer was cut at max_tokens — raise gemini.max_tokens in the config");
+        bail!("the answer was cut at max_tokens — raise max_tokens of the model in the config");
     }
     if finish_reason != "STOP" && !finish_reason.is_empty() {
         bail!("Gemini stopped the answer (finishReason={finish_reason})");
@@ -871,6 +800,7 @@ fn parse_gemini(response: Value) -> Result<Summary> {
 /// `choices[0].message.content`. Some upstream errors come back as HTTP 200 with an
 /// `error` object, so we check it first.
 fn parse_openrouter(response: Value) -> Result<Summary> {
+    let api = "OpenRouter";
     if let Some(error) = response.get("error") {
         let message = error
             .get("message")
@@ -885,24 +815,24 @@ fn parse_openrouter(response: Value) -> Result<Summary> {
         };
         if let Some(kind) = kind {
             return Err(ApiError {
-                api: "OpenRouter",
+                api,
                 kind,
                 details: format!("{code}: {message}"),
             }
             .into());
         }
-        bail!("OpenRouter returned an error ({code}): {message}");
+        bail!("{api} returned an error ({code}): {message}");
     }
 
     let choice = response
         .pointer("/choices/0")
-        .with_context(|| format!("the OpenRouter answer has no choices: {response}"))?;
+        .with_context(|| format!("the {api} answer has no choices: {response}"))?;
     let finish_reason = choice
         .get("finish_reason")
         .and_then(Value::as_str)
         .unwrap_or("");
     if finish_reason == "length" {
-        bail!("the answer was cut at max_tokens — raise openrouter.max_tokens in the config");
+        bail!("the answer was cut at max_tokens — raise max_tokens of the model in the config");
     }
     if finish_reason == "content_filter" {
         bail!("the model refused the request (finish_reason=content_filter)");
@@ -913,7 +843,7 @@ fn parse_openrouter(response: Value) -> Result<Summary> {
         .and_then(Value::as_str)
         .unwrap_or_default();
     if text.trim().is_empty() {
-        bail!("the OpenRouter answer has no text: {response}");
+        bail!("the {api} answer has no text: {response}");
     }
 
     let digest: Digest = serde_json::from_str(strip_code_fence(text))
@@ -925,7 +855,7 @@ fn parse_openrouter(response: Value) -> Result<Summary> {
             .and_then(Value::as_u64)
     };
 
-    // OpenRouter may pick a different model for a router id like `openrouter/free`.
+    // OpenRouter may pick another model for a router id like `openrouter/free`.
     let model = response.get("model").and_then(Value::as_str).unwrap_or("");
     tracing::info!(
         %model,

@@ -15,13 +15,13 @@
 # a container restart, together with the text of its parts and their random_id.
 db_file = "/data/digest.db"
 
-# Which model writes the digest: "anthropic" ([anthropic] below), "gemini" ([gemini])
-# or "openrouter" ([openrouter]).
-provider = "anthropic"
+# Which model writes the digest, as "provider/model" from [providers] below.
+# /model in the bot switches it; this is the default.
+model = "gemini/gemini-3.8-flash"
 
-# Where to switch when `provider` is overloaded or its limit is used up. The bot asks the owner
-# first (/fallback), nothing switches by itself. Its key must be set too.
-# fallback_provider = "gemini"
+# Where to switch when the model is overloaded or its limit is used up, in this
+# order. The bot asks the owner first (/fallback), nothing switches by itself.
+fallback = ["openrouter/google/gemma-4-31b-it:free", "anthropic/claude-haiku-5-5"]
 
 # ------------------------------------------------------------------ schedule --
 [schedule]
@@ -104,51 +104,50 @@ token = ""
 # Bot session (SQLite), created on the first start. No login is needed for a bot.
 session_file = "/data/bot.session"
 
-# ---------------------------------------------------------------- anthropic --
-[anthropic]
+# ---------------------------------------------------------------- providers --
+# Each provider has its key and its models. The model name is its full id in the
+# provider API, as it is (no date suffix is added). `model` and `fallback` at the top
+# of this file say which one is used, as "provider/model".
+#
+# These settings can be set for a provider (all its models) or for one model:
+#   max_tokens           — the longest answer, in tokens
+#   max_input_chars      — above this many characters the posts are condensed in
+#                          parts first (map-reduce): more requests, each one smaller
+#   request_timeout_secs — how long to wait for one answer (default 600)
+#   effort               — anthropic only: low | medium | high | xhigh | max
+#   reasoning            — openrouter only: the model thinks before it answers;
+#                          slower, and the thinking counts in max_tokens
+# Providers you do not use can be left out.
+
+[providers.anthropic]
 api_key = "sk-ant-..."
+effort  = "high"
 
-# Do not add a date suffix to the id — the string is used as is.
-model  = "claude-opus-5"
-
-# low | medium | high | xhigh | max — how deeply the model thinks, and token use
-effort = "high"
-
+[providers.anthropic.models."claude-haiku-5-5"]
 max_tokens = 16000
 
-api_url              = "https://api.anthropic.com/v1/messages"
-request_timeout_secs = 600
+# The key is from https://aistudio.google.com/apikey (free tier with limits).
+# A Gemini app subscription (AI Pro / Ultra) gives no API access.
+[providers.gemini]
+api_key = "..."
 
-# Above this many characters the posts are condensed in parts first (map-reduce):
-# more requests, but each one is smaller. The same setting is in every provider.
-max_input_chars = 400000
-
-# ------------------------------------------------------------------- gemini --
-# Used when provider = "gemini". The key is from https://aistudio.google.com/apikey
-# (free tier with limits). A Gemini app subscription (AI Pro / Ultra) gives no API access.
-[gemini]
-api_key    = "..."
-# Check the model list in AI Studio, ids change often.
-model      = "gemini-2.5-flash"
-max_tokens = 32000
 # The context is 1M tokens; Russian text is about 2–3 characters per token.
+[providers.gemini.models."gemini-3.8-flash"]
+max_tokens      = 32000
 max_input_chars = 400000
 
-# --------------------------------------------------------------- openrouter --
-# Used when provider = "openrouter". One key for many models: https://openrouter.ai/keys
+# One key for many models: https://openrouter.ai/keys
 # Free models have ids that end with ":free" (https://openrouter.ai/collections/free-models).
 # They have low daily limits and can be busy too. The model must support
 # response_format. If it has no strict JSON schema (structured_outputs), the service
 # asks for a JSON object and puts the schema in the prompt.
-[openrouter]
-api_key    = "sk-or-..."
-model      = ""
-max_tokens = 16000
-# Many models here have a context of 128k tokens or less, so the limit is lower.
-max_input_chars = 200000
-# The model thinks before it answers: slower and more tokens, but it often groups
-# the news better. The thinking counts in max_tokens, so raise it if answers get cut.
-reasoning = false
+[providers.openrouter]
+api_key = "sk-or-..."
+
+[providers.openrouter.models."google/gemma-4-31b-it:free"]
+max_tokens      = 16000
+max_input_chars = 400000
+reasoning       = false
 
 # ------------------------------------------------------------------ prompts --
 # Edit them here, no rebuild needed. Placeholders in user_template:
