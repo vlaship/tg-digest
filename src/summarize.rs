@@ -222,6 +222,10 @@ impl Backend {
                     "response_format": format,
                     "provider": { "require_parameters": true }
                 });
+                // One model has many hosts, and their prices differ up to five times.
+                if let Some(sort) = &m.sort {
+                    body["provider"]["sort"] = json!(sort);
+                }
                 // The model thinks before it answers: slower and more tokens, but it
                 // often groups the news better. Some models think by default, so "off"
                 // is sent too, but only to a model that can think: otherwise

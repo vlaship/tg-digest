@@ -237,6 +237,9 @@ pub struct ModelSettings {
     pub effort: Option<String>,
     /// OpenRouter only: let the model think before it answers.
     pub reasoning: Option<bool>,
+    /// OpenRouter only: how to choose the host of the model: price | throughput |
+    /// latency. Not set: OpenRouter balances price and uptime.
+    pub sort: Option<String>,
 }
 
 /// A model with all its settings in one place: what one run uses.
@@ -256,6 +259,7 @@ pub struct ModelSpec {
     /// OpenRouter: the model can think. Then `reasoning = false` is sent as
     /// `enabled: false`: some models think by default.
     pub can_reason: bool,
+    pub sort: Option<String>,
     /// The model takes a strict JSON schema. When not, OpenRouter is asked for a JSON object.
     pub json_schema: bool,
 }
@@ -384,6 +388,7 @@ impl Config {
             reasoning: m.reasoning.or(p.reasoning).unwrap_or(false)
                 && entry.and_then(|e| e.reasoning).unwrap_or(true),
             can_reason: entry.and_then(|e| e.reasoning).unwrap_or(false),
+            sort: m.sort.clone().or_else(|| p.sort.clone()),
             json_schema: entry.and_then(|e| e.json_schema).unwrap_or(true),
         })
     }

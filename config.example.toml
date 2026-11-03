@@ -125,6 +125,9 @@ session_file = "/data/bot.session"
 #   effort               — anthropic only: low | medium | high | xhigh | max
 #   reasoning            — openrouter only: the model thinks before it answers;
 #                          slower, and the thinking counts in max_tokens
+#   sort                 — openrouter only: how to choose the host of a model:
+#                          price | throughput | latency (not set: OpenRouter
+#                          balances price and uptime)
 # Providers you do not use can be left out.
 
 [providers.anthropic]
@@ -143,6 +146,8 @@ api_key = "..."
 # service asks for a JSON object and puts the schema in the prompt.
 [providers.openrouter]
 api_key = "sk-or-..."
+# One model has many hosts, and their prices differ up to five times.
+sort    = "price"
 
 # A big answer from a free model can take minutes: wait longer.
 [providers.openrouter.models."google/gemma-4-31b-it:free"]
