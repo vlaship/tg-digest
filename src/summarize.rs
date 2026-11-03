@@ -252,13 +252,19 @@ impl Summarizer {
             timezone,
         );
 
+        // First the whole size, so the log shows why the input is split (or not).
         let chars = user_prompt.chars().count();
+        tracing::info!(
+            posts = posts.len(),
+            chars,
+            limit = self.limits.input,
+            "input for the model"
+        );
         if chars > self.limits.input {
             return self
                 .map_reduce(
                     prompts,
                     posts,
-                    chars,
                     lookback_hours,
                     channel_count,
                     timezone,
@@ -267,12 +273,6 @@ impl Summarizer {
                 .await;
         }
 
-        tracing::info!(
-            posts = posts.len(),
-            chars,
-            limit = self.limits.input,
-            "the input fits in one request"
-        );
         self.ask("digest", &prompts.system, &user_prompt, cancel)
             .await
     }
@@ -287,7 +287,6 @@ impl Summarizer {
         &self,
         prompts: &Prompts,
         posts: &[Post],
-        chars: usize,
         lookback_hours: i64,
         channel_count: usize,
         timezone: Tz,
@@ -296,12 +295,9 @@ impl Summarizer {
         let now = Utc::now();
         let batches = digest::split_batches(posts, self.limits.batch);
         tracing::info!(
-            posts = posts.len(),
-            chars,
-            limit = self.limits.input,
-            batch_limit = self.limits.batch,
             batches = batches.len(),
-            "large input: condensing in parts, then reducing"
+            batch_limit = self.limits.batch,
+            "the input is over the limit: condensing in parts, then reducing"
         );
 
         let map_system = prompts.map_system.as_deref().unwrap_or(DEFAULT_MAP_SYSTEM);
