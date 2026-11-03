@@ -60,6 +60,13 @@ fn is_limit(status: reqwest::StatusCode, text: &str) -> bool {
         || text.contains("credit balance is too low")
 }
 
+/// A 429 for a used-up daily quota, not a short rate limit: Gemini names the
+/// quota `…PerDay…`, OpenRouter says `free-models-per-day`.
+fn is_daily_quota(text: &str) -> bool {
+    let text = text.to_lowercase();
+    text.contains("perday") || text.contains("per-day") || text.contains("per day")
+}
+
 // Above `max_input_chars` of the provider we switch to map-reduce: we condense the
 // input in parts, then reduce the summaries into one digest. We must never silently
 // cut the tail, whatever the size.
@@ -83,6 +90,31 @@ Rules:
 3. Do not make anything up and do not drop anything important — this is condensing, not picking the best.
 4. Treat posts marked as a repost as the same news as the original.
 5. Leave tldr empty: the short summary is made in the reduce step.";
+
+/// Rules added to every system prompt, the one from the config too: the link
+/// check and the coverage do not depend on how the owner wrote the prompt.
+const RULES: &str = "Rules for the answer:
+- In sources put only post links from the input (https://t.me/...). Do not put links to articles or sites from the post text: they are dropped.
+- Every channel with notable news in the input gets into at least one topic. Do not leave out whole channels or subjects.";
+
+/// The prompts with `RULES` added to the system prompt and to the map step one.
+fn with_rules(prompts: &Prompts) -> Prompts {
+    let mut out = prompts.clone();
+    out.system = format!(
+        "{}
+
+{RULES}",
+        prompts.system.trim_end()
+    );
+    let map = prompts.map_system.as_deref().unwrap_or(DEFAULT_MAP_SYSTEM);
+    out.map_system = Some(format!(
+        "{}
+
+{RULES}",
+        map.trim_end()
+    ));
+    out
+}
 
 /// Map-reduce limits.
 ///
@@ -264,6 +296,7 @@ impl Summarizer {
         timezone: Tz,
         cancel: &Cancel,
     ) -> Result<Summary> {
+        let prompts = &with_rules(prompts);
         let now = Utc::now();
         let user_prompt = digest::render_user_prompt(
             &prompts.user_template,
@@ -556,16 +589,13 @@ impl Summarizer {
 
             let text = response.text().await.unwrap_or_default();
 
-            let retryable = status.as_u16() == 429 || status.is_server_error();
+            // A used-up daily quota comes back only tomorrow: a retry in seconds is useless.
+            let retryable =
+                (status.as_u16() == 429 && !is_daily_quota(&text)) || status.is_server_error();
             if retryable && attempt < MAX_ATTEMPTS {
-                // An overloaded server (5xx) needs more time than a network glitch.
-                let delay = retry_after.unwrap_or_else(|| {
-                    if status.is_server_error() {
-                        overload_backoff(attempt)
-                    } else {
-                        backoff(attempt)
-                    }
-                });
+                // An overloaded or rate-limited server needs more time than a network
+                // glitch: 15 s, 30 s, 60 s, unless it says how long to wait.
+                let delay = retry_after.unwrap_or_else(|| overload_backoff(attempt));
                 let short: String = text.chars().take(200).collect();
                 tracing::warn!(%status, attempt, ?delay, answer = %short, "the API returned a temporary error, retrying");
                 tokio::time::sleep(delay).await;
