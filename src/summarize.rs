@@ -223,10 +223,13 @@ impl Backend {
                     "provider": { "require_parameters": true }
                 });
                 // The model thinks before it answers: slower and more tokens, but it
-                // often groups the news better. Not sent when off, so a model
-                // without reasoning still finds a host.
+                // often groups the news better. Some models think by default, so "off"
+                // is sent too, but only to a model that can think: otherwise
+                // `require_parameters` finds no host.
                 if m.reasoning {
                     body["reasoning"] = json!({ "enabled": true });
+                } else if m.can_reason {
+                    body["reasoning"] = json!({ "enabled": false });
                 }
                 body
             }

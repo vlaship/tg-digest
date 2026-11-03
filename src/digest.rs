@@ -5,7 +5,7 @@ use chrono::{DateTime, Utc};
 use chrono_tz::Tz;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::collections::HashSet;
+use std::collections::HashMap;
 
 /// The Telegram limit is 4096 characters per message, and it counts them in UTF-16
 /// (emoji = 2 units). We keep a margin for service markup.
@@ -149,19 +149,24 @@ pub fn response_schema() -> Value {
 /// place: the source is still a real post. A link that is in no post is dropped.
 /// Returns the number of dropped links.
 pub fn drop_foreign_sources(digest: &mut Digest, posts: &[Post]) -> usize {
-    let allowed: HashSet<&str> = posts.iter().map(|p| p.url.as_str()).collect();
+    let by_url: HashMap<&str, &Post> = posts.iter().map(|p| (p.url.as_str(), p)).collect();
     let mut dropped = 0;
     let mut replaced = 0;
 
     for topic in &mut digest.topics {
         let mut kept: Vec<Source> = Vec::with_capacity(topic.sources.len());
         for source in topic.sources.drain(..) {
-            let source = if allowed.contains(source.url.as_str()) {
-                source
+            // The label is the channel title from our list, not what the model wrote:
+            // it writes `@username` in one run and the title in the next.
+            let source = if let Some(post) = by_url.get(source.url.as_str()) {
+                Source {
+                    channel: post.title.clone(),
+                    url: source.url,
+                }
             } else if let Some(post) = post_with_link(posts, &source.url) {
                 replaced += 1;
                 Source {
-                    channel: post.channel.clone(),
+                    channel: post.title.clone(),
                     url: post.url.clone(),
                 }
             } else {

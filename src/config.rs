@@ -253,6 +253,9 @@ pub struct ModelSpec {
     pub request_timeout_secs: u64,
     pub effort: String,
     pub reasoning: bool,
+    /// OpenRouter: the model can think. Then `reasoning = false` is sent as
+    /// `enabled: false`: some models think by default.
+    pub can_reason: bool,
     /// The model takes a strict JSON schema. When not, OpenRouter is asked for a JSON object.
     pub json_schema: bool,
 }
@@ -380,6 +383,7 @@ impl Config {
             // A model without reasoning would find no host with `require_parameters`.
             reasoning: m.reasoning.or(p.reasoning).unwrap_or(false)
                 && entry.and_then(|e| e.reasoning).unwrap_or(true),
+            can_reason: entry.and_then(|e| e.reasoning).unwrap_or(false),
             json_schema: entry.and_then(|e| e.json_schema).unwrap_or(true),
         })
     }
