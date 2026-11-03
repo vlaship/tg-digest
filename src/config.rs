@@ -25,16 +25,13 @@ pub struct Config {
     #[serde(default)]
     pub providers: BTreeMap<String, Provider>,
     pub prompts: Prompts,
-    /// The bot you talk to: commands, replies, digests, notifications.
-    #[serde(default)]
-    pub bot: Bot,
     /// Database file. In a container it is in the `/data` volume, next to the session.
     #[serde(default = "default_db_file")]
     pub db_file: String,
 }
 
-/// The bot reads no channels (a bot cannot), it only talks to the owner and posts.
-/// Reading is done by the personal account from `[telegram]`.
+/// `[telegram.bot]`: the bot you talk to. It reads no channels (a bot cannot), it only
+/// talks to the owner and posts. Reading is done by the personal account (`[telegram.app]`).
 #[derive(Debug, Deserialize)]
 pub struct Bot {
     /// Token from @BotFather.
@@ -65,8 +62,11 @@ pub struct Schedule {
     pub run_on_start: bool,
 }
 
+/// `[telegram.app]`: the personal account and the Telegram app keys. The account
+/// only reads: it collects posts, resolves `/add`, refreshes names. The bot logs in
+/// with the same `api_id` and `api_hash`.
 #[derive(Debug, Deserialize)]
-pub struct Telegram {
+pub struct App {
     #[serde(default)]
     pub api_id: i32,
     #[serde(default)]
@@ -75,6 +75,26 @@ pub struct Telegram {
     pub phone: String,
     #[serde(default = "default_session_file")]
     pub session_file: String,
+}
+
+impl Default for App {
+    fn default() -> Self {
+        Self {
+            api_id: 0,
+            api_hash: String::new(),
+            phone: String::new(),
+            session_file: default_session_file(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct Telegram {
+    #[serde(default)]
+    pub app: App,
+    /// The bot you talk to: commands, replies, digests, notifications.
+    #[serde(default)]
+    pub bot: Bot,
     /// Where the bot posts the digest: `"bot"` — the chat with the bot (`"me"` means the
     /// same, for old configs), or `"@channel"` where the bot is an admin.
     #[serde(default = "default_destination")]
@@ -251,7 +271,7 @@ impl Config {
         let mut cfg: Config =
             toml::from_str(&raw).with_context(|| format!("{} — invalid TOML", path.display()))?;
 
-        cfg.telegram.phone = normalize_phone(&cfg.telegram.phone);
+        cfg.telegram.app.phone = normalize_phone(&cfg.telegram.app.phone);
         cfg.validate()?;
         Ok(cfg)
     }
@@ -322,11 +342,12 @@ impl Config {
     /// We catch empty required fields here, not on the first network call:
     /// otherwise the error shows up in the middle of a night run as a 401.
     fn validate(&self) -> Result<()> {
-        if self.telegram.api_id == 0 || self.telegram.api_hash.is_empty() {
-            bail!("telegram.api_id / telegram.api_hash are not set (get them at https://my.telegram.org)");
+        let app = &self.telegram.app;
+        if app.api_id == 0 || app.api_hash.is_empty() {
+            bail!("telegram.app.api_id / telegram.app.api_hash are not set (get them at https://my.telegram.org)");
         }
-        if self.telegram.phone.is_empty() {
-            bail!("telegram.phone is not set");
+        if app.phone.is_empty() {
+            bail!("telegram.app.phone is not set");
         }
         for name in self.providers.keys() {
             if ProviderKind::from_name(name).is_none() {

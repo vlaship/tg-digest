@@ -41,17 +41,6 @@ run_on_start = false
 
 # ----------------------------------------------------------------- telegram --
 [telegram]
-# Get them at https://my.telegram.org → API development tools
-api_id   = 0
-api_hash = ""
-# Account phone number in international format. You can keep dashes, spaces and
-# brackets — the service removes them before it calls Telegram.
-phone    = "+1-000-00-00"
-
-# Session file (SQLite). The `tg-digest login` command creates it.
-# WARNING: it gives full access to the account — do not commit it or copy it anywhere.
-session_file = "/data/tg.session"
-
 # Where the bot posts the digest: "bot" = the chat with the bot (you see it there),
 # or "@my_channel" — then the bot must be an admin of that channel.
 destination = "bot"
@@ -89,16 +78,31 @@ mark_read = true
 # random_id for deduplication. After this window the owner retries with /resume.
 publish_retry_window_hours = 2
 
-# ---------------------------------------------------------------------- bot --
+# ------------------------------------------------------------- telegram.app --
+# The personal account: it only reads. It collects posts, resolves /add and
+# refreshes channel names. The bot logs in with the same api_id and api_hash.
+[telegram.app]
+# Get them at https://my.telegram.org → API development tools
+api_id   = 0
+api_hash = ""
+# Account phone number in international format. You can keep dashes, spaces and
+# brackets — the service removes them before it calls Telegram.
+phone    = "+1-000-00-00"
+
+# Session file (SQLite). The `tg-digest login` command creates it.
+# WARNING: it gives full access to the account — do not commit it or copy it anywhere.
+session_file = "/data/tg.session"
+
+# ------------------------------------------------------------- telegram.bot --
 # The bot you talk to: you write commands to it, and it writes back the replies,
 # the digests and the notifications. The personal account above still reads the
 # channels (a bot cannot read channels where it is not an admin).
 #
 # Create a bot with @BotFather (/newbot) and paste its token here. Then open the
 # bot in Telegram and send it /start once: a bot can write to you only after that.
-# Only the account from [telegram] may give the bot commands. Everyone else is
+# Only the account from [telegram.app] may give the bot commands. Everyone else is
 # ignored.
-[bot]
+[telegram.bot]
 token = ""
 
 # Bot session (SQLite), created on the first start. No login is needed for a bot.
