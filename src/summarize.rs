@@ -15,7 +15,7 @@ use crate::cancel::Cancel;
 use crate::config::{ModelSpec, Prompts, ProviderKind};
 use crate::digest::{self, Digest, Post};
 
-const ANTHROPIC_VERSION: &str = "2023-06-01";
+pub const ANTHROPIC_VERSION: &str = "2023-06-01";
 const MAX_ATTEMPTS: u32 = 4;
 /// How many times we ask the model when its answer is broken (`Digest::defect`).
 const MAX_BROKEN_ANSWERS: u32 = 2;
@@ -279,7 +279,8 @@ impl Summarizer {
             model: model.key.clone(),
             limits: Limits::new(model.max_input_chars),
             backend: Backend(model.clone()),
-            json_object: AtomicBool::new(false),
+            // OpenRouter: a model without a strict JSON schema gets a JSON object at once.
+            json_object: AtomicBool::new(!model.json_schema),
         })
     }
 

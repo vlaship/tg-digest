@@ -10,6 +10,7 @@ mod cancel;
 mod config;
 mod db;
 mod digest;
+mod models;
 mod run;
 mod schedule;
 mod summarize;
@@ -159,7 +160,7 @@ async fn dry_run_once(cfg: Arc<Config>) -> Result<()> {
         return Ok(());
     }
 
-    let summarizer = Summarizer::new(&cfg.model(&runner.model().await)?)?;
+    let summarizer = Summarizer::new(&runner.catalog.spec(&runner.model().await).await?)?;
     let summary = summarizer
         .summarize(
             &cfg.prompts,
