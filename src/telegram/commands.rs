@@ -7,7 +7,7 @@
 //! Channels are named by `@username` or by numeric `id`: private channels have
 //! no username, so `/list` and the `/add` reply always show the `id`.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use grammers_client::client::UpdatesConfiguration;
 use grammers_client::message::InputMessage;
 use grammers_client::peer::Peer;
@@ -369,7 +369,7 @@ async fn add_many(runner: &Arc<Runner>, arg: &str) -> Result<String> {
     for item in items {
         out.push(match add(runner, item).await {
             Ok(reply) => reply,
-            Err(e) => format!("{item}: error: {e:#}"),
+            Err(e) => format!("{item}: {e:#}"),
         });
     }
     Ok(out.join("\n\n"))
@@ -574,14 +574,30 @@ async fn resolve_new_channel(runner: &Arc<Runner>, arg: &str) -> Result<channels
         client
             .accept_invite_link(arg)
             .await
-            .with_context(|| format!("could not join by the link {arg}"))?
+            .map_err(|e| {
+                let text = e.to_string();
+                if text.contains("INVITE_HASH_EXPIRED") || text.contains("INVITE_HASH_INVALID") {
+                    anyhow!("the invite link is wrong or expired")
+                } else {
+                    anyhow!(e).context(format!("could not join by the link {arg}"))
+                }
+            })?
             .context("the link did not return a chat")?
     } else {
+        // Telegram answers USERNAME_INVALID for a name that cannot exist and
+        // USERNAME_NOT_OCCUPIED for a free one: for the owner both mean a typo.
         client
             .resolve_username(username_from(arg))
             .await
-            .with_context(|| format!("could not resolve {arg}"))?
-            .with_context(|| format!("channel {arg} not found"))?
+            .map_err(|e| {
+                let text = e.to_string();
+                if text.contains("USERNAME_INVALID") || text.contains("USERNAME_NOT_OCCUPIED") {
+                    anyhow!("no such channel, check the name")
+                } else {
+                    anyhow!(e).context(format!("could not resolve {arg}"))
+                }
+            })?
+            .context("no such channel, check the name")?
     };
 
     // A username or an invite can give anything: a user, a bot, a group.
