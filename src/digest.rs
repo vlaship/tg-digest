@@ -143,22 +143,65 @@ pub fn response_schema() -> Value {
 /// The prompt says "do not make up URLs", but a request is not a check. This is also
 /// protection from prompt injection: a post can talk the model into adding a foreign
 /// link, but only addresses of collected posts get into the digest.
+///
+/// Some models put the link of an article from the post text instead of the post
+/// link. If such a link is in the text of a collected post, we put that post in its
+/// place: the source is still a real post. A link that is in no post is dropped.
 /// Returns the number of dropped links.
 pub fn drop_foreign_sources(digest: &mut Digest, posts: &[Post]) -> usize {
     let allowed: HashSet<&str> = posts.iter().map(|p| p.url.as_str()).collect();
     let mut dropped = 0;
+    let mut replaced = 0;
 
     for topic in &mut digest.topics {
-        topic.sources.retain(|source| {
-            let ok = allowed.contains(source.url.as_str());
-            if !ok {
+        let mut kept: Vec<Source> = Vec::with_capacity(topic.sources.len());
+        for source in topic.sources.drain(..) {
+            let source = if allowed.contains(source.url.as_str()) {
+                source
+            } else if let Some(post) = post_with_link(posts, &source.url) {
+                replaced += 1;
+                Source {
+                    channel: post.channel.clone(),
+                    url: post.url.clone(),
+                }
+            } else {
                 dropped += 1;
                 tracing::warn!(url = %source.url, topic = %topic.title, "the link was not in the input posts, dropping it");
+                continue;
+            };
+            // Two article links from one post give the same post twice.
+            if !kept.iter().any(|k| k.url == source.url) {
+                kept.push(source);
             }
-            ok
-        });
+        }
+        topic.sources = kept;
+    }
+    if replaced > 0 {
+        tracing::info!(
+            replaced,
+            "article links replaced with the posts that have them"
+        );
     }
     dropped
+}
+
+/// The first post whose text has this link. `https://`, `www.` and a last `/` do not count.
+fn post_with_link<'a>(posts: &'a [Post], url: &str) -> Option<&'a Post> {
+    fn bare(url: &str) -> &str {
+        let url = url.trim();
+        let url = url
+            .strip_prefix("https://")
+            .or_else(|| url.strip_prefix("http://"))
+            .unwrap_or(url);
+        let url = url.strip_prefix("www.").unwrap_or(url);
+        url.trim_end_matches('/')
+    }
+    let needle = bare(url);
+    // A too short "link" would match almost any text.
+    if needle.len() < 12 {
+        return None;
+    }
+    posts.iter().find(|p| p.text.contains(needle))
 }
 
 /// Telegram puts at most 10 photos in one album.
