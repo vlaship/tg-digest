@@ -31,9 +31,10 @@ Toolchain: `cargo --version`. If the command is missing, the install steps are i
 `README.md` (you need the MSVC linker).
 
 Working config: `config.toml` (not `config.example.toml`). If it is missing, copy
-the example and name the fields the owner must fill in: `telegram.api_id`,
-`telegram.api_hash`, `telegram.phone`, `anthropic.api_key` (or `gemini.api_key` with `provider = "gemini"`, or `openrouter.api_key` and `openrouter.model` with `provider = "openrouter"`), `bot.token` (from
-@BotFather). Channels are not in the config: the owner adds them with `/add` in
+the example and name the fields the owner must fill in: `telegram.app.api_id`,
+`telegram.app.api_hash`, `telegram.app.phone`, `telegram.bot.token` (from
+@BotFather), and `api_key` of each provider in `[providers]` that `model` or
+`fallback` uses. Channels are not in the config: the owner adds them with `/add` in
 the chat with the bot. The owner must send the bot `/start` once, or the bot
 cannot write to them.
 
@@ -162,8 +163,8 @@ they target the old API.
 **`the bot cannot write to you yet`** — the owner never wrote to the bot. Open the
 bot in Telegram and send it `/start`; after that the bot remembers the chat.
 
-**`bot.token is not set`** / **`bot login failed`** — put the token from @BotFather
-into `[bot]` in `config.toml`. If you change the token to another bot, delete
+**`telegram.bot.token is not set`** / **`bot login failed`** — put the token from
+@BotFather into `[telegram.bot]` in `config.toml`. If you change the token to another bot, delete
 `data/bot.session`.
 
 **`channel excluded from the run`** — it hit `max_posts_per_channel` or the
