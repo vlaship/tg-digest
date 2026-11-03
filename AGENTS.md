@@ -184,8 +184,10 @@ CI has two workflows:
 - `.github/workflows/cargo.yml` — on every push to a branch except `main`:
   `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
   `cargo build --release`, all with `--locked`.
-- `.github/workflows/docker.yml` — a push to `main` or a `v*` tag builds and
-  publishes one image to `ghcr.io/vlaship/tg-digest`. On branches and PRs it runs
+- `.github/workflows/docker.yml` — a push to `main` builds and
+  publishes one image to `ghcr.io/vlaship/tg-digest`, tagged `latest` and with the
+  UTC build time (`20261103-041200`). The same time is built into the binary as the
+  version (`/status`). There are no `v*` tags. On branches and PRs it runs
   only by hand (Actions → docker → Run workflow); a manual run only builds, unless
   you tick "publish".
 

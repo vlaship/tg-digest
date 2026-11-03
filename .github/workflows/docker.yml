@@ -1,5 +1,5 @@
 # Builds the Docker image.
-# - push to main and v* tags: build and push to GitHub Container Registry (ghcr.io);
+# - push to main: build and push to GitHub Container Registry (ghcr.io);
 # - branches and pull requests: only by hand (Actions → docker → Run workflow), to save CI;
 # - manual run: build only, unless you tick "publish".
 name: docker
@@ -7,7 +7,6 @@ name: docker
 on:
   push:
     branches: [main]
-    tags: ["v*"]
   workflow_dispatch:
     inputs:
       publish:
@@ -19,7 +18,7 @@ permissions:
   contents: read
   packages: write
 
-# One run per ref. A run on main or a tag is never cancelled half way: the next one
+# One run per ref. A run on main is never cancelled half way: the next one
 # waits, so every push publishes its own image.
 concurrency:
   group: docker-${{ github.ref }}
@@ -45,7 +44,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       # Tags: a push to main gives `latest` and a UTC build time like
-      # `20261030-011220`; a push of the git tag v1.2.3 gives only `1.2.3` and `1.2`.
+      # `20261030-011220`; a manual run gives only the build time.
       # One build time for the image tag and for the version inside the binary,
       # so /status shows the same value as the tag.
       - name: Build time
@@ -59,9 +58,7 @@ jobs:
           images: ghcr.io/${{ github.repository }}
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
-            type=raw,value=${{ steps.time.outputs.value }},enable=${{ github.ref_type == 'branch' }}
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=${{ steps.time.outputs.value }}
 
       - name: Build and push
         uses: docker/build-push-action@v7
