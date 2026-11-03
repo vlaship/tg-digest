@@ -23,8 +23,8 @@ pub const TRIGGER_CRON: &str = "cron";
 pub const TRIGGER_CATCH_UP: &str = "catch_up";
 pub const TRIGGER_MANUAL: &str = "manual";
 
-/// Key in the `settings` table for the provider the owner chose.
-const PROVIDER_SETTING: &str = "provider";
+/// Key in the `settings` table for the model the owner chose.
+const MODEL_SETTING: &str = "model";
 
 /// How a trigger ended. We reply to `/run` with the same text.
 pub enum Outcome {
@@ -123,25 +123,33 @@ impl Runner {
         }
     }
 
-    /// The model provider for the next run: the one the owner chose with `/provider`
-    /// or `/fallback` (kept in the database), else `provider` from the config.
-    pub async fn provider(&self) -> String {
-        match self.db.setting(PROVIDER_SETTING).await {
-            Ok(Some(name)) if self.cfg.check_provider(&name).is_ok() => name,
-            Ok(_) => self.cfg.provider.clone(),
+    /// The model for the next run, as `provider/model`: the one the owner chose with
+    /// `/model` or `/fallback` (kept in the database), else `model` from the config.
+    /// A saved model that is no longer in the config is ignored.
+    pub async fn model(&self) -> String {
+        match self.db.setting(MODEL_SETTING).await {
+            Ok(Some(key)) if self.cfg.model(&key).is_ok() => key,
+            Ok(_) => self.cfg.model.clone(),
             Err(e) => {
-                tracing::warn!(error = %format!("{e:#}"), "could not read the provider setting");
-                self.cfg.provider.clone()
+                tracing::warn!(error = %format!("{e:#}"), "could not read the model setting");
+                self.cfg.model.clone()
             }
         }
     }
 
-    /// Switch the model provider. The name and its key are checked first.
-    pub async fn set_provider(&self, name: &str) -> Result<()> {
-        self.cfg.check_provider(name)?;
-        self.db.set_setting(PROVIDER_SETTING, name).await?;
-        tracing::info!(provider = name, "model provider switched");
+    /// Switch the model. The model and its key are checked first.
+    pub async fn set_model(&self, key: &str) -> Result<()> {
+        self.cfg.model(key)?;
+        self.db.set_setting(MODEL_SETTING, key).await?;
+        tracing::info!(model = key, "model switched");
         Ok(())
+    }
+
+    /// Where `/fallback` goes from the current model: the first model in the
+    /// `fallback` list that is not the current one.
+    pub async fn next_fallback(&self) -> Option<String> {
+        let current = self.model().await;
+        self.cfg.fallback.iter().find(|m| **m != current).cloned()
     }
 
     /// The lock for commands that touch cursors and run status.
@@ -319,8 +327,11 @@ impl Runner {
             return self.finish_empty(run_id, &collected, (None, None)).await;
         }
 
-        let provider = self.provider().await;
-        let summarizer = match Summarizer::new(&self.cfg, &provider) {
+        let summarizer = match self
+            .cfg
+            .model(&self.model().await)
+            .and_then(|model| Summarizer::new(&model))
+        {
             Ok(s) => s,
             Err(e) => return self.fail(run_id, trigger, e).await,
         };
@@ -576,15 +587,12 @@ impl Runner {
         };
 
         let api = api_error.api;
-        let current = self.provider().await;
-        let fallback = match &self.cfg.fallback_provider {
-            Some(fallback) if *fallback != current => Some(fallback.clone()),
-            _ => None,
-        };
+        let current = self.model().await;
+        let fallback = self.next_fallback().await;
         let switch = |otherwise: &str| match &fallback {
             Some(fallback) => format!(
                 "Switch to {fallback} and build the digest now? Send /fallback.\n\
-                 Later, /provider {current} switches back."
+                 Later, /model {current} switches back."
             ),
             None => otherwise.to_string(),
         };
@@ -592,15 +600,16 @@ impl Runner {
         match api_error.kind {
             ApiErrorKind::Limit => format!(
                 "⚠️ The {api} limit is used up, the digest is not built.\n{KEPT}\n\n{}",
-                switch("Wait for the limit to reset, or set fallback_provider in the config.")
+                switch("Wait for the limit to reset, or add a model to fallback in the config.")
             ),
             ApiErrorKind::Unavailable => format!(
                 "⚠️ {api} is overloaded and did not answer, the digest is not built.\n{KEPT}\n\n{}",
-                switch("Send /run later to try again, or switch the provider with /provider.")
+                switch("Send /run later to try again, or switch the model with /model.")
             ),
             ApiErrorKind::Auth => format!(
                 "⚠️ {api} did not accept the API key, the digest is not built.\n{KEPT}\n\n\
-                 Check {current}.api_key in config.toml."
+                 Check providers.{}.api_key in config.toml.",
+                current.split('/').next().unwrap_or("")
             ),
         }
     }

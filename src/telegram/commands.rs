@@ -18,7 +18,6 @@ use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::task::JoinSet;
 
 use crate::cancel::Cancel;
-use crate::config::PROVIDERS;
 use crate::db::Channel;
 use crate::run::{Runner, TRIGGER_MANUAL};
 use crate::telegram::client::is_auth_error;
@@ -33,8 +32,8 @@ Commands:
 /skip — move all channels to their newest message: older posts are skipped
 /run — run now (or deliver an undelivered digest)
 /status — version and last run: status, posts, tokens
-/provider [name] — list the model providers, or switch
-/fallback — switch to the fallback provider and run now
+/model [provider/model] — list the models, or switch
+/fallback — switch to the next fallback model and run now
 /last — send the last digest again
 /resume N — deliver an old run (a duplicate is possible)
 /abandon N — cancel an undelivered run
@@ -170,7 +169,7 @@ async fn handle(runner: &Arc<Runner>, text: &str) -> Result<String> {
     match command {
         "/help" => Ok(HELP.into()),
         "/start" => Ok(HELP.into()),
-        "/provider" => provider(runner, arg).await,
+        "/model" => model(runner, arg).await,
         "/fallback" => fallback(runner).await,
         "/list" => list(runner).await,
         "/status" => status(runner).await,
@@ -218,49 +217,47 @@ where
     action.await
 }
 
-/// `/provider` shows the model provider, `/provider name` switches it.
-async fn provider(runner: &Arc<Runner>, arg: &str) -> Result<String> {
-    let current = runner.provider().await;
+/// `/model` lists the models from the config, `/model provider/model` switches.
+async fn model(runner: &Arc<Runner>, arg: &str) -> Result<String> {
+    let current = runner.model().await;
     if arg.is_empty() {
         let cfg = &runner.cfg;
-        let mut out = String::from("Model providers:");
-        for name in PROVIDERS {
-            let mark = if name == current { "✅" } else { "•" };
-            out.push_str(&format!("\n{mark} {name} — {}", cfg.model_of(name)));
-            if name == current {
+        let mut out = String::from("Models:");
+        for key in cfg.model_keys() {
+            let mark = if key == current { "✅" } else { "•" };
+            out.push_str(&format!("\n{mark} {key}"));
+            if key == current {
                 out.push_str(" (now)");
             }
-            if cfg.fallback_provider.as_deref() == Some(name) {
-                out.push_str(" (fallback)");
+            if let Some(place) = cfg.fallback.iter().position(|m| *m == key) {
+                out.push_str(&format!(" (fallback {})", place + 1));
             }
-            if cfg.check_provider(name).is_err() {
-                out.push_str(" — no key in the config");
+            if let Err(e) = cfg.model(&key) {
+                out.push_str(&format!(" — {e:#}"));
             }
         }
-        out.push_str("\n\n/provider name — switch");
+        out.push_str("\n\n/model provider/model — switch");
         return Ok(out);
     }
-    match runner.set_provider(arg).await {
-        Ok(()) => Ok(format!("model provider: {arg} (was {current})")),
+    match runner.set_model(arg).await {
+        Ok(()) => Ok(format!("model: {arg} (was {current})")),
         Err(e) => Ok(format!("cannot switch to {arg}: {e:#}")),
     }
 }
 
-/// The owner agrees to the fallback provider after a limit notice: switch and
-/// build the digest at once.
+/// The owner agrees to the fallback model after an error notice: switch to the
+/// next model in the `fallback` list and build the digest at once.
 async fn fallback(runner: &Arc<Runner>) -> Result<String> {
-    let Some(fallback) = runner.cfg.fallback_provider.clone() else {
-        return Ok("fallback_provider is not set in the config".into());
+    let current = runner.model().await;
+    let Some(fallback) = runner.next_fallback().await else {
+        return Ok("there is no other model in fallback in the config".into());
     };
-    let current = runner.provider().await;
-    if fallback != current {
-        if let Err(e) = runner.set_provider(&fallback).await {
-            return Ok(format!("cannot switch to {fallback}: {e:#}"));
-        }
+    if let Err(e) = runner.set_model(&fallback).await {
+        return Ok(format!("cannot switch to {fallback}: {e:#}"));
     }
     let outcome = runner.trigger(TRIGGER_MANUAL).await?;
     Ok(format!(
-        "model provider: {fallback} (was {current}). /provider {current} switches back.\n\n{outcome}"
+        "model: {fallback} (was {current}). /model {current} switches back.\n\n{outcome}"
     ))
 }
 

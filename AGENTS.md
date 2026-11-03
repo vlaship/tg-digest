@@ -24,7 +24,7 @@ use it is in [README.md](README.md).
 | `src/telegram/photos.rs` | photos for topics: download by the personal account, files in `/data/photos` until the run is done |
 | `src/telegram/bot.rs` | the bot: login with the token, the chat with the owner, notifications |
 | `src/telegram/commands.rs` | commands to the bot (`/add`, `/rm`, `/run`, `/status`, …), only from the owner |
-| `src/summarize.rs` | HTTP calls to the model API (Anthropic, Gemini or OpenRouter, `provider`), map-reduce |
+| `src/summarize.rs` | HTTP calls to the model API (Anthropic, Gemini or OpenRouter, `[providers]`), map-reduce |
 | `src/digest.rs` | JSON schema of the answer, link checks, Telegram-HTML rendering, splitting |
 | `Dockerfile`, `compose.yaml` | image and run; all state is in the `/data` volume |
 
@@ -72,10 +72,10 @@ config, and no sync step. Titles and usernames are read again before every run
 list. Otherwise a renamed channel would stay in the digest forever with an old
 link.
 
-**Two Telegram clients, two jobs.** The personal account (`[telegram]`,
+**Two Telegram clients, two jobs.** The personal account (`[telegram.app]`,
 `tg.session`) only reads: it collects posts, resolves `/add`, refreshes names. A
 bot cannot do that — it reads only channels where it is an admin. The bot
-(`[bot]`, `bot.session`, logs in with the token on start) only talks: it takes
+(`[telegram.bot]`, `bot.session`, logs in with the token on start) only talks: it takes
 commands, replies, and sends digests and notifications. The bot accepts commands
 only from the owner (the personal account); everyone else is ignored (logged with
 the user id). There is one user: digests and notifications go only to the owner
@@ -90,7 +90,7 @@ takes `handle`, updates come from `pool.updates`. The session is
 <https://docs.rs/grammers-client/0.10.0/>. Do not trust memory or examples from
 search — almost all of them use the old API.
 
-**Model providers.** `provider` is `anthropic`, `gemini` or `openrouter`. Each has its own `max_input_chars` (the map-reduce limit). When it is overloaded (5xx after the retries) or its limit is used up, the bot tells the owner in plain words and, if `fallback_provider` is set, offers `/fallback`. A `/run` gets this text as the reply, not as a second message. Nothing switches by itself. The choice is kept in the `settings` table (`/provider`), so the config value is only the default.
+**Model providers.** `[providers.<provider>]` has the key and shared settings; `[providers.<provider>.models."<model id>"]` has one model, named by its full id. A provider is `anthropic`, `gemini` or `openrouter`. `model` and `fallback` name models as `provider/model id` (only the first `/` splits, OpenRouter ids have their own). A setting (`max_tokens`, `max_input_chars`, …) of a model wins over the provider one. When the model is overloaded (5xx after the retries) or its limit is used up, the bot tells the owner in plain words and offers `/fallback` (the next model in `fallback`). A `/run` gets this text as the reply, not as a second message. Nothing switches by itself. The choice is kept in the `settings` table (`/model`), so the config value is only the default.
 
 **Anthropic API.** The model id comes from the config as it is. Do not add a date
 suffix. On `claude-opus-5` thinking is on by default — do not send `thinking`,

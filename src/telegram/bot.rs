@@ -32,15 +32,15 @@ pub struct Bot {
 /// Connect the bot and log in with the token. A bot needs no code and no password,
 /// so this happens on start, without `login`.
 pub async fn connect(cfg: &Config, owner: PeerId) -> Result<(Bot, UnboundedReceiver<UpdatesLike>)> {
-    let token = cfg.bot.token.trim();
+    let token = cfg.telegram.bot.token.trim();
     if token.is_empty() {
         bail!(
-            "bot.token is not set: create a bot with @BotFather and put its token \
-             into [bot] in config.toml"
+            "telegram.bot.token is not set: create a bot with @BotFather and put its token \
+             into [telegram.bot] in config.toml"
         );
     }
 
-    let session = client::open(&cfg.bot.session_file, cfg.telegram.api_id).await?;
+    let session = client::open(&cfg.telegram.bot.session_file, cfg.telegram.app.api_id).await?;
     let authorized = session
         .client
         .is_authorized()
@@ -49,9 +49,9 @@ pub async fn connect(cfg: &Config, owner: PeerId) -> Result<(Bot, UnboundedRecei
     if !authorized {
         let me = session
             .client
-            .bot_sign_in(token, &cfg.telegram.api_hash)
+            .bot_sign_in(token, &cfg.telegram.app.api_hash)
             .await
-            .context("bot login failed: check bot.token")?;
+            .context("bot login failed: check telegram.bot.token")?;
         tracing::info!(bot = ?me.username(), "bot logged in");
     }
 

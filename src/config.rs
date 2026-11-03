@@ -6,36 +6,32 @@
 
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
+use std::collections::BTreeMap;
 use std::path::Path;
 
 #[derive(Debug, Deserialize)]
 pub struct Config {
     pub schedule: Schedule,
     pub telegram: Telegram,
-    /// Which model writes the digest: "anthropic" (default), "gemini" or "openrouter".
-    #[serde(default = "default_provider")]
-    pub provider: String,
-    /// Where to switch when the limit of the current provider is used up. The bot
-    /// asks the owner first (`/fallback`); nothing switches by itself.
+    /// Which model writes the digest, as `provider/model` from `[providers]`, for
+    /// example "anthropic/claude-haiku-5-5". `/model` in the bot changes it; this is the default.
+    pub model: String,
+    /// Where to switch when the model is overloaded or its limit is used up, in this
+    /// order. The bot asks the owner first (`/fallback`); nothing switches by itself.
     #[serde(default)]
-    pub fallback_provider: Option<String>,
+    pub fallback: Vec<String>,
+    /// Model providers with their keys and models: `[providers.<provider>]` and
+    /// `[providers.<provider>.models.<name>]`.
     #[serde(default)]
-    pub anthropic: Anthropic,
-    #[serde(default)]
-    pub gemini: Gemini,
-    #[serde(default)]
-    pub openrouter: OpenRouter,
+    pub providers: BTreeMap<String, Provider>,
     pub prompts: Prompts,
-    /// The bot you talk to: commands, replies, digests, notifications.
-    #[serde(default)]
-    pub bot: Bot,
     /// Database file. In a container it is in the `/data` volume, next to the session.
     #[serde(default = "default_db_file")]
     pub db_file: String,
 }
 
-/// The bot reads no channels (a bot cannot), it only talks to the owner and posts.
-/// Reading is done by the personal account from `[telegram]`.
+/// `[telegram.bot]`: the bot you talk to. It reads no channels (a bot cannot), it only
+/// talks to the owner and posts. Reading is done by the personal account (`[telegram.app]`).
 #[derive(Debug, Deserialize)]
 pub struct Bot {
     /// Token from @BotFather.
@@ -66,8 +62,11 @@ pub struct Schedule {
     pub run_on_start: bool,
 }
 
+/// `[telegram.app]`: the personal account and the Telegram app keys. The account
+/// only reads: it collects posts, resolves `/add`, refreshes names. The bot logs in
+/// with the same `api_id` and `api_hash`.
 #[derive(Debug, Deserialize)]
-pub struct Telegram {
+pub struct App {
     #[serde(default)]
     pub api_id: i32,
     #[serde(default)]
@@ -76,6 +75,26 @@ pub struct Telegram {
     pub phone: String,
     #[serde(default = "default_session_file")]
     pub session_file: String,
+}
+
+impl Default for App {
+    fn default() -> Self {
+        Self {
+            api_id: 0,
+            api_hash: String::new(),
+            phone: String::new(),
+            session_file: default_session_file(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct Telegram {
+    #[serde(default)]
+    pub app: App,
+    /// The bot you talk to: commands, replies, digests, notifications.
+    #[serde(default)]
+    pub bot: Bot,
     /// Where the bot posts the digest: `"bot"` — the chat with the bot (`"me"` means the
     /// same, for old configs), or `"@channel"` where the bot is an admin.
     #[serde(default = "default_destination")]
@@ -103,96 +122,126 @@ pub struct Telegram {
     pub publish_retry_window_hours: i64,
 }
 
+/// The API a provider speaks. The provider name in the config says which one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderKind {
+    Anthropic,
+    /// Google Gemini API. The key is from Google AI Studio: a Gemini app
+    /// subscription (Google AI Pro / Ultra) does not give API access.
+    Gemini,
+    /// One key for many models, free ones too (ids end with `:free`). The model must
+    /// support `response_format`; without a strict JSON schema we ask for a JSON object.
+    OpenRouter,
+}
+
+/// All model providers the service knows, as they are written in the config.
+pub const PROVIDERS: [&str; 3] = ["anthropic", "gemini", "openrouter"];
+
+impl ProviderKind {
+    fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "anthropic" => Some(Self::Anthropic),
+            "gemini" => Some(Self::Gemini),
+            "openrouter" => Some(Self::OpenRouter),
+            _ => None,
+        }
+    }
+
+    /// For logs and messages to the owner.
+    pub fn api_name(self) -> &'static str {
+        match self {
+            Self::Anthropic => "Anthropic",
+            Self::Gemini => "Gemini",
+            Self::OpenRouter => "OpenRouter",
+        }
+    }
+
+    fn default_api_url(self) -> &'static str {
+        match self {
+            Self::Anthropic => "https://api.anthropic.com/v1/messages",
+            // `{model}` is replaced with the model id.
+            Self::Gemini => {
+                "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+            }
+            Self::OpenRouter => "https://openrouter.ai/api/v1/chat/completions",
+        }
+    }
+
+    fn default_max_tokens(self) -> u32 {
+        match self {
+            Self::Gemini => 32000,
+            _ => 16000,
+        }
+    }
+
+    /// Many OpenRouter models have a context of 128k tokens or less.
+    fn default_max_input_chars(self) -> usize {
+        match self {
+            Self::OpenRouter => 200_000,
+            _ => 400_000,
+        }
+    }
+
+    fn key_url(self) -> &'static str {
+        match self {
+            Self::Anthropic => "https://console.anthropic.com/settings/keys",
+            Self::Gemini => "https://aistudio.google.com/apikey",
+            Self::OpenRouter => "https://openrouter.ai/keys",
+        }
+    }
+}
+
+/// One provider: its key, the settings shared by its models, and the models.
 #[derive(Debug, Deserialize)]
-pub struct Anthropic {
+pub struct Provider {
     #[serde(default)]
     pub api_key: String,
-    #[serde(default = "default_model")]
-    pub model: String,
-    #[serde(default = "default_effort")]
+    #[serde(default)]
+    pub api_url: Option<String>,
+    #[serde(flatten)]
+    pub settings: ModelSettings,
+    #[serde(default)]
+    pub models: BTreeMap<String, Model>,
+}
+
+/// One model of a provider. Settings not set here come from the provider.
+#[derive(Debug, Default, Deserialize)]
+pub struct Model {
+    /// The model id in the provider API, as it is (no date suffix is added). Not
+    /// set: the model name from the config is the id.
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(flatten)]
+    pub settings: ModelSettings,
+}
+
+/// Settings that a model can have, or take from its provider.
+#[derive(Debug, Default, Deserialize)]
+pub struct ModelSettings {
+    pub max_tokens: Option<u32>,
+    /// Above this the input is condensed in parts (map-reduce).
+    pub max_input_chars: Option<usize>,
+    pub request_timeout_secs: Option<u64>,
+    /// Anthropic only: low | medium | high | xhigh | max.
+    pub effort: Option<String>,
+    /// OpenRouter only: let the model think before it answers.
+    pub reasoning: Option<bool>,
+}
+
+/// A model with all its settings in one place: what one run uses.
+#[derive(Debug, Clone)]
+pub struct ModelSpec {
+    /// `provider/model`, as in the config and in `/model`.
+    pub key: String,
+    pub kind: ProviderKind,
+    pub api_key: String,
+    pub api_url: String,
+    pub id: String,
+    pub max_tokens: u32,
+    pub max_input_chars: usize,
+    pub request_timeout_secs: u64,
     pub effort: String,
-    #[serde(default = "default_max_tokens")]
-    pub max_tokens: u32,
-    #[serde(default = "default_api_url")]
-    pub api_url: String,
-    #[serde(default = "default_timeout_secs")]
-    pub request_timeout_secs: u64,
-    /// Above this the input is condensed in parts (map-reduce).
-    #[serde(default = "default_max_input_chars")]
-    pub max_input_chars: usize,
-}
-
-impl Default for Anthropic {
-    fn default() -> Self {
-        Self {
-            api_key: String::new(),
-            model: default_model(),
-            effort: default_effort(),
-            max_tokens: default_max_tokens(),
-            api_url: default_api_url(),
-            request_timeout_secs: default_timeout_secs(),
-            max_input_chars: default_max_input_chars(),
-        }
-    }
-}
-
-/// Google Gemini API. The key is from Google AI Studio: a Gemini app
-/// subscription (Google AI Pro / Ultra) does not give API access.
-#[derive(Debug, Deserialize)]
-#[serde(default)]
-pub struct Gemini {
-    pub api_key: String,
-    pub model: String,
-    pub max_tokens: u32,
-    /// `{model}` is replaced with the model id.
-    pub api_url: String,
-    pub request_timeout_secs: u64,
-    /// Above this the input is condensed in parts (map-reduce).
-    pub max_input_chars: usize,
-}
-
-impl Default for Gemini {
-    fn default() -> Self {
-        Self {
-            api_key: String::new(),
-            model: "gemini-2.5-flash".into(),
-            max_tokens: 32000,
-            api_url:
-                "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-                    .into(),
-            request_timeout_secs: default_timeout_secs(),
-            max_input_chars: default_max_input_chars(),
-        }
-    }
-}
-
-/// OpenRouter: one key for many models, free ones too (ids end with `:free`).
-/// The key is from https://openrouter.ai/keys. The model must support structured
-/// output (`response_format`), or OpenRouter finds no host for the request.
-#[derive(Debug, Deserialize)]
-#[serde(default)]
-pub struct OpenRouter {
-    pub api_key: String,
-    pub model: String,
-    pub max_tokens: u32,
-    pub api_url: String,
-    pub request_timeout_secs: u64,
-    /// Above this the input is condensed in parts (map-reduce). Lower than for the
-    /// other providers: many models here have a context of 128k tokens or less.
-    pub max_input_chars: usize,
-}
-
-impl Default for OpenRouter {
-    fn default() -> Self {
-        Self {
-            api_key: String::new(),
-            model: String::new(),
-            max_tokens: 16000,
-            api_url: "https://openrouter.ai/api/v1/chat/completions".into(),
-            request_timeout_secs: default_timeout_secs(),
-            max_input_chars: 200_000,
-        }
-    }
+    pub reasoning: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -222,52 +271,92 @@ impl Config {
         let mut cfg: Config =
             toml::from_str(&raw).with_context(|| format!("{} — invalid TOML", path.display()))?;
 
-        cfg.telegram.phone = normalize_phone(&cfg.telegram.phone);
+        cfg.telegram.app.phone = normalize_phone(&cfg.telegram.app.phone);
         cfg.validate()?;
         Ok(cfg)
     }
 
-    /// The model id of a provider from `PROVIDERS`.
-    pub fn model_of(&self, provider: &str) -> &str {
-        match provider {
-            "gemini" => &self.gemini.model,
-            "openrouter" => &self.openrouter.model,
-            _ => &self.anthropic.model,
+    /// A model by its `provider/model`, with the provider settings filled in. Fails
+    /// with a clear message if the model or the key is missing. Only the first `/`
+    /// splits: OpenRouter ids have their own (`openrouter/google/gemma-4-31b-it:free`).
+    pub fn model(&self, key: &str) -> Result<ModelSpec> {
+        let (provider_name, model_name) = key.split_once('/').with_context(|| {
+            format!("{key:?}: write the model as provider/model, for example anthropic/claude-haiku-5-5")
+        })?;
+        let kind = ProviderKind::from_name(provider_name).with_context(|| {
+            format!("{key:?}: unknown provider {provider_name:?}, it must be one of {PROVIDERS:?}")
+        })?;
+        let provider = self
+            .providers
+            .get(provider_name)
+            .with_context(|| format!("{key:?}: there is no [providers.{provider_name}]"))?;
+        let model = provider.models.get(model_name).with_context(|| {
+            format!("{key:?}: there is no [providers.{provider_name}.models.\"{model_name}\"]")
+        })?;
+        if provider.api_key.is_empty() {
+            bail!(
+                "providers.{provider_name}.api_key is not set (get it at {})",
+                kind.key_url()
+            );
         }
+
+        let (m, p) = (&model.settings, &provider.settings);
+        Ok(ModelSpec {
+            key: key.to_string(),
+            kind,
+            api_key: provider.api_key.clone(),
+            api_url: provider
+                .api_url
+                .clone()
+                .unwrap_or_else(|| kind.default_api_url().to_string()),
+            id: model.id.clone().unwrap_or_else(|| model_name.to_string()),
+            max_tokens: m
+                .max_tokens
+                .or(p.max_tokens)
+                .unwrap_or_else(|| kind.default_max_tokens()),
+            max_input_chars: m
+                .max_input_chars
+                .or(p.max_input_chars)
+                .unwrap_or_else(|| kind.default_max_input_chars()),
+            request_timeout_secs: m
+                .request_timeout_secs
+                .or(p.request_timeout_secs)
+                .unwrap_or(600),
+            effort: m
+                .effort
+                .clone()
+                .or_else(|| p.effort.clone())
+                .unwrap_or_else(|| "high".into()),
+            reasoning: m.reasoning.or(p.reasoning).unwrap_or(false),
+        })
     }
 
-    /// The provider name is known and its key is set.
-    pub fn check_provider(&self, name: &str) -> Result<()> {
-        match name {
-            "anthropic" if self.anthropic.api_key.is_empty() => {
-                bail!("anthropic.api_key is not set")
-            }
-            "gemini" if self.gemini.api_key.is_empty() => {
-                bail!("gemini.api_key is not set (get it at https://aistudio.google.com/apikey)")
-            }
-            "openrouter" if self.openrouter.api_key.is_empty() => {
-                bail!("openrouter.api_key is not set (get it at https://openrouter.ai/keys)")
-            }
-            "openrouter" if self.openrouter.model.is_empty() => {
-                bail!("openrouter.model is not set (see https://openrouter.ai/models)")
-            }
-            "anthropic" | "gemini" | "openrouter" => Ok(()),
-            other => bail!("must be one of {PROVIDERS:?}, not {other:?}"),
-        }
+    /// All models in the config as `provider/model`.
+    pub fn model_keys(&self) -> Vec<String> {
+        self.providers
+            .iter()
+            .flat_map(|(provider, p)| p.models.keys().map(move |m| format!("{provider}/{m}")))
+            .collect()
     }
 
     /// We catch empty required fields here, not on the first network call:
     /// otherwise the error shows up in the middle of a night run as a 401.
     fn validate(&self) -> Result<()> {
-        if self.telegram.api_id == 0 || self.telegram.api_hash.is_empty() {
-            bail!("telegram.api_id / telegram.api_hash are not set (get them at https://my.telegram.org)");
+        let app = &self.telegram.app;
+        if app.api_id == 0 || app.api_hash.is_empty() {
+            bail!("telegram.app.api_id / telegram.app.api_hash are not set (get them at https://my.telegram.org)");
         }
-        if self.telegram.phone.is_empty() {
-            bail!("telegram.phone is not set");
+        if app.phone.is_empty() {
+            bail!("telegram.app.phone is not set");
         }
-        self.check_provider(&self.provider).context("provider")?;
-        if let Some(fallback) = &self.fallback_provider {
-            self.check_provider(fallback).context("fallback_provider")?;
+        for name in self.providers.keys() {
+            if ProviderKind::from_name(name).is_none() {
+                bail!("[providers.{name}]: unknown provider, it must be one of {PROVIDERS:?}");
+            }
+        }
+        self.model(&self.model).context("model")?;
+        for key in &self.fallback {
+            self.model(key).context("fallback")?;
         }
         if self.telegram.lookback_hours <= 0 {
             bail!("telegram.lookback_hours must be greater than zero");
@@ -320,30 +409,6 @@ fn default_pause_ms() -> u64 {
 }
 fn default_publish_retry_window_hours() -> i64 {
     2
-}
-/// All model providers the service knows.
-pub const PROVIDERS: [&str; 3] = ["anthropic", "gemini", "openrouter"];
-
-fn default_provider() -> String {
-    "anthropic".into()
-}
-fn default_model() -> String {
-    "claude-opus-5".into()
-}
-fn default_effort() -> String {
-    "high".into()
-}
-fn default_max_tokens() -> u32 {
-    16000
-}
-fn default_api_url() -> String {
-    "https://api.anthropic.com/v1/messages".into()
-}
-fn default_timeout_secs() -> u64 {
-    600
-}
-fn default_max_input_chars() -> usize {
-    400_000
 }
 fn default_digest_title() -> String {
     "📰 Digest for {{date}}".into()

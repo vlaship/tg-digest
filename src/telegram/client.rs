@@ -45,7 +45,7 @@ pub struct Session {
 
 /// Connect the personal account: it reads the channels.
 pub async fn connect(cfg: &Config) -> Result<Session> {
-    open(&cfg.telegram.session_file, cfg.telegram.api_id).await
+    open(&cfg.telegram.app.session_file, cfg.telegram.app.api_id).await
 }
 
 /// Open a session file, connect to Telegram and start the background task of the
@@ -91,11 +91,11 @@ pub async fn login(client: &Client, cfg: &Config) -> Result<()> {
         return Ok(());
     }
 
-    let phone = &cfg.telegram.phone;
+    let phone = &cfg.telegram.app.phone;
     println!("Requesting a code for {phone}…");
 
     let token = client
-        .request_login_code(phone, &cfg.telegram.api_hash)
+        .request_login_code(phone, &cfg.telegram.app.api_hash)
         .await
         .context("could not request a login code")?;
 
