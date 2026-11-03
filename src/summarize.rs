@@ -252,11 +252,13 @@ impl Summarizer {
             timezone,
         );
 
-        if user_prompt.chars().count() > self.limits.input {
+        let chars = user_prompt.chars().count();
+        if chars > self.limits.input {
             return self
                 .map_reduce(
                     prompts,
                     posts,
+                    chars,
                     lookback_hours,
                     channel_count,
                     timezone,
@@ -265,7 +267,14 @@ impl Summarizer {
                 .await;
         }
 
-        self.ask(&prompts.system, &user_prompt, cancel).await
+        tracing::info!(
+            posts = posts.len(),
+            chars,
+            limit = self.limits.input,
+            "the input fits in one request"
+        );
+        self.ask("digest", &prompts.system, &user_prompt, cancel)
+            .await
     }
 
     /// The input does not fit in one request: we condense it in parts, then reduce.
@@ -273,10 +282,12 @@ impl Summarizer {
     /// This costs more than one request (N+1 calls), but the other option is to cut
     /// the tail, and we must not do that. Post links are carried through the summaries,
     /// so the final check of `sources[].url` still works.
+    #[allow(clippy::too_many_arguments)]
     async fn map_reduce(
         &self,
         prompts: &Prompts,
         posts: &[Post],
+        chars: usize,
         lookback_hours: i64,
         channel_count: usize,
         timezone: Tz,
@@ -286,6 +297,9 @@ impl Summarizer {
         let batches = digest::split_batches(posts, self.limits.batch);
         tracing::info!(
             posts = posts.len(),
+            chars,
+            limit = self.limits.input,
+            batch_limit = self.limits.batch,
             batches = batches.len(),
             "large input: condensing in parts, then reducing"
         );
@@ -309,7 +323,12 @@ impl Summarizer {
             );
 
             let summary = self
-                .ask(map_system, &prompt, cancel)
+                .ask(
+                    &format!("map {}/{}", index + 1, batches.len()),
+                    map_system,
+                    &prompt,
+                    cancel,
+                )
                 .await
                 .with_context(|| {
                     format!("could not condense part {} of {}", index + 1, batches.len())
@@ -364,7 +383,12 @@ impl Summarizer {
                     timezone,
                 );
                 let summary = self
-                    .ask(map_system, &prompt, cancel)
+                    .ask(
+                        &format!("reduce {stage}: {}/{}", index + 1, groups.len()),
+                        map_system,
+                        &prompt,
+                        cancel,
+                    )
                     .await
                     .with_context(|| {
                         format!(
@@ -396,7 +420,7 @@ impl Summarizer {
         ensure_fits(&reduce_prompt, partials.len(), self.limits)?;
 
         let mut summary = self
-            .ask(&prompts.system, &reduce_prompt, cancel)
+            .ask("final", &prompts.system, &reduce_prompt, cancel)
             .await
             .context("could not reduce the part summaries into a digest")?;
 
@@ -409,7 +433,9 @@ impl Summarizer {
     /// but the database has nothing and a retry is safe. We cannot wait for the end — with
     /// `effort = "high"` the answer takes minutes, no sensible `stop_grace_period`
     /// covers that.
-    async fn ask(&self, system: &str, user: &str, cancel: &Cancel) -> Result<Summary> {
+    /// `step` only goes to the log: which request this is (`digest`, `map 3/15`,
+    /// `reduce 1: 2/4`, `final`).
+    async fn ask(&self, step: &str, system: &str, user: &str, cancel: &Cancel) -> Result<Summary> {
         let body = self.backend.body(system, user);
 
         // A broken answer (see `Digest::defect`) is asked again once. If the second
@@ -417,6 +443,7 @@ impl Summarizer {
         let mut attempt = 1;
         loop {
             tracing::info!(
+                step,
                 api = self.backend.name(),
                 model = %self.model,
                 system_chars = system.chars().count(),
@@ -429,7 +456,11 @@ impl Summarizer {
                 _ = cancel.cancelled() => bail!("model request stopped by the shutdown signal"),
                 result = self.post_with_retries(&body) => result?,
             };
-            tracing::info!(seconds = started.elapsed().as_secs(), "the model answered");
+            tracing::info!(
+                step,
+                seconds = started.elapsed().as_secs(),
+                "the model answered"
+            );
             let summary = self.backend.parse(response)?;
             let Some(defect) = summary.digest.defect() else {
                 return Ok(summary);
