@@ -180,6 +180,8 @@ pub struct OpenRouter {
     /// Above this the input is condensed in parts (map-reduce). Lower than for the
     /// other providers: many models here have a context of 128k tokens or less.
     pub max_input_chars: usize,
+    /// Let the model think before it answers (`reasoning: {enabled: true}`).
+    pub reasoning: bool,
 }
 
 impl Default for OpenRouter {
@@ -191,6 +193,7 @@ impl Default for OpenRouter {
             api_url: "https://openrouter.ai/api/v1/chat/completions".into(),
             request_timeout_secs: default_timeout_secs(),
             max_input_chars: 200_000,
+            reasoning: false,
         }
     }
 }

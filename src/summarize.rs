@@ -145,6 +145,7 @@ enum Backend {
         api_url: String,
         model: String,
         max_tokens: u32,
+        reasoning: bool,
     },
 }
 
@@ -189,7 +190,10 @@ impl Backend {
             // `require_parameters`: OpenRouter sends the request only to hosts that
             // support `response_format`, otherwise the answer may be free text.
             Backend::OpenRouter {
-                model, max_tokens, ..
+                model,
+                max_tokens,
+                reasoning,
+                ..
             } => {
                 let (system, format) = if json_object {
                     let system = format!(
@@ -209,7 +213,7 @@ impl Backend {
                     });
                     (system.to_string(), format)
                 };
-                json!({
+                let mut body = json!({
                     "model": model,
                     "max_tokens": max_tokens,
                     "messages": [
@@ -218,7 +222,14 @@ impl Backend {
                     ],
                     "response_format": format,
                     "provider": { "require_parameters": true }
-                })
+                });
+                // The model thinks before it answers: slower and more tokens, but it
+                // often groups the news better. Not sent when off, so a model
+                // without reasoning still finds a host.
+                if *reasoning {
+                    body["reasoning"] = json!({ "enabled": true });
+                }
+                body
             }
         }
     }
@@ -280,6 +291,7 @@ impl Summarizer {
                     api_url: o.api_url.clone(),
                     model: o.model.clone(),
                     max_tokens: o.max_tokens,
+                    reasoning: o.reasoning,
                 };
                 (backend, o.request_timeout_secs, o.max_input_chars)
             }
@@ -919,6 +931,7 @@ fn parse_openrouter(response: Value) -> Result<Summary> {
         %model,
         input_tokens = usage("prompt_tokens"),
         output_tokens = usage("completion_tokens"),
+        reasoning_tokens = usage("completion_tokens_details/reasoning_tokens"),
         %finish_reason,
         topics = digest.topics.len(),
         "model answer received"

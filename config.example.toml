@@ -146,6 +146,9 @@ model      = ""
 max_tokens = 16000
 # Many models here have a context of 128k tokens or less, so the limit is lower.
 max_input_chars = 200000
+# The model thinks before it answers: slower and more tokens, but it often groups
+# the news better. The thinking counts in max_tokens, so raise it if answers get cut.
+reasoning = false
 
 # ------------------------------------------------------------------ prompts --
 # Edit them here, no rebuild needed. Placeholders in user_template:
