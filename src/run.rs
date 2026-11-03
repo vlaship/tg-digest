@@ -373,32 +373,14 @@ impl Runner {
         }
 
         let dest_label = self.cfg.telegram.destination.clone();
-        // Who gets the digest is fixed now: the first one is the main destination,
-        // the rest get copies.
         let resolved = match self.bot() {
-            Ok(bot) => publish::recipients(bot, &self.db, &dest_label).await,
+            Ok(bot) => publish::resolve_destination(bot, &dest_label).await,
             Err(e) => Err(e),
         };
-        let mut recipients = match resolved {
-            Ok(recipients) => recipients,
+        let dest = match resolved {
+            Ok(dest) => dest,
             Err(e) => return self.fail(run_id, e).await,
         };
-        // Everybody sent /stop: nothing to send, but the posts were read.
-        if recipients.is_empty() {
-            tracing::info!(
-                run = run_id,
-                "everybody turned the digest off, nothing is sent"
-            );
-            return self
-                .finish_empty(
-                    run_id,
-                    &collected,
-                    (summary.input_tokens, summary.output_tokens),
-                )
-                .await;
-        }
-        let dest = recipients.remove(0);
-        let extra_dests = recipients;
 
         let journal = self
             .with_photos(run_id, &digest, chunks, &collected.posts)
@@ -413,7 +395,6 @@ impl Runner {
                 &collected.cursors,
                 &dest_label,
                 dest,
-                &extra_dests,
                 &journal,
             )
             .await?;

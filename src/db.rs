@@ -28,63 +28,55 @@ pub const STATUS_EMPTY: &str = "empty";
 /// The run did not happen; the cursors are not applied.
 pub const STATUS_ERROR: &str = "error";
 
-/// The full schema: migrations are applied in order, the version is stored in
-/// `schema_version`. Add only to the end of the list.
-const MIGRATIONS: &[&str] = &[
-    // 1
-    "CREATE TABLE channels (
-        id          INTEGER PRIMARY KEY,
-        access_hash INTEGER NOT NULL,
-        username    TEXT,
-        title       TEXT NOT NULL,
-        enabled     INTEGER NOT NULL DEFAULT 1,
-        last_msg_id INTEGER NOT NULL DEFAULT 0,
-        last_error  TEXT,
-        added_at    TEXT NOT NULL
-    )",
-    // 2
-    "CREATE TABLE runs (
-        id                INTEGER PRIMARY KEY AUTOINCREMENT,
-        started_at        TEXT NOT NULL,
-        finished_at       TEXT,
-        status            TEXT NOT NULL,
-        trigger           TEXT NOT NULL,
-        posts             INTEGER,
-        topics            INTEGER,
-        input_tokens      INTEGER,
-        output_tokens     INTEGER,
-        error             TEXT,
-        cursors           TEXT,
-        first_send_at     TEXT,
-        dest_label        TEXT,
-        dest_peer_id      INTEGER,
-        dest_access_hash  INTEGER,
-        stale_notified_at TEXT
-    )",
-    // 3
-    "CREATE TABLE run_chunks (
-        run_id       INTEGER NOT NULL REFERENCES runs(id),
-        idx          INTEGER NOT NULL,
-        html         TEXT NOT NULL,
-        random_id    INTEGER NOT NULL,
-        delivered_at TEXT,
-        sent_msg_id  INTEGER,
-        PRIMARY KEY (run_id, idx)
-    )",
-    // 4: other recipients of the digest (JSON list of `Destination`), fixed at
-    // `summarized` time like the main destination.
-    "ALTER TABLE runs ADD COLUMN extra_dests TEXT",
-    // 5: users who turned the digest off with /stop.
-    "CREATE TABLE muted_users (user_id INTEGER PRIMARY KEY)",
-    // 6: short topics of the digest (JSON list of strings), so the next run can skip
-    // stories that were already sent.
-    "ALTER TABLE runs ADD COLUMN digest_topics TEXT",
-    // 7: how many photos a part has. The files are in the photos folder
-    // (`photos.rs`), downloaded once at `summarized` time.
-    "ALTER TABLE run_chunks ADD COLUMN photos INTEGER NOT NULL DEFAULT 0",
-    // 8: settings the owner changes with commands, like the active model provider.
-    "CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
-];
+/// The full schema. It is created on the first start; there are no migrations,
+/// so after a schema change start with a new database.
+const SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS channels (
+    id          INTEGER PRIMARY KEY,
+    access_hash INTEGER NOT NULL,
+    username    TEXT,
+    title       TEXT NOT NULL,
+    enabled     INTEGER NOT NULL DEFAULT 1,
+    last_msg_id INTEGER NOT NULL DEFAULT 0,
+    last_error  TEXT,
+    added_at    TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS runs (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    started_at        TEXT NOT NULL,
+    finished_at       TEXT,
+    status            TEXT NOT NULL,
+    trigger           TEXT NOT NULL,
+    posts             INTEGER,
+    topics            INTEGER,
+    input_tokens      INTEGER,
+    output_tokens     INTEGER,
+    error             TEXT,
+    cursors           TEXT,
+    first_send_at     TEXT,
+    dest_label        TEXT,
+    dest_peer_id      INTEGER,
+    dest_access_hash  INTEGER,
+    stale_notified_at TEXT,
+    -- short topics of the digest (JSON list of strings), so the next run can skip
+    -- stories that were already sent
+    digest_topics     TEXT
+);
+-- photos: how many photos a part has. The files are in the photos folder
+-- (`photos.rs`), downloaded once at `summarized` time.
+CREATE TABLE IF NOT EXISTS run_chunks (
+    run_id       INTEGER NOT NULL REFERENCES runs(id),
+    idx          INTEGER NOT NULL,
+    html         TEXT NOT NULL,
+    random_id    INTEGER NOT NULL,
+    delivered_at TEXT,
+    sent_msg_id  INTEGER,
+    photos       INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (run_id, idx)
+);
+-- settings the owner changes with commands, like the active model provider
+CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+";
 
 /// A channel in the database. `id` is the "bare" Telegram channel id (positive,
 /// without the `-100` prefix), as MTProto gives it.
@@ -135,8 +127,6 @@ pub struct Run {
     pub dest_peer_id: Option<i64>,
     pub dest_access_hash: Option<i64>,
     pub stale_notified_at: Option<DateTime<Utc>>,
-    /// Other users who also get the digest (`bot.allowed_users` who started the bot).
-    pub extra_dests: Vec<Destination>,
 }
 
 impl Run {
@@ -207,58 +197,11 @@ impl Db {
             .with_context(|| format!("could not connect to the database {path}"))?;
 
         let db = Self { conn };
-        db.migrate().await.context("database migration failed")?;
-        Ok(db)
-    }
-
-    async fn migrate(&self) -> Result<()> {
-        self.conn
-            .execute(
-                "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL)",
-                params![],
-            )
-            .await?;
-
-        let current: i64 = match self
-            .conn
-            .prepare("SELECT version FROM schema_version LIMIT 1")
-            .await?
-            .query_row(params![])
+        db.conn
+            .execute_batch(SCHEMA)
             .await
-        {
-            Ok(row) => row.get(0)?,
-            Err(libsql::Error::QueryReturnedNoRows) => {
-                self.conn
-                    .execute("INSERT INTO schema_version (version) VALUES (0)", params![])
-                    .await?;
-                0
-            }
-            Err(e) => return Err(e.into()),
-        };
-
-        if current as usize >= MIGRATIONS.len() {
-            return Ok(());
-        }
-
-        let tx = self.conn.transaction().await?;
-        for (index, sql) in MIGRATIONS.iter().enumerate().skip(current as usize) {
-            tx.execute(sql, params![])
-                .await
-                .with_context(|| format!("migration #{} was not applied", index + 1))?;
-        }
-        tx.execute(
-            "UPDATE schema_version SET version = ?1",
-            params![MIGRATIONS.len() as i64],
-        )
-        .await?;
-        tx.commit().await?;
-
-        tracing::info!(
-            from = current,
-            to = MIGRATIONS.len(),
-            "database schema updated"
-        );
-        Ok(())
+            .context("could not create the database schema")?;
+        Ok(db)
     }
 
     // --------------------------------------------------------------- channels
@@ -445,32 +388,6 @@ impl Db {
         }))
     }
 
-    // ------------------------------------------------------------------ users
-
-    /// `/stop` (`muted = true`) and `/start` (`muted = false`) for one user.
-    pub async fn set_muted(&self, user_id: i64, muted: bool) -> Result<()> {
-        let sql = if muted {
-            "INSERT OR IGNORE INTO muted_users (user_id) VALUES (?1)"
-        } else {
-            "DELETE FROM muted_users WHERE user_id = ?1"
-        };
-        self.conn.execute(sql, params![user_id]).await?;
-        Ok(())
-    }
-
-    /// Users who do not want the digest.
-    pub async fn muted_users(&self) -> Result<Vec<i64>> {
-        let mut rows = self
-            .conn
-            .query("SELECT user_id FROM muted_users", ())
-            .await?;
-        let mut out = Vec::new();
-        while let Some(row) = rows.next().await? {
-            out.push(row.get(0)?);
-        }
-        Ok(out)
-    }
-
     // ------------------------------------------------------------------- runs
 
     /// Short topics of a digest, saved with the run (see `last_digest_topics`).
@@ -611,15 +528,13 @@ impl Db {
         cursors: &BTreeMap<i64, i32>,
         dest_label: &str,
         dest: Destination,
-        extra_dests: &[Destination],
         chunks: &[NewChunk],
     ) -> Result<()> {
         let tx = self.conn.transaction().await?;
         tx.execute(
             "UPDATE runs
              SET status = ?2, posts = ?3, topics = ?4, input_tokens = ?5, output_tokens = ?6,
-                 cursors = ?7, dest_label = ?8, dest_peer_id = ?9, dest_access_hash = ?10,
-                 extra_dests = ?11
+                 cursors = ?7, dest_label = ?8, dest_peer_id = ?9, dest_access_hash = ?10
              WHERE id = ?1",
             params![
                 run_id,
@@ -632,7 +547,6 @@ impl Db {
                 dest_label,
                 dest.peer_id,
                 dest.access_hash,
-                serde_json::to_string(extra_dests)?,
             ],
         )
         .await?;
@@ -842,11 +756,9 @@ async fn collect_channels(mut rows: libsql::Rows) -> Result<Vec<Channel>> {
     Ok(out)
 }
 
-/// `SELECT *` on `runs` — the column order is set by migration #2, plus
-/// `extra_dests` from migration #4 at the end.
+/// `SELECT *` on `runs` — the column order is set by `SCHEMA`.
 fn row_to_run(row: &libsql::Row) -> Result<Run> {
     let cursors: Option<String> = row.get(10)?;
-    let extra_dests: Option<String> = row.get(16)?;
     Ok(Run {
         id: row.get(0)?,
         started_at: parse_time(row.get::<Option<String>>(1)?)?.unwrap_or_else(Utc::now),
@@ -869,12 +781,6 @@ fn row_to_run(row: &libsql::Row) -> Result<Run> {
         dest_peer_id: row.get(13)?,
         dest_access_hash: row.get(14)?,
         stale_notified_at: parse_time(row.get::<Option<String>>(15)?)?,
-        extra_dests: match extra_dests {
-            Some(raw) => {
-                serde_json::from_str(&raw).context("run recipients in the database are damaged")?
-            }
-            None => Vec::new(),
-        },
     })
 }
 

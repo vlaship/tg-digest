@@ -78,56 +78,6 @@ pub async fn resolve_destination(bot: &Bot, destination: &str) -> Result<Destina
     })
 }
 
-/// Everybody who gets the digest. The first one is the main destination of the
-/// delivery journal, the rest get copies.
-///
-/// For a channel this is only the channel: it already reaches everyone who follows it.
-/// For the chat with the bot: the owner, then the other allowed users — except those
-/// who sent `/stop`. The list may be empty: then nobody wants the digest.
-///
-/// The owner who did not write to the bot yet is an error, as before. Another user
-/// who never wrote to the bot cannot get messages from it, so they are skipped with a
-/// warning instead of failing the run.
-pub async fn recipients(bot: &Bot, db: &Db, destination: &str) -> Result<Vec<Destination>> {
-    if !matches!(destination, "bot" | "me") {
-        return Ok(vec![resolve_destination(bot, destination).await?]);
-    }
-
-    let muted = db.muted_users().await?;
-    let is_muted = |user: grammers_session::types::PeerId| {
-        user.bare_id().is_some_and(|id| muted.contains(&id))
-    };
-
-    let mut out = Vec::new();
-    if !is_muted(bot.owner) {
-        out.push(to_destination(bot.owner_ref().await?));
-    }
-    for user in bot.others().filter(|&u| !is_muted(u)) {
-        match bot.user_ref(user).await {
-            Ok(peer) => out.push(to_destination(peer)),
-            Err(e) => tracing::warn!(
-                user = ?user.bare_id(),
-                error = %format!("{e:#}"),
-                "allowed user does not get the digest"
-            ),
-        }
-    }
-    Ok(out)
-}
-
-fn to_destination(peer: PeerRef) -> Destination {
-    Destination {
-        peer_id: peer.id.bot_api_dialog_id_unchecked(),
-        access_hash: peer.auth.hash(),
-    }
-}
-
-/// The `random_id` of a copy for another recipient: different for each recipient, but
-/// the same on every retry, so Telegram still drops duplicates.
-fn copy_random_id(random_id: i64, peer_id: i64) -> i64 {
-    random_id ^ peer_id.wrapping_mul(0x9E37_79B9_7F4A_7C15_u64 as i64)
-}
-
 pub fn destination_ref(dest: Destination) -> Result<PeerRef> {
     let id = PeerId::from_bot_api_dialog_id(dest.peer_id)
         .ok_or_else(|| anyhow!("{} does not look like a chat id", dest.peer_id))?;
@@ -343,11 +293,6 @@ pub async fn deliver_pending(
         .destination()
         .ok_or_else(|| anyhow!("run #{} has no fixed destination", run.id))?;
     let peer = destination_ref(dest)?;
-    let extras = run
-        .extra_dests
-        .iter()
-        .map(|d| destination_ref(*d))
-        .collect::<Result<Vec<_>>>()?;
 
     db.mark_publishing(run.id).await?;
     let chunks = db.chunks(run.id).await?;
@@ -389,29 +334,10 @@ pub async fn deliver_pending(
             continue;
         }
 
-        // The main destination decides the delivery: if it fails, the run waits.
         let sent_msg_id = match send.part(peer, chunk, &photos, chunk.random_id).await? {
             Attempt::Delivered(id) => id,
             Attempt::Stop(reason) => return Ok(Some(reason)),
         };
-
-        // Copies for the other users. A failure here does not hold the digest for the
-        // owner: it is only logged. On a retry the same `random_id` keeps them unique.
-        for extra in &extras {
-            let random_id = copy_random_id(chunk.random_id, extra.id.bot_api_dialog_id_unchecked());
-            if let Attempt::Stop(reason) = send.part(*extra, chunk, &photos, random_id).await? {
-                tracing::warn!(
-                    run = run.id,
-                    part = chunk.idx + 1,
-                    user = ?extra.id.bare_id(),
-                    %reason,
-                    "copy for an allowed user not delivered"
-                );
-                if cancel.is_cancelled() {
-                    return Ok(Some("stopped by signal".into()));
-                }
-            }
-        }
 
         db.mark_delivered(run.id, chunk.idx, sent_msg_id).await?;
         tracing::info!(
@@ -419,7 +345,6 @@ pub async fn deliver_pending(
             part = chunk.idx + 1,
             of = total,
             msg_id = ?sent_msg_id,
-            copies = extras.len(),
             "part delivered"
         );
     }
