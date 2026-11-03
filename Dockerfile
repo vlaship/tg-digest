@@ -15,6 +15,12 @@ RUN mkdir src && echo "fn main() {}" > src/main.rs \
     && rm -rf src
 
 COPY src ./src
+# The version for `/status` and the start log: the build time (the same as the
+# image tag) and the git commit. CI passes both; a local build without them shows
+# "dev". They are after the dependency layer, so a new build does not rebuild the
+# dependencies.
+ARG BUILD_TIME=""
+ARG GIT_SHA=""
 # The file time must change, or cargo reuses the stub.
 RUN touch src/main.rs && cargo build --release --locked
 
