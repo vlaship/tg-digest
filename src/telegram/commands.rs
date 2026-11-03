@@ -26,13 +26,13 @@ use crate::telegram::{channels, publish};
 
 const HELP: &str = "\
 Commands:
-/add @channel | link | id — add a channel
+/add @channel | link | id … — add one or more channels
 /rm @channel | id — remove a channel
 /list — channels, cursors, errors
 /reset id — read the channel again from the lookback_hours window
 /skip — move all channels to their newest message: older posts are skipped
 /run — run now (or deliver an undelivered digest)
-/status — last run: status, posts, tokens
+/status — version and last run: status, posts, tokens
 /provider [name] — list the model providers, or switch
 /fallback — switch to the fallback provider and run now
 /last — send the last digest again
@@ -184,7 +184,7 @@ async fn handle(runner: &Arc<Runner>, text: &str) -> Result<String> {
             Err(_) => Ok("a run number is needed: /abandon 12".into()),
         },
         // Futures are lazy: the action does not start until `guarded` lets it through.
-        "/add" => guarded(runner, add(runner, arg)).await,
+        "/add" => guarded(runner, add_many(runner, arg)).await,
         "/rm" => guarded(runner, remove(runner, arg)).await,
         "/reset" => guarded(runner, reset(runner, arg)).await,
         "/skip" => guarded(runner, skip(runner)).await,
@@ -294,15 +294,16 @@ async fn list(runner: &Arc<Runner>) -> Result<String> {
 }
 
 async fn status(runner: &Arc<Runner>) -> Result<String> {
+    let version = crate::version();
     let Some(run) = runner.db.last_run().await? else {
-        return Ok("there were no runs yet".into());
+        return Ok(format!("version {version}\nthere were no runs yet"));
     };
 
     let chunks = runner.db.chunks(run.id).await?;
     let delivered = chunks.iter().filter(|c| c.delivered_at.is_some()).count();
 
     let mut out = format!(
-        "run #{} ({}): {}\nstarted {}\nfinished {}\nposts {}, topics {}\ntokens: {} / {}\nparts: {delivered} of {}\ndestination: {}",
+        "version {version}\nrun #{} ({}): {}\nstarted {}\nfinished {}\nposts {}, topics {}\ntokens: {} / {}\nparts: {delivered} of {}\ndestination: {}",
         run.id,
         run.trigger,
         run.status,
@@ -356,6 +357,27 @@ async fn status(runner: &Arc<Runner>) -> Result<String> {
 
 /// The channel list lives only in the database, so `/add` writes there directly.
 /// A channel that was removed with `/rm` comes back with a fresh cursor.
+/// `/add` with several channels separated by spaces, commas or new lines. Each one
+/// is added on its own: an error in one channel does not stop the others.
+async fn add_many(runner: &Arc<Runner>, arg: &str) -> Result<String> {
+    let items: Vec<&str> = arg
+        .split(|c: char| c.is_whitespace() || c == ',')
+        .filter(|s| !s.is_empty())
+        .collect();
+    if items.len() <= 1 {
+        return add(runner, arg.trim()).await;
+    }
+
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        out.push(match add(runner, item).await {
+            Ok(reply) => reply,
+            Err(e) => format!("{item}: error: {e:#}"),
+        });
+    }
+    Ok(out.join("\n\n"))
+}
+
 async fn add(runner: &Arc<Runner>, arg: &str) -> Result<String> {
     if arg.is_empty() {
         return Ok("a channel is needed: /add @name, /add https://t.me/+invite or /add id".into());
