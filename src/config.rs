@@ -167,8 +167,8 @@ impl Default for Gemini {
 }
 
 /// OpenRouter: one key for many models, free ones too (ids end with `:free`).
-/// The key is from https://openrouter.ai/keys. The model must support structured
-/// output (`response_format`), or OpenRouter finds no host for the request.
+/// The key is from https://openrouter.ai/keys. The model must support
+/// `response_format`; without a strict JSON schema we ask for a JSON object.
 #[derive(Debug, Deserialize)]
 #[serde(default)]
 pub struct OpenRouter {

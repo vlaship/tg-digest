@@ -7,6 +7,7 @@ use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use chrono_tz::Tz;
 use serde_json::{json, Value};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crate::cancel::Cancel;
@@ -113,7 +114,14 @@ pub struct Summarizer {
     /// Model id, only for the log.
     model: String,
     limits: Limits,
+    /// OpenRouter only: the model hosts do not support a strict JSON schema
+    /// (`structured_outputs`), so we ask for `json_object` and put the schema in the
+    /// system prompt. Found out on the first request and kept for the whole run.
+    json_object: AtomicBool,
 }
+
+/// OpenRouter says this when no host of the model supports a parameter we sent.
+const NO_ENDPOINTS: &str = "No endpoints found that can handle the requested parameters";
 
 /// Which API writes the digest. A copy of the settings without a lifetime tied to
 /// the whole Config.
@@ -149,7 +157,8 @@ impl Backend {
         }
     }
 
-    fn body(&self, system: &str, user: &str) -> Value {
+    /// `json_object`: only for OpenRouter, see `Summarizer::json_object`.
+    fn body(&self, system: &str, user: &str, json_object: bool) -> Value {
         match self {
             // thinking is on by default on claude-opus-5 — we do not pass the parameter.
             // temperature and budget_tokens return 400 on this model.
@@ -181,23 +190,36 @@ impl Backend {
             // support `response_format`, otherwise the answer may be free text.
             Backend::OpenRouter {
                 model, max_tokens, ..
-            } => json!({
-                "model": model,
-                "max_tokens": max_tokens,
-                "messages": [
-                    { "role": "system", "content": system },
-                    { "role": "user", "content": user }
-                ],
-                "response_format": {
-                    "type": "json_schema",
-                    "json_schema": {
-                        "name": "digest",
-                        "strict": true,
-                        "schema": digest::response_schema()
-                    }
-                },
-                "provider": { "require_parameters": true }
-            }),
+            } => {
+                let (system, format) = if json_object {
+                    let system = format!(
+                        "{system}\n\nAnswer with JSON only, no other text. \
+                         The JSON must match this JSON schema:\n{}",
+                        digest::response_schema()
+                    );
+                    (system, json!({ "type": "json_object" }))
+                } else {
+                    let format = json!({
+                        "type": "json_schema",
+                        "json_schema": {
+                            "name": "digest",
+                            "strict": true,
+                            "schema": digest::response_schema()
+                        }
+                    });
+                    (system.to_string(), format)
+                };
+                json!({
+                    "model": model,
+                    "max_tokens": max_tokens,
+                    "messages": [
+                        { "role": "system", "content": system },
+                        { "role": "user", "content": user }
+                    ],
+                    "response_format": format,
+                    "provider": { "require_parameters": true }
+                })
+            }
         }
     }
 
@@ -284,6 +306,7 @@ impl Summarizer {
             backend,
             model: cfg.model_of(provider).to_string(),
             limits: Limits::new(max_input_chars),
+            json_object: AtomicBool::new(false),
         })
     }
 
@@ -490,8 +513,6 @@ impl Summarizer {
     /// `step` only goes to the log: which request this is (`digest`, `map 3/15`,
     /// `reduce 1: 2/4`, `final`).
     async fn ask(&self, step: &str, system: &str, user: &str, cancel: &Cancel) -> Result<Summary> {
-        let body = self.backend.body(system, user);
-
         // A broken answer (see `Digest::defect`) is asked again once. If the second
         // one is broken too, the run fails and the cursors do not move.
         let mut attempt = 1;
@@ -505,10 +526,28 @@ impl Summarizer {
                 attempt,
                 "asking the model, this can take a few minutes"
             );
+            let json_object = self.json_object.load(Ordering::Relaxed);
+            let body = self.backend.body(system, user, json_object);
             let started = std::time::Instant::now();
-            let response = tokio::select! {
+            let result = tokio::select! {
                 _ = cancel.cancelled() => bail!("model request stopped by the shutdown signal"),
-                result = self.post_with_retries(&body) => result?,
+                result = self.post_with_retries(&body) => result,
+            };
+            let response = match result {
+                Ok(response) => response,
+                Err(e)
+                    if matches!(self.backend, Backend::OpenRouter { .. })
+                        && !json_object
+                        && format!("{e:#}").contains(NO_ENDPOINTS) =>
+                {
+                    tracing::warn!(
+                        model = %self.model,
+                        "the model does not support a strict JSON schema, asking for a JSON object"
+                    );
+                    self.json_object.store(true, Ordering::Relaxed);
+                    continue;
+                }
+                Err(e) => return Err(e),
             };
             tracing::info!(
                 step,

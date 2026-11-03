@@ -137,8 +137,9 @@ max_input_chars = 400000
 # --------------------------------------------------------------- openrouter --
 # Used when provider = "openrouter". One key for many models: https://openrouter.ai/keys
 # Free models have ids that end with ":free" (https://openrouter.ai/collections/free-models).
-# They have low daily limits and can be busy too. The model must support structured
-# output (response_format), or OpenRouter finds no host for the request.
+# They have low daily limits and can be busy too. The model must support
+# response_format. If it has no strict JSON schema (structured_outputs), the service
+# asks for a JSON object and puts the schema in the prompt.
 [openrouter]
 api_key    = "sk-or-..."
 model      = ""
