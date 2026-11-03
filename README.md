@@ -144,7 +144,7 @@ every run, so a renamed channel keeps correct links.
 
 | Command | What it does |
 |---|---|
-| `/add @channel`, `/add t.me/name`, `/add t.me/+link`, `/add id` | add the channel; only posts after adding go into the digest |
+| `/add @channel`, `/add t.me/name`, `/add t.me/+link`, `/add id` | add the channel; the digest starts from your read mark if you follow it, else only posts after adding go into it. Several channels at once: `/add @a @b @c` (spaces, commas or new lines) |
 | `/rm @channel` · `/rm id` | turn the channel off |
 | `/list` | channels: id, username, on/off, cursor, last error |
 | `/reset id` | read the channel again from the `lookback_hours` window |

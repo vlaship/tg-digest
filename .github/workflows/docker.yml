@@ -64,6 +64,8 @@ jobs:
           push: ${{ env.PUSH == 'true' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          # The commit is built into the binary: /status shows it.
+          build-args: GIT_SHA=${{ github.sha }}
           # Without these, buildx adds attestation manifests, and ghcr.io shows them
           # as extra untagged "unknown/unknown" versions: one push must give one image.
           provenance: false

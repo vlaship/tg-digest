@@ -36,8 +36,22 @@ use summarize::Summarizer;
 /// unpredictable ways, so we wait in ticks and check the clock each time.
 const TICK: Duration = Duration::from_secs(60);
 
+/// Version of this build: the crate version and, if the build had `GIT_SHA`
+/// (the Docker image gets it from CI), the short git commit.
+pub fn version() -> String {
+    let version = env!("CARGO_PKG_VERSION");
+    match option_env!("GIT_SHA").filter(|sha| !sha.is_empty()) {
+        Some(sha) => format!("{version} ({})", &sha[..sha.len().min(7)]),
+        None => version.to_string(),
+    }
+}
+
 #[derive(Parser)]
-#[command(name = "tg-digest", about = "Digest of Telegram channels with Claude")]
+#[command(
+    name = "tg-digest",
+    about = "Digest of Telegram channels with Claude",
+    version
+)]
 struct Cli {
     /// Path to the config
     #[arg(long, short, default_value = "/data/config.toml", global = true)]
@@ -246,7 +260,7 @@ async fn serve(cfg: Arc<Config>) -> Result<()> {
     // the logs say what to do (`login`).
     let listener = telegram::commands::listen(runner.clone(), bot_updates, cancel.clone());
 
-    tracing::info!(cron = %cfg.schedule.cron, tz = %cfg.schedule.timezone, "daemon started");
+    tracing::info!(version = %version(), cron = %cfg.schedule.cron, tz = %cfg.schedule.timezone, "daemon started");
 
     let schedule_loop = schedule_loop(runner, scheduler, cancel);
 

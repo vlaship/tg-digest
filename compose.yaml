@@ -1,6 +1,11 @@
 services:
   tg-digest:
-    build: .
+    # GIT_SHA puts the commit into /status. Set it for a local build if you want:
+    # GIT_SHA=$(git rev-parse HEAD) docker compose up -d --build
+    build:
+      context: .
+      args:
+        GIT_SHA: ${GIT_SHA:-}
     image: tg-digest
     restart: unless-stopped
 

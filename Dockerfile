@@ -15,6 +15,10 @@ RUN mkdir src && echo "fn main() {}" > src/main.rs \
     && rm -rf src
 
 COPY src ./src
+# The git commit for `/status` and the start log. CI passes it; a local build
+# without it shows only the crate version. It is after the dependency layer, so a
+# new commit does not rebuild the dependencies.
+ARG GIT_SHA=""
 # The file time must change, or cargo reuses the stub.
 RUN touch src/main.rs && cargo build --release --locked
 
