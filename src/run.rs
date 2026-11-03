@@ -15,6 +15,7 @@ use crate::cancel::Cancel;
 use crate::config::{Config, Prompts};
 use crate::db::{self, Db, NewChunk, Run};
 use crate::digest::{self, RenderOptions};
+use crate::models::Catalog;
 use crate::summarize::{ApiError, ApiErrorKind, Summarizer};
 use crate::telegram::bot::Bot;
 use crate::telegram::{channels, client as tg, photos, publish};
@@ -84,6 +85,8 @@ pub struct Runner {
     /// The bot: posts digests and notifications. `None` in the debug commands
     /// (`preview`, `run --dry-run`): they never send anything.
     pub bot: Option<Bot>,
+    /// The models of each provider, read from their APIs.
+    pub catalog: Catalog,
     cancel: Cancel,
     /// One lock for the run and for commands that touch cursors.
     /// It replaces a lock file: there is one process in the container.
@@ -99,6 +102,7 @@ impl Runner {
         cancel: Cancel,
     ) -> Self {
         Self {
+            catalog: Catalog::new(cfg.clone(), db.clone()),
             cfg,
             db,
             client,
@@ -125,10 +129,10 @@ impl Runner {
 
     /// The model for the next run, as `provider/model`: the one the owner chose with
     /// `/model` or `/fallback` (kept in the database), else `model` from the config.
-    /// A saved model that is no longer in the config is ignored.
+    /// A saved model whose provider is no longer in the config is ignored.
     pub async fn model(&self) -> String {
         match self.db.setting(MODEL_SETTING).await {
-            Ok(Some(key)) if self.cfg.model(&key).is_ok() => key,
+            Ok(Some(key)) if self.cfg.model_id(&key).is_ok() => key,
             Ok(_) => self.cfg.model.clone(),
             Err(e) => {
                 tracing::warn!(error = %format!("{e:#}"), "could not read the model setting");
@@ -137,9 +141,9 @@ impl Runner {
         }
     }
 
-    /// Switch the model. The model and its key are checked first.
+    /// Switch the model. The key and the provider's model list are checked first.
     pub async fn set_model(&self, key: &str) -> Result<()> {
-        self.cfg.model(key)?;
+        self.catalog.spec(key).await?;
         self.db.set_setting(MODEL_SETTING, key).await?;
         tracing::info!(model = key, "model switched");
         Ok(())
@@ -328,8 +332,9 @@ impl Runner {
         }
 
         let summarizer = match self
-            .cfg
-            .model(&self.model().await)
+            .catalog
+            .spec(&self.model().await)
+            .await
             .and_then(|model| Summarizer::new(&model))
         {
             Ok(s) => s,

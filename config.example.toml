@@ -109,11 +109,15 @@ token = ""
 session_file = "/data/bot.session"
 
 # ---------------------------------------------------------------- providers --
-# Each provider has its key and its models. The model name is its full id in the
-# provider API, as it is (no date suffix is added). `model` and `fallback` at the top
-# of this file say which one is used, as "provider/model".
+# Each provider needs only its key. `model` and `fallback` at the top of this file
+# name any model the provider has, as "provider/model id" (the full id, as it is).
+# The service reads each provider's model list from its API (once a day) and takes
+# the limits from there: the input size and the longest answer. In the bot,
+# /models <provider> shows the list and /model switches to any model in it.
 #
-# These settings can be set for a provider (all its models) or for one model:
+# A table [providers.<provider>.models."<id>"] is needed only to change a setting
+# by hand. A setting can also be set for the whole provider. The order is: the model
+# table, the provider's model list, the provider table, the defaults.
 #   max_tokens           — the longest answer, in tokens
 #   max_input_chars      — above this many characters the posts are condensed in
 #                          parts first (map-reduce): more requests, each one smaller
@@ -127,31 +131,22 @@ session_file = "/data/bot.session"
 api_key = "sk-ant-..."
 effort  = "high"
 
-[providers.anthropic.models."claude-haiku-5-5"]
-max_tokens = 16000
-
 # The key is from https://aistudio.google.com/apikey (free tier with limits).
 # A Gemini app subscription (AI Pro / Ultra) gives no API access.
 [providers.gemini]
 api_key = "..."
 
-# The context is 1M tokens; Russian text is about 2–3 characters per token.
-[providers.gemini.models."gemini-3.8-flash"]
-max_tokens      = 32000
-max_input_chars = 400000
-
 # One key for many models: https://openrouter.ai/keys
-# Free models have ids that end with ":free" (https://openrouter.ai/collections/free-models).
-# They have low daily limits and can be busy too. The model must support
-# response_format. If it has no strict JSON schema (structured_outputs), the service
-# asks for a JSON object and puts the schema in the prompt.
+# Free models have ids that end with ":free" (/models openrouter free in the bot).
+# They have low daily limits and can be busy too. Only models with response_format
+# are in the list. If a model has no strict JSON schema (structured_outputs), the
+# service asks for a JSON object and puts the schema in the prompt.
 [providers.openrouter]
 api_key = "sk-or-..."
 
+# A big answer from a free model can take minutes: wait longer.
 [providers.openrouter.models."google/gemma-4-31b-it:free"]
-max_tokens      = 16000
-max_input_chars = 400000
-reasoning       = false
+request_timeout_secs = 1200
 
 # ------------------------------------------------------------------ prompts --
 # Edit them here, no rebuild needed. Placeholders in user_template:

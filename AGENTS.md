@@ -24,6 +24,7 @@ use it is in [README.md](README.md).
 | `src/telegram/photos.rs` | photos for topics: download by the personal account, files in `/data/photos` until the run is done |
 | `src/telegram/bot.rs` | the bot: login with the token, the chat with the owner, notifications |
 | `src/telegram/commands.rs` | commands to the bot (`/add`, `/rm`, `/run`, `/status`, …), only from the owner |
+| `src/models.rs` | the model catalog: each provider's model list and limits from its API, kept in `settings` |
 | `src/summarize.rs` | HTTP calls to the model API (Anthropic, Gemini or OpenRouter, `[providers]`), map-reduce |
 | `src/digest.rs` | JSON schema of the answer, link checks, Telegram-HTML rendering, splitting |
 | `Dockerfile`, `compose.yaml` | image and run; all state is in the `/data` volume |
@@ -90,7 +91,7 @@ takes `handle`, updates come from `pool.updates`. The session is
 <https://docs.rs/grammers-client/0.10.0/>. Do not trust memory or examples from
 search — almost all of them use the old API.
 
-**Model providers.** `[providers.<provider>]` has the key and shared settings; `[providers.<provider>.models."<model id>"]` has one model, named by its full id. A provider is `anthropic`, `gemini` or `openrouter`. `model` and `fallback` name models as `provider/model id` (only the first `/` splits, OpenRouter ids have their own). A setting (`max_tokens`, `max_input_chars`, …) of a model wins over the provider one. When the model is overloaded (5xx after the retries) or its limit is used up, the bot tells the owner in plain words and offers `/fallback` (the next model in `fallback`). A `/run` gets this text as the reply, not as a second message. Nothing switches by itself. The choice is kept in the `settings` table (`/model`), so the config value is only the default.
+**Model providers.** `[providers.<provider>]` has the key and shared settings. No model id is written in the code, and models do not have to be in the config: the limits (input, output, strict JSON schema) come from the provider's model list (`models.rs`, read once a day, kept in `settings`). `[providers.<provider>.models."<model id>"]` only changes a setting by hand; the order is model table, model list, provider table, defaults. A model the provider does not have is refused at `/model`, not found as a 404 in a run. A provider is `anthropic`, `gemini` or `openrouter`. `model` and `fallback` name models as `provider/model id` (only the first `/` splits, OpenRouter ids have their own). When the model is overloaded (5xx after the retries) or its limit is used up, the bot tells the owner in plain words and offers `/fallback` (the next model in `fallback`). A `/run` gets this text as the reply, not as a second message. Nothing switches by itself. The choice is kept in the `settings` table (`/model`), so the config value is only the default.
 
 **Anthropic API.** The model id comes from the config as it is. Do not add a date
 suffix. On `claude-opus-5` thinking is on by default — do not send `thinking`,

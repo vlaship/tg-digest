@@ -32,7 +32,8 @@ Commands:
 /skip — move all channels to their newest message: older posts are skipped
 /run — run now (or deliver an undelivered digest)
 /status — version and last run: status, posts, tokens
-/model [provider/model] — list the models, or switch
+/model [provider/model] — the models from the config, or switch to any model
+/models provider [word] — the models the provider has (word: a part of the id, or free)
 /fallback — switch to the next fallback model and run now
 /last — send the last digest again
 /resume N — deliver an old run (a duplicate is possible)
@@ -170,6 +171,7 @@ async fn handle(runner: &Arc<Runner>, text: &str) -> Result<String> {
         "/help" => Ok(HELP.into()),
         "/start" => Ok(HELP.into()),
         "/model" => model(runner, arg).await,
+        "/models" => models(runner, arg).await,
         "/fallback" => fallback(runner).await,
         "/list" => list(runner).await,
         "/status" => status(runner).await,
@@ -217,7 +219,8 @@ where
     action.await
 }
 
-/// `/model` lists the models from the config, `/model provider/model` switches.
+/// `/model` lists the models from the config with their limits, `/model provider/model`
+/// switches to any model the provider has.
 async fn model(runner: &Arc<Runner>, arg: &str) -> Result<String> {
     let current = runner.model().await;
     if arg.is_empty() {
@@ -232,17 +235,82 @@ async fn model(runner: &Arc<Runner>, arg: &str) -> Result<String> {
             if let Some(place) = cfg.fallback.iter().position(|m| *m == key) {
                 out.push_str(&format!(" (fallback {})", place + 1));
             }
-            if let Err(e) = cfg.model(&key) {
-                out.push_str(&format!(" — {e:#}"));
+            match runner.catalog.spec(&key).await {
+                Ok(spec) => out.push_str(&format!(
+                    " — input {}k chars, output {}k tokens",
+                    spec.max_input_chars / 1000,
+                    spec.max_tokens / 1000
+                )),
+                Err(e) => out.push_str(&format!(" — {e:#}")),
             }
         }
-        out.push_str("\n\n/model provider/model — switch");
+        out.push_str(
+            "\n\n/model provider/model — switch (any model of the provider)\n\
+             /models provider — what the provider has",
+        );
         return Ok(out);
     }
     match runner.set_model(arg).await {
         Ok(()) => Ok(format!("model: {arg} (was {current})")),
         Err(e) => Ok(format!("cannot switch to {arg}: {e:#}")),
     }
+}
+
+/// `/models provider [word]`: the models from the provider API. The word keeps only
+/// the ids that have it; `free` keeps the free models.
+async fn models(runner: &Arc<Runner>, arg: &str) -> Result<String> {
+    let mut words = arg.split_whitespace();
+    let Some(provider) = words.next() else {
+        let names: Vec<&String> = runner.cfg.providers.keys().collect();
+        return Ok(format!(
+            "write the provider: /models {}",
+            names
+                .iter()
+                .map(|n| n.as_str())
+                .collect::<Vec<_>>()
+                .join(" | ")
+        ));
+    };
+    let filter = words.next().map(str::to_lowercase);
+    let list = runner.catalog.refresh(provider).await?;
+    let found: Vec<_> = list
+        .iter()
+        .filter(|m| match filter.as_deref() {
+            None => true,
+            Some("free") => m.free,
+            Some(word) => m.id.to_lowercase().contains(word),
+        })
+        .collect();
+    if found.is_empty() {
+        return Ok(format!(
+            "{provider}: no models found ({} in all)",
+            list.len()
+        ));
+    }
+
+    let mut out = format!("{provider}: {} models", found.len());
+    for m in found {
+        out.push_str(&format!(
+            "
+• {}",
+            m.id
+        ));
+        if let Some(tokens) = m.input_tokens {
+            out.push_str(&format!(" — {}k", tokens / 1000));
+        }
+        if m.free {
+            out.push_str(" free");
+        }
+        if m.json_schema == Some(false) {
+            out.push_str(" (no strict JSON)");
+        }
+    }
+    out.push_str(&format!(
+        "
+
+/model {provider}/<id> — switch"
+    ));
+    Ok(out)
 }
 
 /// The owner agrees to the fallback model after an error notice: switch to the
