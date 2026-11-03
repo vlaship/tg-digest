@@ -125,9 +125,6 @@ pub struct Telegram {
     pub publish_retry_window_hours: i64,
 }
 
-/// The output limit we ask for at most, even if the model allows more: a digest is
-/// never that long, and some hosts reserve the whole `max_tokens`.
-const MAX_OUTPUT_TOKENS: u64 = 32_000;
 /// Characters per token, times ten. Russian text is about 2.5–3, so 1.8 leaves room
 /// for the prompt and for text with many links.
 const CHARS_PER_TOKEN_X10: u64 = 18;
@@ -177,10 +174,14 @@ impl ProviderKind {
         }
     }
 
+    /// Also the most we ask for, even if the model allows more. Anthropic: thinking
+    /// with `effort = "high"` uses the same limit as the answer, and 16000 was cut on
+    /// 156k characters of input; only the used tokens are billed. Others: a digest is
+    /// never that long, and some OpenRouter hosts reserve the whole `max_tokens`.
     fn default_max_tokens(self) -> u32 {
         match self {
-            Self::Gemini => 32000,
-            _ => 16000,
+            Self::Anthropic => 64000,
+            _ => 32000,
         }
     }
 
@@ -343,7 +344,7 @@ impl Config {
             .or_else(|| {
                 entry?
                     .output_tokens
-                    .map(|t| t.min(MAX_OUTPUT_TOKENS) as u32)
+                    .map(|t| t.min(u64::from(kind.default_max_tokens())) as u32)
             })
             .or(p.max_tokens)
             .unwrap_or_else(|| kind.default_max_tokens());
