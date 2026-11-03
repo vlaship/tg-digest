@@ -31,6 +31,7 @@ Commands:
 /reset id — read the channel again from the lookback_hours window
 /skip — move all channels to their newest message: older posts are skipped
 /run — run now (or deliver an undelivered digest)
+/reread N — read all channels again for the last N days (1–7) and run now
 /status — version and last run: status, posts, tokens
 /model [provider/model] — the models from the config, or switch to any model
 /models provider [word] — the models the provider has (word: a part of the id, or free)
@@ -176,6 +177,7 @@ async fn handle(runner: &Arc<Runner>, text: &str) -> Result<String> {
         "/list" => list(runner).await,
         "/status" => status(runner).await,
         "/run" => Ok(runner.trigger(TRIGGER_MANUAL).await?.to_string()),
+        "/reread" => reread(runner, arg).await,
         "/resume" => match arg.parse::<i64>() {
             Ok(id) => Ok(runner.resume(id).await?.to_string()),
             Err(_) => Ok("a run number is needed: /resume 12".into()),
@@ -578,6 +580,30 @@ async fn reset(runner: &Arc<Runner>, arg: &str) -> Result<String> {
     ))
 }
 
+/// `/reread N`: all channels again for the last N days, then a run at once. Takes
+/// `2`, `-2`, `2d` or `-2day`.
+async fn reread(runner: &Arc<Runner>, arg: &str) -> Result<String> {
+    let digits: String = arg.chars().filter(char::is_ascii_digit).collect();
+    let days = match digits.parse::<i64>() {
+        Ok(days) if (1..=7).contains(&days) => days,
+        _ => return Ok("write the number of days, 1 to 7: /reread 2".into()),
+    };
+    let prepared = guarded(runner, async {
+        let count = runner.prepare_reread(days).await?;
+        Ok(format!("{count} channels"))
+    })
+    .await?;
+    if !prepared.ends_with(" channels") {
+        // The lock is taken or there is an undelivered run: `guarded` says why.
+        return Ok(prepared);
+    }
+    let outcome = runner.trigger(TRIGGER_MANUAL).await?;
+    Ok(format!(
+        "reread {days} d, {prepared}:
+{outcome}"
+    ))
+}
+
 /// A deliberate repeat, not a recovery: the parts go to the **current**
 /// `destination` and with new `random_id`.
 async fn last(runner: &Arc<Runner>) -> Result<String> {
@@ -698,7 +724,7 @@ fn is_slow(text: &str) -> bool {
         .unwrap_or_default();
     matches!(
         command,
-        "/run" | "/resume" | "/last" | "/skip" | "/add" | "/fallback"
+        "/run" | "/reread" | "/resume" | "/last" | "/skip" | "/add" | "/fallback"
     )
 }
 

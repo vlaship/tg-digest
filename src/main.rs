@@ -115,8 +115,14 @@ async fn preview(cfg: Arc<Config>) -> Result<()> {
     runner.refresh_channels().await?;
 
     let channels = runner.db.enabled_channels().await?;
-    let collected =
-        telegram::client::collect_posts(&runner.client, &cfg, &channels, &Cancel::never()).await?;
+    let collected = telegram::client::collect_posts(
+        &runner.client,
+        &cfg,
+        &channels,
+        cfg.telegram.lookback_hours,
+        &Cancel::never(),
+    )
+    .await?;
 
     println!(
         "Channels enabled: {}, collected {} posts\n",
@@ -152,8 +158,14 @@ async fn dry_run_once(cfg: Arc<Config>) -> Result<()> {
     runner.refresh_channels().await?;
 
     let channels = runner.db.enabled_channels().await?;
-    let collected =
-        telegram::client::collect_posts(&runner.client, &cfg, &channels, &Cancel::never()).await?;
+    let collected = telegram::client::collect_posts(
+        &runner.client,
+        &cfg,
+        &channels,
+        cfg.telegram.lookback_hours,
+        &Cancel::never(),
+    )
+    .await?;
 
     if collected.posts.is_empty() {
         println!("no new posts, nothing to build the digest from");

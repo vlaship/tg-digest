@@ -26,6 +26,9 @@ pub const TRIGGER_MANUAL: &str = "manual";
 
 /// Key in the `settings` table for the model the owner chose.
 const MODEL_SETTING: &str = "model";
+/// Key in the `settings` table for a one-time window set by `/reread`, in hours.
+/// It stays until a run reads the posts (any outcome but a failure).
+const REREAD_SETTING: &str = "reread_hours";
 
 /// How a trigger ended. We reply to `/run` with the same text.
 pub enum Outcome {
@@ -182,7 +185,39 @@ impl Runner {
             return self.finish_unfinished(run).await;
         }
 
-        self.fresh_run(trigger).await
+        let outcome = self.fresh_run(trigger).await;
+        if matches!(&outcome, Ok(o) if !matches!(o, Outcome::Failed(..))) {
+            if let Err(e) = self.db.delete_setting(REREAD_SETTING).await {
+                tracing::warn!(error = %format!("{e:#}"), "could not clear the reread window");
+            }
+        }
+        outcome
+    }
+
+    /// `/reread N`: read all channels again for the last N days. The cursors go to 0,
+    /// and the next run uses a window of N days instead of `lookback_hours`. The
+    /// caller holds the lock and then starts the run.
+    pub async fn prepare_reread(&self, days: i64) -> Result<usize> {
+        let channels = self.db.enabled_channels().await?;
+        for channel in &channels {
+            self.db.reset_channel(channel.id).await?;
+        }
+        self.db
+            .set_setting(REREAD_SETTING, &(days * 24).to_string())
+            .await?;
+        tracing::info!(days, channels = channels.len(), "reread prepared");
+        Ok(channels.len())
+    }
+
+    /// The window of the next run, in hours: from `/reread`, else `lookback_hours`.
+    async fn lookback_hours(&self) -> (i64, bool) {
+        match self.db.setting(REREAD_SETTING).await {
+            Ok(Some(hours)) => match hours.parse() {
+                Ok(hours) => (hours, true),
+                Err(_) => (self.cfg.telegram.lookback_hours, false),
+            },
+            _ => (self.cfg.telegram.lookback_hours, false),
+        }
     }
 
     /// `/resume`: the owner accepts the risk of a duplicate. Delivery uses the saved
@@ -303,11 +338,19 @@ impl Runner {
             });
         }
 
-        let collected =
-            match tg::collect_posts(&self.client, &self.cfg, &channels, &self.cancel).await {
-                Ok(collected) => collected,
-                Err(e) => return self.fail(run_id, trigger, e).await,
-            };
+        let (lookback_hours, reread) = self.lookback_hours().await;
+        let collected = match tg::collect_posts(
+            &self.client,
+            &self.cfg,
+            &channels,
+            lookback_hours,
+            &self.cancel,
+        )
+        .await
+        {
+            Ok(collected) => collected,
+            Err(e) => return self.fail(run_id, trigger, e).await,
+        };
 
         // An excluded channel is a reason for a notification: we cannot silently lose
         // its posts, and its cursor does not move, so the next run reads the rest.
@@ -341,17 +384,22 @@ impl Runner {
             Err(e) => return self.fail(run_id, trigger, e).await,
         };
         // A channel often writes about yesterday's story again in a new post: tell the
-        // model what the last digest already had.
-        let previous = self.db.last_digest_topics().await.unwrap_or_else(|e| {
-            tracing::warn!(error = %format!("{e:#}"), "could not read the last digest topics");
+        // model what the last digest already had. Not on `/reread`: the owner asked for
+        // these days again, the old topics would be dropped.
+        let previous = if reread {
             Vec::new()
-        });
+        } else {
+            self.db.last_digest_topics().await.unwrap_or_else(|e| {
+                tracing::warn!(error = %format!("{e:#}"), "could not read the last digest topics");
+                Vec::new()
+            })
+        };
         let prompts = with_previous_topics(&self.cfg.prompts, &previous);
         let summary = match summarizer
             .summarize(
                 &prompts,
                 &collected.posts,
-                self.cfg.telegram.lookback_hours,
+                lookback_hours,
                 channels.len() - failed.len(),
                 self.timezone(),
                 &self.cancel,

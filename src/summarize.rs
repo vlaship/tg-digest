@@ -95,7 +95,8 @@ Rules:
 /// check and the coverage do not depend on how the owner wrote the prompt.
 const RULES: &str = "Rules for the answer:
 - In sources put only post links from the input (https://t.me/...). Do not put links to articles or sites from the post text: they are dropped.
-- Every channel with notable news in the input gets into at least one topic. Do not leave out whole channels or subjects.";
+- Every channel with notable news in the input gets into at least one topic. Do not leave out whole channels or subjects.
+- One topic is one event or story. Never put unrelated events into one topic because they share a subject (\"Smartphones\", \"Incidents\").";
 
 /// The prompts with `RULES` added to the system prompt and to the map step one.
 fn with_rules(prompts: &Prompts) -> Prompts {

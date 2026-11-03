@@ -432,6 +432,13 @@ impl Db {
         })
     }
 
+    pub async fn delete_setting(&self, key: &str) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM settings WHERE key = ?1", params![key])
+            .await?;
+        Ok(())
+    }
+
     pub async fn set_setting(&self, key: &str, value: &str) -> Result<()> {
         self.conn
             .execute(

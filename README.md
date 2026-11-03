@@ -149,6 +149,7 @@ every run, so a renamed channel keeps correct links.
 | `/reset id` | read the channel again from the `lookback_hours` window |
 | `/skip` | move all channels to their newest message: older posts are skipped |
 | `/run` | run now (or deliver an undelivered digest) |
+| `/reread N` | read all channels again for the last N days (1–7) and run now; the last digest topics are not excluded |
 | `/status` | last run: status, posts, topics, tokens, parts |
 | `/last` | send the last digest again |
 | `/model [provider/model]` | the models from the config with their limits, or switch to any model of a provider |
