@@ -15,10 +15,11 @@
 # a container restart, together with the text of its parts and their random_id.
 db_file = "/data/digest.db"
 
-# Which model writes the digest: "anthropic" ([anthropic] below) or "gemini" ([gemini]).
+# Which model writes the digest: "anthropic" ([anthropic] below), "gemini" ([gemini])
+# or "openrouter" ([openrouter]).
 provider = "anthropic"
 
-# Where to switch when the limit of `provider` is used up. The bot asks the owner
+# Where to switch when `provider` is overloaded or its limit is used up. The bot asks the owner
 # first (/fallback), nothing switches by itself. Its key must be set too.
 # fallback_provider = "gemini"
 
@@ -118,6 +119,10 @@ max_tokens = 16000
 api_url              = "https://api.anthropic.com/v1/messages"
 request_timeout_secs = 600
 
+# Above this many characters the posts are condensed in parts first (map-reduce):
+# more requests, but each one is smaller. The same setting is in every provider.
+max_input_chars = 400000
+
 # ------------------------------------------------------------------- gemini --
 # Used when provider = "gemini". The key is from https://aistudio.google.com/apikey
 # (free tier with limits). A Gemini app subscription (AI Pro / Ultra) gives no API access.
@@ -126,6 +131,20 @@ api_key    = "..."
 # Check the model list in AI Studio, ids change often.
 model      = "gemini-2.5-flash"
 max_tokens = 32000
+# The context is 1M tokens; Russian text is about 2–3 characters per token.
+max_input_chars = 400000
+
+# --------------------------------------------------------------- openrouter --
+# Used when provider = "openrouter". One key for many models: https://openrouter.ai/keys
+# Free models have ids that end with ":free" (https://openrouter.ai/collections/free-models).
+# They have low daily limits and can be busy too. The model must support structured
+# output (response_format), or OpenRouter finds no host for the request.
+[openrouter]
+api_key    = "sk-or-..."
+model      = ""
+max_tokens = 16000
+# Many models here have a context of 128k tokens or less, so the limit is lower.
+max_input_chars = 200000
 
 # ------------------------------------------------------------------ prompts --
 # Edit them here, no rebuild needed. Placeholders in user_template:
