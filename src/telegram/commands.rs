@@ -1,8 +1,8 @@
 //! Controlling the service with commands to the bot.
 //!
-//! The bot listens to updates and reacts **only** to allowed users: the owner (the
-//! personal account from `[telegram]`) and `bot.allowed_users`. Anybody can
-//! write to a bot, so everybody else is ignored.
+//! The bot listens to updates and reacts **only** to the owner (the personal
+//! account from `[telegram]`). Anybody can write to a bot, so everybody else is
+//! ignored.
 //!
 //! Channels are named by `@username` or by numeric `id`: private channels have
 //! no username, so `/list` and the `/add` reply always show the `id`.
@@ -12,7 +12,6 @@ use grammers_client::client::UpdatesConfiguration;
 use grammers_client::message::InputMessage;
 use grammers_client::peer::Peer;
 use grammers_client::update::Update;
-use grammers_session::types::PeerId;
 use grammers_session::updates::UpdatesLike;
 use std::sync::Arc;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -34,13 +33,11 @@ Commands:
 /skip — move all channels to their newest message: older posts are skipped
 /run — run now (or deliver an undelivered digest)
 /status — last run: status, posts, tokens
-/provider [name] — list the model providers, or switch (owner)
-/fallback — switch to the fallback provider and run now (owner)
+/provider [name] — list the model providers, or switch
+/fallback — switch to the fallback provider and run now
 /last — send the last digest again
 /resume N — deliver an old run (a duplicate is possible)
 /abandon N — cancel an undelivered run
-/stop — stop getting digests (commands still work)
-/start — get digests again
 /help — this help";
 
 /// Run the updates loop until the shutdown signal comes.
@@ -106,12 +103,8 @@ pub async fn listen(
         }
         // In a private chat with the bot the peer is the user who wrote.
         let user = message.peer_id();
-        if !bot.is_allowed(user) {
-            // Info, not debug: the owner finds the id here to add it to allowed_users.
-            tracing::info!(
-                user = ?user.bare_id(),
-                "message ignored: user is not in bot.allowed_users"
-            );
+        if user != bot.owner {
+            tracing::info!(user = ?user.bare_id(), "message ignored: user is not the owner");
             continue;
         }
         let text = message.text().trim().to_string();
@@ -119,7 +112,7 @@ pub async fn listen(
             continue;
         }
 
-        tracing::info!(command = %text, "command from an allowed user");
+        tracing::info!(command = %text, "command from the owner");
         let runner = runner.clone();
         let cancel = cancel.clone();
         commands.spawn(async move {
@@ -133,7 +126,7 @@ pub async fn listen(
                     tracing::warn!(error = %e, "could not send the working note");
                 }
             }
-            let reply = match handle(&runner, user, &text).await {
+            let reply = match handle(&runner, &text).await {
                 Ok(reply) => reply,
                 Err(e) if crate::telegram::client::is_fatal(&e) => return Err(e),
                 // We show a command error to the owner, we do not hide it in the log.
@@ -163,7 +156,7 @@ pub async fn listen(
     }
 }
 
-async fn handle(runner: &Arc<Runner>, user: PeerId, text: &str) -> Result<String> {
+async fn handle(runner: &Arc<Runner>, text: &str) -> Result<String> {
     let mut parts = text.splitn(2, char::is_whitespace);
     // Telegram may add the bot name: `/list@my_digest_bot`.
     let command = parts
@@ -176,10 +169,9 @@ async fn handle(runner: &Arc<Runner>, user: PeerId, text: &str) -> Result<String
 
     match command {
         "/help" => Ok(HELP.into()),
-        "/start" => subscribe(runner, user, true).await,
-        "/provider" => provider(runner, user, arg).await,
-        "/fallback" => fallback(runner, user).await,
-        "/stop" => subscribe(runner, user, false).await,
+        "/start" => Ok(HELP.into()),
+        "/provider" => provider(runner, arg).await,
+        "/fallback" => fallback(runner).await,
         "/list" => list(runner).await,
         "/status" => status(runner).await,
         "/run" => Ok(runner.trigger(TRIGGER_MANUAL).await?.to_string()),
@@ -226,11 +218,8 @@ where
     action.await
 }
 
-/// `/start` and `/stop`: turn the digest on or off for the user who wrote, the owner
-/// too. Commands and (for the owner) notifications keep working either way.
-/// `/provider` shows the model provider, `/provider name` switches it. Only the owner:
-/// the owner pays for the keys and gets the limit notices.
-async fn provider(runner: &Arc<Runner>, user: PeerId, arg: &str) -> Result<String> {
+/// `/provider` shows the model provider, `/provider name` switches it.
+async fn provider(runner: &Arc<Runner>, arg: &str) -> Result<String> {
     let current = runner.provider().await;
     if arg.is_empty() {
         let cfg = &runner.cfg;
@@ -248,11 +237,8 @@ async fn provider(runner: &Arc<Runner>, user: PeerId, arg: &str) -> Result<Strin
                 out.push_str(" — no key in the config");
             }
         }
-        out.push_str("\n\n/provider name — switch (only the owner)");
+        out.push_str("\n\n/provider name — switch");
         return Ok(out);
-    }
-    if runner.bot()?.owner != user {
-        return Ok("only the owner can switch the provider".into());
     }
     match runner.set_provider(arg).await {
         Ok(()) => Ok(format!("model provider: {arg} (was {current})")),
@@ -262,10 +248,7 @@ async fn provider(runner: &Arc<Runner>, user: PeerId, arg: &str) -> Result<Strin
 
 /// The owner agrees to the fallback provider after a limit notice: switch and
 /// build the digest at once.
-async fn fallback(runner: &Arc<Runner>, user: PeerId) -> Result<String> {
-    if runner.bot()?.owner != user {
-        return Ok("only the owner can switch the provider".into());
-    }
+async fn fallback(runner: &Arc<Runner>) -> Result<String> {
     let Some(fallback) = runner.cfg.fallback_provider.clone() else {
         return Ok("fallback_provider is not set in the config".into());
     };
@@ -279,16 +262,6 @@ async fn fallback(runner: &Arc<Runner>, user: PeerId) -> Result<String> {
     Ok(format!(
         "model provider: {fallback} (was {current}). /provider {current} switches back.\n\n{outcome}"
     ))
-}
-
-async fn subscribe(runner: &Arc<Runner>, user: PeerId, on: bool) -> Result<String> {
-    let id = user.bare_id().unwrap_or_default();
-    runner.db.set_muted(id, !on).await?;
-    Ok(if on {
-        format!("digests are on for you.\n\n{HELP}")
-    } else {
-        "digests are off for you. Send /start to turn them on again.".into()
-    })
 }
 
 async fn list(runner: &Arc<Runner>) -> Result<String> {
@@ -521,20 +494,9 @@ async fn last(runner: &Arc<Runner>) -> Result<String> {
     }
 
     let bot = runner.bot()?;
-    let recipients = publish::recipients(bot, &runner.db, &runner.cfg.telegram.destination).await?;
-    if recipients.is_empty() {
-        return Ok("everybody turned the digest off with /stop: nothing is sent".into());
-    }
-    // A failure for one recipient does not stop the others; it is only logged.
-    for dest in recipients {
-        let peer = publish::destination_ref(dest)?;
-        if let Err(e) = publish::resend(&bot.client, peer, &chunks, runner.cancellation()).await {
-            if crate::telegram::client::is_fatal(&e) {
-                return Err(e);
-            }
-            tracing::warn!(error = %format!("{e:#}"), "/last for one recipient failed");
-        }
-    }
+    let dest = publish::resolve_destination(bot, &runner.cfg.telegram.destination).await?;
+    let peer = publish::destination_ref(dest)?;
+    publish::resend(&bot.client, peer, &chunks, runner.cancellation()).await?;
 
     Ok(format!(
         "run #{} sent again to {} ({} parts)",

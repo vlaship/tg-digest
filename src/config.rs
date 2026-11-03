@@ -42,10 +42,6 @@ pub struct Bot {
     /// The bot session (SQLite). It is created on the first start, no login needed.
     #[serde(default = "default_bot_session_file")]
     pub session_file: String,
-    /// Other Telegram user ids that may give the bot commands. The owner (the account
-    /// from `[telegram]`) is always allowed and is not listed here.
-    #[serde(default)]
-    pub allowed_users: Vec<i64>,
 }
 
 impl Default for Bot {
@@ -53,7 +49,6 @@ impl Default for Bot {
         Self {
             token: String::new(),
             session_file: default_bot_session_file(),
-            allowed_users: Vec::new(),
         }
     }
 }
