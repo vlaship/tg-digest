@@ -1,10 +1,12 @@
 services:
   tg-digest:
-    # GIT_SHA puts the commit into /status. Set it for a local build if you want:
-    # GIT_SHA=$(git rev-parse HEAD) docker compose up -d --build
+    # BUILD_TIME and GIT_SHA put the version into /status; without them it is "dev".
+    # For a local build, if you want:
+    # BUILD_TIME=$(date -u +%Y%m%d-%H%M%S) GIT_SHA=$(git rev-parse HEAD) docker compose up -d --build
     build:
       context: .
       args:
+        BUILD_TIME: ${BUILD_TIME:-}
         GIT_SHA: ${GIT_SHA:-}
     image: tg-digest
     restart: unless-stopped

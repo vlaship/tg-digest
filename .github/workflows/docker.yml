@@ -46,6 +46,12 @@ jobs:
 
       # Tags: a push to main gives `latest` and a UTC build time like
       # `20261030-011220`; a push of the git tag v1.2.3 gives only `1.2.3` and `1.2`.
+      # One build time for the image tag and for the version inside the binary,
+      # so /status shows the same value as the tag.
+      - name: Build time
+        id: time
+        run: echo "value=$(date -u +%Y%m%d-%H%M%S)" >> "$GITHUB_OUTPUT"
+
       - name: Image tags
         id: meta
         uses: docker/metadata-action@v6
@@ -53,7 +59,7 @@ jobs:
           images: ghcr.io/${{ github.repository }}
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
-            type=raw,value={{date 'YYYYMMDD-HHmmss' tz='UTC'}},enable=${{ github.ref_type == 'branch' }}
+            type=raw,value=${{ steps.time.outputs.value }},enable=${{ github.ref_type == 'branch' }}
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
 
@@ -64,8 +70,10 @@ jobs:
           push: ${{ env.PUSH == 'true' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          # The commit is built into the binary: /status shows it.
-          build-args: GIT_SHA=${{ github.sha }}
+          # The build time and the commit are built into the binary: /status shows them.
+          build-args: |
+            BUILD_TIME=${{ steps.time.outputs.value }}
+            GIT_SHA=${{ github.sha }}
           # Without these, buildx adds attestation manifests, and ghcr.io shows them
           # as extra untagged "unknown/unknown" versions: one push must give one image.
           provenance: false
