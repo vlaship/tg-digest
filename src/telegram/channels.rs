@@ -196,6 +196,37 @@ pub async fn last_message_id(client: &Client, peer: ChannelPeer) -> Result<Optio
     Ok(last.map(|m| m.id()))
 }
 
+/// The read mark of the personal account in the channel: id of the last post it read.
+/// `None` if the account does not follow the channel (no dialog, or it left) or read nothing.
+pub async fn read_mark(client: &Client, peer: ChannelPeer) -> Result<Option<i32>> {
+    let request = tl::functions::messages::GetPeerDialogs {
+        peers: vec![tl::enums::InputDialogPeer::Peer(
+            tl::types::InputDialogPeer {
+                peer: tl::enums::InputPeer::Channel(tl::types::InputPeerChannel {
+                    channel_id: peer.id,
+                    access_hash: peer.access_hash,
+                }),
+            },
+        )],
+    };
+    let tl::enums::messages::PeerDialogs::Dialogs(answer) = client
+        .invoke(&request)
+        .await
+        .with_context(|| format!("could not read the dialog of channel id {}", peer.id))?;
+
+    let following = answer
+        .chats
+        .iter()
+        .any(|chat| matches!(chat, tl::enums::Chat::Channel(c) if c.id == peer.id && !c.left));
+    if !following {
+        return Ok(None);
+    }
+    Ok(answer.dialogs.iter().find_map(|dialog| match dialog {
+        tl::enums::Dialog::Dialog(d) if d.read_inbox_max_id > 0 => Some(d.read_inbox_max_id),
+        _ => None,
+    }))
+}
+
 /// Title and username of one channel by peer.
 pub async fn describe(client: &Client, peer: ChannelPeer) -> Result<(Option<String>, String)> {
     let reference = peer_ref(peer.id, peer.access_hash)?;

@@ -386,7 +386,24 @@ async fn add(runner: &Arc<Runner>, arg: &str) -> Result<String> {
         .upsert_channel(peer.id, peer.access_hash, username.as_deref(), &title)
         .await?;
 
-    // Start from the newest message: only posts after adding go into the digest.
+    // The account follows the channel: start from its read mark, so the posts it did
+    // not read yet go into the digest.
+    match channels::read_mark(&runner.client, peer).await {
+        Ok(Some(mark)) => {
+            runner.db.set_cursor(peer.id, mark).await?;
+            return Ok(format!(
+                "added: {title}, id {}. The digest starts from your read mark in Telegram \
+                 (cursor {mark}): the posts you did not read go into it",
+                peer.id
+            ));
+        }
+        Ok(None) => {}
+        Err(e) => {
+            tracing::warn!(error = %format!("{e:#}"), channel = peer.id, "could not read the read mark, the newest post is used")
+        }
+    }
+
+    // Otherwise start from the newest message: only posts after adding go into the digest.
     // If we cannot read it, the channel keeps cursor 0 (the lookback_hours window).
     match channels::last_message_id(&runner.client, peer).await {
         Ok(Some(last)) => runner.db.set_cursor(peer.id, last).await?,
