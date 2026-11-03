@@ -24,7 +24,7 @@ use it is in [README.md](README.md).
 | `src/telegram/photos.rs` | photos for topics: download by the personal account, files in `/data/photos` until the run is done |
 | `src/telegram/bot.rs` | the bot: login with the token, the chat with the owner, notifications |
 | `src/telegram/commands.rs` | commands to the bot (`/add`, `/rm`, `/run`, `/status`, …), only from the owner |
-| `src/summarize.rs` | HTTP calls to the model API (Anthropic or Gemini, `provider`), map-reduce |
+| `src/summarize.rs` | HTTP calls to the model API (Anthropic, Gemini or OpenRouter, `provider`), map-reduce |
 | `src/digest.rs` | JSON schema of the answer, link checks, Telegram-HTML rendering, splitting |
 | `Dockerfile`, `compose.yaml` | image and run; all state is in the `/data` volume |
 
@@ -90,7 +90,7 @@ takes `handle`, updates come from `pool.updates`. The session is
 <https://docs.rs/grammers-client/0.10.0/>. Do not trust memory or examples from
 search — almost all of them use the old API.
 
-**Model providers.** `provider` is `anthropic` or `gemini`. When its limit is used up, the bot tells the owner and, if `fallback_provider` is set, offers `/fallback`. Nothing switches by itself. The choice is kept in the `settings` table (`/provider`), so the config value is only the default.
+**Model providers.** `provider` is `anthropic`, `gemini` or `openrouter`. Each has its own `max_input_chars` (the map-reduce limit). When it is overloaded (5xx after the retries) or its limit is used up, the bot tells the owner in plain words and, if `fallback_provider` is set, offers `/fallback`. A `/run` gets this text as the reply, not as a second message. Nothing switches by itself. The choice is kept in the `settings` table (`/provider`), so the config value is only the default.
 
 **Anthropic API.** The model id comes from the config as it is. Do not add a date
 suffix. On `claude-opus-5` thinking is on by default — do not send `thinking`,

@@ -12,7 +12,7 @@ use std::path::Path;
 pub struct Config {
     pub schedule: Schedule,
     pub telegram: Telegram,
-    /// Which model writes the digest: "anthropic" (default) or "gemini".
+    /// Which model writes the digest: "anthropic" (default), "gemini" or "openrouter".
     #[serde(default = "default_provider")]
     pub provider: String,
     /// Where to switch when the limit of the current provider is used up. The bot
@@ -23,6 +23,8 @@ pub struct Config {
     pub anthropic: Anthropic,
     #[serde(default)]
     pub gemini: Gemini,
+    #[serde(default)]
+    pub openrouter: OpenRouter,
     pub prompts: Prompts,
     /// The bot you talk to: commands, replies, digests, notifications.
     #[serde(default)]
@@ -115,6 +117,9 @@ pub struct Anthropic {
     pub api_url: String,
     #[serde(default = "default_timeout_secs")]
     pub request_timeout_secs: u64,
+    /// Above this the input is condensed in parts (map-reduce).
+    #[serde(default = "default_max_input_chars")]
+    pub max_input_chars: usize,
 }
 
 impl Default for Anthropic {
@@ -126,6 +131,7 @@ impl Default for Anthropic {
             max_tokens: default_max_tokens(),
             api_url: default_api_url(),
             request_timeout_secs: default_timeout_secs(),
+            max_input_chars: default_max_input_chars(),
         }
     }
 }
@@ -141,6 +147,8 @@ pub struct Gemini {
     /// `{model}` is replaced with the model id.
     pub api_url: String,
     pub request_timeout_secs: u64,
+    /// Above this the input is condensed in parts (map-reduce).
+    pub max_input_chars: usize,
 }
 
 impl Default for Gemini {
@@ -153,6 +161,36 @@ impl Default for Gemini {
                 "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
                     .into(),
             request_timeout_secs: default_timeout_secs(),
+            max_input_chars: default_max_input_chars(),
+        }
+    }
+}
+
+/// OpenRouter: one key for many models, free ones too (ids end with `:free`).
+/// The key is from https://openrouter.ai/keys. The model must support structured
+/// output (`response_format`), or OpenRouter finds no host for the request.
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+pub struct OpenRouter {
+    pub api_key: String,
+    pub model: String,
+    pub max_tokens: u32,
+    pub api_url: String,
+    pub request_timeout_secs: u64,
+    /// Above this the input is condensed in parts (map-reduce). Lower than for the
+    /// other providers: many models here have a context of 128k tokens or less.
+    pub max_input_chars: usize,
+}
+
+impl Default for OpenRouter {
+    fn default() -> Self {
+        Self {
+            api_key: String::new(),
+            model: String::new(),
+            max_tokens: 16000,
+            api_url: "https://openrouter.ai/api/v1/chat/completions".into(),
+            request_timeout_secs: default_timeout_secs(),
+            max_input_chars: 200_000,
         }
     }
 }
@@ -193,6 +231,7 @@ impl Config {
     pub fn model_of(&self, provider: &str) -> &str {
         match provider {
             "gemini" => &self.gemini.model,
+            "openrouter" => &self.openrouter.model,
             _ => &self.anthropic.model,
         }
     }
@@ -206,8 +245,14 @@ impl Config {
             "gemini" if self.gemini.api_key.is_empty() => {
                 bail!("gemini.api_key is not set (get it at https://aistudio.google.com/apikey)")
             }
-            "anthropic" | "gemini" => Ok(()),
-            other => bail!("must be \"anthropic\" or \"gemini\", not {other:?}"),
+            "openrouter" if self.openrouter.api_key.is_empty() => {
+                bail!("openrouter.api_key is not set (get it at https://openrouter.ai/keys)")
+            }
+            "openrouter" if self.openrouter.model.is_empty() => {
+                bail!("openrouter.model is not set (see https://openrouter.ai/models)")
+            }
+            "anthropic" | "gemini" | "openrouter" => Ok(()),
+            other => bail!("must be one of {PROVIDERS:?}, not {other:?}"),
         }
     }
 
@@ -277,7 +322,7 @@ fn default_publish_retry_window_hours() -> i64 {
     2
 }
 /// All model providers the service knows.
-pub const PROVIDERS: [&str; 2] = ["anthropic", "gemini"];
+pub const PROVIDERS: [&str; 3] = ["anthropic", "gemini", "openrouter"];
 
 fn default_provider() -> String {
     "anthropic".into()
@@ -296,6 +341,9 @@ fn default_api_url() -> String {
 }
 fn default_timeout_secs() -> u64 {
     600
+}
+fn default_max_input_chars() -> usize {
+    400_000
 }
 fn default_digest_title() -> String {
     "📰 Digest for {{date}}".into()

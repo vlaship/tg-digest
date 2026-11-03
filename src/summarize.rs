@@ -1,4 +1,4 @@
-//! Calls to the model API: Anthropic Messages or Google Gemini (`provider`).
+//! Calls to the model API: Anthropic Messages, Google Gemini or OpenRouter (`provider`).
 //!
 //! There is no official Rust SDK, so we call HTTP directly with reqwest —
 //! this is the normal way for languages without an SDK.
@@ -18,21 +18,38 @@ const MAX_ATTEMPTS: u32 = 4;
 /// How many times we ask the model when its answer is broken (`Digest::defect`).
 const MAX_BROKEN_ANSWERS: u32 = 2;
 
-/// The API limit is used up: requests per minute or per day, or money on the account.
-/// It is a separate type, so the owner gets a clear message, not a JSON dump.
+/// A model API error the owner can act on. It is a separate type, so the bot can
+/// say in plain words what happened and what to do, not send a JSON dump.
 #[derive(Debug)]
-pub struct LimitReached {
+pub struct ApiError {
     pub api: &'static str,
+    pub kind: ApiErrorKind,
+    /// The API answer, cut short: for the log and the database.
     pub details: String,
 }
 
-impl std::fmt::Display for LimitReached {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApiErrorKind {
+    /// Requests per minute or per day, or money on the account, are used up.
+    Limit,
+    /// The server is overloaded or down (5xx), and the retries did not help.
+    Unavailable,
+    /// The key is wrong or has no access (401, 403).
+    Auth,
+}
+
+impl std::fmt::Display for ApiError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "the {} API limit is used up: {}", self.api, self.details)
+        let what = match self.kind {
+            ApiErrorKind::Limit => "limit is used up",
+            ApiErrorKind::Unavailable => "is not available",
+            ApiErrorKind::Auth => "did not accept the key",
+        };
+        write!(f, "the {} API {what}: {}", self.api, self.details)
     }
 }
 
-impl std::error::Error for LimitReached {}
+impl std::error::Error for ApiError {}
 
 /// The answer says the limit or the balance is used up.
 fn is_limit(status: reqwest::StatusCode, text: &str) -> bool {
@@ -41,15 +58,12 @@ fn is_limit(status: reqwest::StatusCode, text: &str) -> bool {
         || text.contains("credit balance is too low")
 }
 
-/// Above this size we switch to map-reduce: we condense the input in parts, then
-/// reduce the summaries into one digest. The model context is 1M tokens, so the limit
-/// has a margin — but we must never silently cut the tail, whatever the size.
-const LARGE_INPUT_CHARS: usize = 400_000;
-
-/// Budget of one part in the map step. Half of the limit: if the input is just
-/// over it, we get two similar parts, not "almost everything
-/// and a small piece".
-const MAP_BATCH_CHARS: usize = LARGE_INPUT_CHARS / 2;
+// Above `max_input_chars` of the provider we switch to map-reduce: we condense the
+// input in parts, then reduce the summaries into one digest. We must never silently
+// cut the tail, whatever the size.
+//
+// The budget of one part in the map step is half of the limit: if the input is just
+// over it, we get two similar parts, not "almost everything and a small piece".
 
 /// How many times summaries can be reduced in between before we go to the final
 /// request as they are. Every round costs money, and for normal sizes one is
@@ -70,7 +84,7 @@ Rules:
 
 /// Map-reduce limits.
 ///
-/// In production these are the constants above; they became a separate type so tests can
+/// In production they come from the provider config; they became a separate type so tests can
 /// run the same flow on short inputs. Otherwise the check "summaries are reduced
 /// in between" would cost megabytes of text and hundreds of requests to the mock.
 #[derive(Debug, Clone, Copy)]
@@ -83,11 +97,11 @@ struct Limits {
     stages: usize,
 }
 
-impl Default for Limits {
-    fn default() -> Self {
+impl Limits {
+    fn new(max_input_chars: usize) -> Self {
         Self {
-            input: LARGE_INPUT_CHARS,
-            batch: MAP_BATCH_CHARS,
+            input: max_input_chars,
+            batch: max_input_chars / 2,
             stages: MAX_REDUCE_STAGES,
         }
     }
@@ -117,6 +131,13 @@ enum Backend {
         api_url: String,
         max_tokens: u32,
     },
+    /// OpenRouter: one key for many models, the OpenAI chat format.
+    OpenRouter {
+        api_key: String,
+        api_url: String,
+        model: String,
+        max_tokens: u32,
+    },
 }
 
 impl Backend {
@@ -124,6 +145,7 @@ impl Backend {
         match self {
             Backend::Anthropic { .. } => "Anthropic",
             Backend::Gemini { .. } => "Gemini",
+            Backend::OpenRouter { .. } => "OpenRouter",
         }
     }
 
@@ -155,6 +177,27 @@ impl Backend {
                     "responseJsonSchema": digest::response_schema()
                 }
             }),
+            // `require_parameters`: OpenRouter sends the request only to hosts that
+            // support `response_format`, otherwise the answer may be free text.
+            Backend::OpenRouter {
+                model, max_tokens, ..
+            } => json!({
+                "model": model,
+                "max_tokens": max_tokens,
+                "messages": [
+                    { "role": "system", "content": system },
+                    { "role": "user", "content": user }
+                ],
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "digest",
+                        "strict": true,
+                        "schema": digest::response_schema()
+                    }
+                },
+                "provider": { "require_parameters": true }
+            }),
         }
     }
 
@@ -169,6 +212,12 @@ impl Backend {
             Backend::Gemini {
                 api_key, api_url, ..
             } => http.post(api_url).header("x-goog-api-key", api_key),
+            Backend::OpenRouter {
+                api_key, api_url, ..
+            } => http
+                .post(api_url)
+                .bearer_auth(api_key)
+                .header("X-Title", "tg-digest"),
         }
     }
 
@@ -176,6 +225,7 @@ impl Backend {
         match self {
             Backend::Anthropic { .. } => parse_summary(response),
             Backend::Gemini { .. } => parse_gemini(response),
+            Backend::OpenRouter { .. } => parse_openrouter(response),
         }
     }
 }
@@ -191,24 +241,37 @@ pub struct Summary {
 
 impl Summarizer {
     pub fn new(cfg: &Config, provider: &str) -> Result<Self> {
-        let (backend, timeout) = if provider == "gemini" {
-            let g = &cfg.gemini;
-            let backend = Backend::Gemini {
-                api_key: g.api_key.clone(),
-                api_url: g.api_url.replace("{model}", &g.model),
-                max_tokens: g.max_tokens,
-            };
-            (backend, g.request_timeout_secs)
-        } else {
-            let a = &cfg.anthropic;
-            let backend = Backend::Anthropic {
-                api_key: a.api_key.clone(),
-                api_url: a.api_url.clone(),
-                model: a.model.clone(),
-                effort: a.effort.clone(),
-                max_tokens: a.max_tokens,
-            };
-            (backend, a.request_timeout_secs)
+        let (backend, timeout, max_input_chars) = match provider {
+            "gemini" => {
+                let g = &cfg.gemini;
+                let backend = Backend::Gemini {
+                    api_key: g.api_key.clone(),
+                    api_url: g.api_url.replace("{model}", &g.model),
+                    max_tokens: g.max_tokens,
+                };
+                (backend, g.request_timeout_secs, g.max_input_chars)
+            }
+            "openrouter" => {
+                let o = &cfg.openrouter;
+                let backend = Backend::OpenRouter {
+                    api_key: o.api_key.clone(),
+                    api_url: o.api_url.clone(),
+                    model: o.model.clone(),
+                    max_tokens: o.max_tokens,
+                };
+                (backend, o.request_timeout_secs, o.max_input_chars)
+            }
+            _ => {
+                let a = &cfg.anthropic;
+                let backend = Backend::Anthropic {
+                    api_key: a.api_key.clone(),
+                    api_url: a.api_url.clone(),
+                    model: a.model.clone(),
+                    effort: a.effort.clone(),
+                    max_tokens: a.max_tokens,
+                };
+                (backend, a.request_timeout_secs, a.max_input_chars)
+            }
         };
 
         let http = reqwest::Client::builder()
@@ -216,16 +279,11 @@ impl Summarizer {
             .build()
             .context("could not create the HTTP client")?;
 
-        let model = if provider == "gemini" {
-            cfg.gemini.model.clone()
-        } else {
-            cfg.anthropic.model.clone()
-        };
         Ok(Self {
             http,
             backend,
-            model,
-            limits: Limits::default(),
+            model: cfg.model_of(provider).to_string(),
+            limits: Limits::new(max_input_chars),
         })
     }
 
@@ -534,9 +592,19 @@ impl Summarizer {
                 continue;
             }
 
-            if is_limit(status, &text) {
-                let details: String = text.chars().take(300).collect();
-                return Err(LimitReached { api, details }.into());
+            let kind = if is_limit(status, &text) {
+                Some(ApiErrorKind::Limit)
+            } else if status.is_server_error() {
+                Some(ApiErrorKind::Unavailable)
+            } else if matches!(status.as_u16(), 401 | 403) {
+                Some(ApiErrorKind::Auth)
+            } else {
+                None
+            };
+            if let Some(kind) = kind {
+                let short: String = text.chars().take(300).collect();
+                let details = format!("{status}: {short}");
+                return Err(ApiError { api, kind, details }.into());
             }
             bail!("the {api} API returned {status}: {text}");
         }
@@ -746,4 +814,90 @@ fn parse_gemini(response: Value) -> Result<Summary> {
         input_tokens: usage("promptTokenCount"),
         output_tokens,
     })
+}
+
+/// The OpenRouter answer, in the OpenAI chat format: text is in
+/// `choices[0].message.content`. Some upstream errors come back as HTTP 200 with an
+/// `error` object, so we check it first.
+fn parse_openrouter(response: Value) -> Result<Summary> {
+    if let Some(error) = response.get("error") {
+        let message = error
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("no message");
+        let code = error.get("code").and_then(Value::as_u64).unwrap_or(0);
+        let kind = match code {
+            429 => Some(ApiErrorKind::Limit),
+            401 | 403 => Some(ApiErrorKind::Auth),
+            500..=599 => Some(ApiErrorKind::Unavailable),
+            _ => None,
+        };
+        if let Some(kind) = kind {
+            return Err(ApiError {
+                api: "OpenRouter",
+                kind,
+                details: format!("{code}: {message}"),
+            }
+            .into());
+        }
+        bail!("OpenRouter returned an error ({code}): {message}");
+    }
+
+    let choice = response
+        .pointer("/choices/0")
+        .with_context(|| format!("the OpenRouter answer has no choices: {response}"))?;
+    let finish_reason = choice
+        .get("finish_reason")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if finish_reason == "length" {
+        bail!("the answer was cut at max_tokens — raise openrouter.max_tokens in the config");
+    }
+    if finish_reason == "content_filter" {
+        bail!("the model refused the request (finish_reason=content_filter)");
+    }
+
+    let text = choice
+        .pointer("/message/content")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if text.trim().is_empty() {
+        bail!("the OpenRouter answer has no text: {response}");
+    }
+
+    let digest: Digest = serde_json::from_str(strip_code_fence(text))
+        .with_context(|| format!("could not parse the model answer as a digest: {text}"))?;
+
+    let usage = |field: &str| {
+        response
+            .pointer(&format!("/usage/{field}"))
+            .and_then(Value::as_u64)
+    };
+
+    // OpenRouter may pick a different model for a router id like `openrouter/free`.
+    let model = response.get("model").and_then(Value::as_str).unwrap_or("");
+    tracing::info!(
+        %model,
+        input_tokens = usage("prompt_tokens"),
+        output_tokens = usage("completion_tokens"),
+        %finish_reason,
+        topics = digest.topics.len(),
+        "model answer received"
+    );
+
+    Ok(Summary {
+        digest,
+        input_tokens: usage("prompt_tokens"),
+        output_tokens: usage("completion_tokens"),
+    })
+}
+
+/// Some models wrap the JSON in a ```json … ``` block even with a schema.
+fn strip_code_fence(text: &str) -> &str {
+    let text = text.trim();
+    let Some(inner) = text.strip_prefix("```") else {
+        return text;
+    };
+    let inner = inner.strip_prefix("json").unwrap_or(inner);
+    inner.strip_suffix("```").unwrap_or(inner).trim()
 }
