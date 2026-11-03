@@ -116,9 +116,10 @@ Fill in `config.toml`:
 2. `telegram.app.phone` — the phone number of the account that follows the channels;
 3. `telegram.bot.token` — create a bot with [@BotFather](https://t.me/BotFather): send it
    `/newbot`, choose a name and a username, and copy the token it gives you;
-4. the models: `api_key` of each provider you use in `[providers.<provider>]`, the
-   models in `[providers.<provider>.models."<model id>"]`, then `model` (the main
-   one) and `fallback` (where `/fallback` goes), both as `"provider/model id"`.
+4. the models: `api_key` of each provider you use in `[providers.<provider>]`, then
+   `model` (the main one) and `fallback` (where `/fallback` goes), both as
+   `"provider/model id"`. The limits of each model come from the provider's own model
+   list; a `[providers.<provider>.models."<model id>"]` table only changes them by hand.
    Providers: `anthropic`, `gemini` (key from <https://aistudio.google.com/apikey>),
    `openrouter` (key from <https://openrouter.ai/keys>).
 
@@ -150,7 +151,8 @@ every run, so a renamed channel keeps correct links.
 | `/run` | run now (or deliver an undelivered digest) |
 | `/status` | last run: status, posts, topics, tokens, parts |
 | `/last` | send the last digest again |
-| `/model [provider/model]` | list the models from the config, or switch |
+| `/model [provider/model]` | the models from the config with their limits, or switch to any model of a provider |
+| `/models provider [word]` | the models the provider has; the word filters the ids, `free` keeps the free ones |
 | `/fallback` | switch to the next model in `fallback` and run now |
 | `/resume N` · `/abandon N` | deliver or cancel an undelivered run |
 | `/help` | list of commands |

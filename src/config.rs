@@ -9,6 +9,8 @@ use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::Path;
 
+use crate::models::Entry;
+
 #[derive(Debug, Deserialize)]
 pub struct Config {
     pub schedule: Schedule,
@@ -21,7 +23,8 @@ pub struct Config {
     #[serde(default)]
     pub fallback: Vec<String>,
     /// Model providers with their keys and models: `[providers.<provider>]` and
-    /// `[providers.<provider>.models.<name>]`.
+    /// `[providers.<provider>.models.<name>]`. A model table is needed only to change
+    /// a setting: the limits come from the provider's own model list.
     #[serde(default)]
     pub providers: BTreeMap<String, Provider>,
     pub prompts: Prompts,
@@ -122,6 +125,10 @@ pub struct Telegram {
     pub publish_retry_window_hours: i64,
 }
 
+/// Characters per token, times ten. Russian text is about 2.5–3, so 1.8 leaves room
+/// for the prompt and for text with many links.
+const CHARS_PER_TOKEN_X10: u64 = 18;
+
 /// The API a provider speaks. The provider name in the config says which one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderKind {
@@ -167,10 +174,14 @@ impl ProviderKind {
         }
     }
 
+    /// Also the most we ask for, even if the model allows more. Anthropic: thinking
+    /// with `effort = "high"` uses the same limit as the answer, and 16000 was cut on
+    /// 156k characters of input; only the used tokens are billed. Others: a digest is
+    /// never that long, and some OpenRouter hosts reserve the whole `max_tokens`.
     fn default_max_tokens(self) -> u32 {
         match self {
-            Self::Gemini => 32000,
-            _ => 16000,
+            Self::Anthropic => 64000,
+            _ => 32000,
         }
     }
 
@@ -242,6 +253,8 @@ pub struct ModelSpec {
     pub request_timeout_secs: u64,
     pub effort: String,
     pub reasoning: bool,
+    /// The model takes a strict JSON schema. When not, OpenRouter is asked for a JSON object.
+    pub json_schema: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -276,48 +289,85 @@ impl Config {
         Ok(cfg)
     }
 
-    /// A model by its `provider/model`, with the provider settings filled in. Fails
-    /// with a clear message if the model or the key is missing. Only the first `/`
-    /// splits: OpenRouter ids have their own (`openrouter/google/gemma-4-31b-it:free`).
-    pub fn model(&self, key: &str) -> Result<ModelSpec> {
-        let (provider_name, model_name) = key.split_once('/').with_context(|| {
-            format!("{key:?}: write the model as provider/model, for example anthropic/claude-haiku-5-5")
-        })?;
+    /// The provider API and its key. Fails with a clear message if the provider is
+    /// unknown, not in the config, or has no key.
+    pub fn provider_access(&self, provider_name: &str) -> Result<(ProviderKind, String)> {
         let kind = ProviderKind::from_name(provider_name).with_context(|| {
-            format!("{key:?}: unknown provider {provider_name:?}, it must be one of {PROVIDERS:?}")
+            format!("unknown provider {provider_name:?}, it must be one of {PROVIDERS:?}")
         })?;
         let provider = self
             .providers
             .get(provider_name)
-            .with_context(|| format!("{key:?}: there is no [providers.{provider_name}]"))?;
-        let model = provider.models.get(model_name).with_context(|| {
-            format!("{key:?}: there is no [providers.{provider_name}.models.\"{model_name}\"]")
-        })?;
+            .with_context(|| format!("there is no [providers.{provider_name}]"))?;
         if provider.api_key.is_empty() {
             bail!(
                 "providers.{provider_name}.api_key is not set (get it at {})",
                 kind.key_url()
             );
         }
+        Ok((kind, provider.api_key.clone()))
+    }
 
-        let (m, p) = (&model.settings, &provider.settings);
+    /// The provider and the model id in its API for `provider/model`. Only the first
+    /// `/` splits: OpenRouter ids have their own (`openrouter/google/gemma-4-31b-it:free`).
+    pub fn model_id(&self, key: &str) -> Result<(String, String)> {
+        let (provider_name, model_name) = key.split_once('/').with_context(|| {
+            format!("{key:?}: write the model as provider/model, for example anthropic/claude-haiku-5-5")
+        })?;
+        self.provider_access(provider_name)
+            .with_context(|| key.to_string())?;
+        let id = self.providers[provider_name]
+            .models
+            .get(model_name)
+            .and_then(|m| m.id.clone())
+            .unwrap_or_else(|| model_name.to_string());
+        Ok((provider_name.to_string(), id))
+    }
+
+    /// A model with all its settings. Each setting comes from the first place that
+    /// has it: the model table in the config, the provider list (`entry`, see
+    /// `models.rs`), the provider table in the config, the defaults.
+    pub fn model(&self, key: &str, entry: Option<&Entry>) -> Result<ModelSpec> {
+        let (provider_name, id) = self.model_id(key)?;
+        let (kind, api_key) = self.provider_access(&provider_name)?;
+        let provider = &self.providers[&provider_name];
+        let model_name = &key[provider_name.len() + 1..];
+        let none = ModelSettings::default();
+        let m = provider
+            .models
+            .get(model_name)
+            .map_or(&none, |m| &m.settings);
+        let p = &provider.settings;
+
+        let max_tokens = m
+            .max_tokens
+            .or_else(|| {
+                entry?
+                    .output_tokens
+                    .map(|t| t.min(u64::from(kind.default_max_tokens())) as u32)
+            })
+            .or(p.max_tokens)
+            .unwrap_or_else(|| kind.default_max_tokens());
+        let max_input_chars = m
+            .max_input_chars
+            .or_else(|| {
+                let tokens = entry?.input_tokens?.saturating_sub(u64::from(max_tokens));
+                Some((tokens * CHARS_PER_TOKEN_X10 / 10) as usize)
+            })
+            .or(p.max_input_chars)
+            .unwrap_or_else(|| kind.default_max_input_chars());
+
         Ok(ModelSpec {
             key: key.to_string(),
             kind,
-            api_key: provider.api_key.clone(),
+            api_key,
             api_url: provider
                 .api_url
                 .clone()
                 .unwrap_or_else(|| kind.default_api_url().to_string()),
-            id: model.id.clone().unwrap_or_else(|| model_name.to_string()),
-            max_tokens: m
-                .max_tokens
-                .or(p.max_tokens)
-                .unwrap_or_else(|| kind.default_max_tokens()),
-            max_input_chars: m
-                .max_input_chars
-                .or(p.max_input_chars)
-                .unwrap_or_else(|| kind.default_max_input_chars()),
+            id,
+            max_tokens,
+            max_input_chars,
             request_timeout_secs: m
                 .request_timeout_secs
                 .or(p.request_timeout_secs)
@@ -327,16 +377,30 @@ impl Config {
                 .clone()
                 .or_else(|| p.effort.clone())
                 .unwrap_or_else(|| "high".into()),
-            reasoning: m.reasoning.or(p.reasoning).unwrap_or(false),
+            // A model without reasoning would find no host with `require_parameters`.
+            reasoning: m.reasoning.or(p.reasoning).unwrap_or(false)
+                && entry.and_then(|e| e.reasoning).unwrap_or(true),
+            json_schema: entry.and_then(|e| e.json_schema).unwrap_or(true),
         })
     }
 
-    /// All models in the config as `provider/model`.
+    /// The models the config names, as `provider/model`: `model`, `fallback` and
+    /// the model tables, each once.
     pub fn model_keys(&self) -> Vec<String> {
-        self.providers
+        let tables = self
+            .providers
             .iter()
-            .flat_map(|(provider, p)| p.models.keys().map(move |m| format!("{provider}/{m}")))
-            .collect()
+            .flat_map(|(provider, p)| p.models.keys().map(move |m| format!("{provider}/{m}")));
+        let mut keys: Vec<String> = Vec::new();
+        for key in std::iter::once(self.model.clone())
+            .chain(self.fallback.iter().cloned())
+            .chain(tables)
+        {
+            if !keys.contains(&key) {
+                keys.push(key);
+            }
+        }
+        keys
     }
 
     /// We catch empty required fields here, not on the first network call:
@@ -354,9 +418,11 @@ impl Config {
                 bail!("[providers.{name}]: unknown provider, it must be one of {PROVIDERS:?}");
             }
         }
-        self.model(&self.model).context("model")?;
+        // Only the form and the key here: whether the provider has the model is
+        // checked against its list (`models.rs`).
+        self.model(&self.model, None).context("model")?;
         for key in &self.fallback {
-            self.model(key).context("fallback")?;
+            self.model(key, None).context("fallback")?;
         }
         if self.telegram.lookback_hours <= 0 {
             bail!("telegram.lookback_hours must be greater than zero");
