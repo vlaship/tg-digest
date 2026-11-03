@@ -190,9 +190,10 @@ pub async fn collect_posts(
     client: &Client,
     cfg: &Config,
     channels: &[Channel],
+    lookback_hours: i64,
     cancel: &Cancel,
 ) -> Result<Collected> {
-    let since = Utc::now() - ChronoDuration::hours(cfg.telegram.lookback_hours);
+    let since = Utc::now() - ChronoDuration::hours(lookback_hours);
     let pause = Duration::from_millis(cfg.telegram.pause_between_channels_ms);
 
     let mut collected = Collected {
