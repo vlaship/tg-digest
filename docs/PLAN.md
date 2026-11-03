@@ -649,8 +649,8 @@ CREATE TABLE run_chunks (
   gives **private channels** (item [A] from Step 8). Post link:
   `https://t.me/{username}/{id}` for public channels, `https://t.me/c/{peer_id}/{id}`
   for private ones.
-- Migrations: a `schema_version` table, migrations are `&[&str]` in the code, applied on
-  start.
+- No migrations: the schema is one `SCHEMA` in `db.rs`, created on start with
+  `CREATE TABLE IF NOT EXISTS`. After a schema change, start with a new database.
 - `[[channels]]` in the TOML is **only a seed**: with an empty table we import them and
   write it to the log, after that the truth is in the database and the folder. Say so in
   `config.example.toml`.
