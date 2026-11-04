@@ -122,7 +122,8 @@ session_file = "/data/bot.session"
 #   max_input_chars      — above this many characters the posts are condensed in
 #                          parts first (map-reduce): more requests, each one smaller
 #   request_timeout_secs — how long to wait for one answer (default 600)
-#   effort               — anthropic only: low | medium | high | xhigh | max
+#   effort               — anthropic: low | medium | high | xhigh | max;
+#                          openai: none | minimal | low | medium | high
 #   reasoning            — openrouter only: the model thinks before it answers;
 #                          slower, and the thinking counts in max_tokens
 #   sort                 — openrouter only: how to choose the host of a model:
@@ -152,6 +153,13 @@ sort    = "price"
 # A big answer from a free model can take minutes: wait longer.
 [providers.openrouter.models."google/gemma-4-31b-it:free"]
 request_timeout_secs = 1200
+
+# Paid per use, the key is from https://platform.openai.com/api-keys.
+# A ChatGPT subscription (Plus / Pro) gives no API access.
+# effort is sent as reasoning_effort (none | minimal | low | medium | high), only
+# when it is set: a model that does not think rejects it.
+# [providers.openai]
+# api_key = "sk-..."
 
 # ------------------------------------------------------------------ prompts --
 # Edit them here, no rebuild needed. Placeholders in user_template:

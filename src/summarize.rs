@@ -236,6 +236,31 @@ impl Backend {
                 }
                 body
             }
+            // The same chat format, but `max_completion_tokens`: thinking models
+            // reject `max_tokens`. The schema is strict, as OpenAI wants it: every
+            // property is required and every object has `additionalProperties: false`.
+            ProviderKind::OpenAI => {
+                let mut body = json!({
+                    "model": m.id,
+                    "max_completion_tokens": m.max_tokens,
+                    "messages": [
+                        { "role": "system", "content": system },
+                        { "role": "user", "content": user }
+                    ],
+                    "response_format": {
+                        "type": "json_schema",
+                        "json_schema": {
+                            "name": "digest",
+                            "strict": true,
+                            "schema": digest::response_schema()
+                        }
+                    }
+                });
+                if let Some(effort) = &m.effort_set {
+                    body["reasoning_effort"] = json!(effort);
+                }
+                body
+            }
         }
     }
 
@@ -253,6 +278,7 @@ impl Backend {
                 .post(&m.api_url)
                 .bearer_auth(&m.api_key)
                 .header("X-Title", "tg-digest"),
+            ProviderKind::OpenAI => http.post(&m.api_url).bearer_auth(&m.api_key),
         }
     }
 
@@ -260,7 +286,8 @@ impl Backend {
         match self.0.kind {
             ProviderKind::Anthropic => parse_summary(response),
             ProviderKind::Gemini => parse_gemini(response),
-            ProviderKind::OpenRouter => parse_openrouter(response),
+            ProviderKind::OpenRouter => parse_chat(response, "OpenRouter"),
+            ProviderKind::OpenAI => parse_chat(response, "OpenAI"),
         }
     }
 }
@@ -834,11 +861,10 @@ fn parse_gemini(response: Value) -> Result<Summary> {
     })
 }
 
-/// The OpenRouter answer, in the OpenAI chat format: text is in
-/// `choices[0].message.content`. Some upstream errors come back as HTTP 200 with an
-/// `error` object, so we check it first.
-fn parse_openrouter(response: Value) -> Result<Summary> {
-    let api = "OpenRouter";
+/// An answer in the OpenAI chat format (OpenAI and OpenRouter): text is in
+/// `choices[0].message.content`. Some OpenRouter upstream errors come back as HTTP 200
+/// with an `error` object, so we check it first.
+fn parse_chat(response: Value, api: &'static str) -> Result<Summary> {
     if let Some(error) = response.get("error") {
         let message = error
             .get("message")
@@ -874,6 +900,11 @@ fn parse_openrouter(response: Value) -> Result<Summary> {
     }
     if finish_reason == "content_filter" {
         bail!("the model refused the request (finish_reason=content_filter)");
+    }
+
+    // With a strict schema OpenAI puts a refusal here, not in `content`.
+    if let Some(refusal) = choice.pointer("/message/refusal").and_then(Value::as_str) {
+        bail!("the model refused the request: {refusal}");
     }
 
     let text = choice
