@@ -164,6 +164,7 @@ fn list_url(kind: ProviderKind) -> &'static str {
         ProviderKind::Anthropic => "https://api.anthropic.com/v1/models",
         ProviderKind::Gemini => "https://generativelanguage.googleapis.com/v1beta/models",
         ProviderKind::OpenRouter => "https://openrouter.ai/api/v1/models",
+        ProviderKind::OpenAI => "https://api.openai.com/v1/models",
     }
 }
 
@@ -193,7 +194,7 @@ async fn fetch(http: &reqwest::Client, kind: ProviderKind, api_key: &str) -> Res
                     .query(&query)
                     .header("x-goog-api-key", api_key)
             }
-            ProviderKind::OpenRouter => http.get(url).bearer_auth(api_key),
+            ProviderKind::OpenRouter | ProviderKind::OpenAI => http.get(url).bearer_auth(api_key),
         };
         let response = request.send().await?;
         let status = response.status();
@@ -221,6 +222,10 @@ async fn fetch(http: &reqwest::Client, kind: ProviderKind, api_key: &str) -> Res
             }
             ProviderKind::OpenRouter => {
                 models.extend(items(&body, "data").filter_map(openrouter_entry));
+                None
+            }
+            ProviderKind::OpenAI => {
+                models.extend(items(&body, "data").filter_map(openai_entry));
                 None
             }
         };
@@ -267,6 +272,35 @@ fn gemini_entry(m: &Value) -> Option<Entry> {
             .to_string(),
         input_tokens: m["inputTokenLimit"].as_u64(),
         output_tokens: m["outputTokenLimit"].as_u64(),
+        json_schema: None,
+        reasoning: None,
+        free: false,
+    })
+}
+
+/// The OpenAI list has only ids, no limits, and also has models that cannot write
+/// a chat answer (embeddings, speech, images): we keep the chat ones.
+fn openai_entry(m: &Value) -> Option<Entry> {
+    let id = m["id"].as_str()?;
+    let chat = id.starts_with("gpt-")
+        || id.starts_with("chatgpt-")
+        || (id.starts_with('o') && id[1..].starts_with(|c: char| c.is_ascii_digit()));
+    let other = [
+        "audio",
+        "realtime",
+        "transcribe",
+        "tts",
+        "image",
+        "search",
+        "embedding",
+    ];
+    if !chat || other.iter().any(|o| id.contains(o)) {
+        return None;
+    }
+    Some(Entry {
+        id: id.to_string(),
+        input_tokens: None,
+        output_tokens: None,
         json_schema: None,
         reasoning: None,
         free: false,

@@ -121,7 +121,8 @@ Fill in `config.toml`:
    `"provider/model id"`. The limits of each model come from the provider's own model
    list; a `[providers.<provider>.models."<model id>"]` table only changes them by hand.
    Providers: `anthropic`, `gemini` (key from <https://aistudio.google.com/apikey>),
-   `openrouter` (key from <https://openrouter.ai/keys>).
+   `openrouter` (key from <https://openrouter.ai/keys>), `openai` (key from
+   <https://platform.openai.com/api-keys>; a ChatGPT subscription gives no API access).
 
 `telegram.destination = "bot"` (the default) sends the digests to the chat with
 the bot. To post to your channel instead, set `"@your_channel"` and make the bot
