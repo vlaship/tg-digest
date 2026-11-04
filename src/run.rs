@@ -181,17 +181,34 @@ impl Runner {
 
         // The check for an unfinished run happens on EVERY trigger, not only
         // on start: otherwise a second digest would go on top of the first one.
-        if let Some(run) = self.db.unfinished_run().await? {
-            return self.finish_unfinished(run).await;
-        }
-
-        let outcome = self.fresh_run(trigger).await;
-        if matches!(&outcome, Ok(o) if !matches!(o, Outcome::Failed(..))) {
-            if let Err(e) = self.db.delete_setting(REREAD_SETTING).await {
-                tracing::warn!(error = %format!("{e:#}"), "could not clear the reread window");
+        let outcome = match self.db.unfinished_run().await? {
+            Some(run) => self.finish_unfinished(run).await,
+            None => {
+                let outcome = self.fresh_run(trigger).await;
+                if matches!(&outcome, Ok(o) if !matches!(o, Outcome::Failed(..))) {
+                    if let Err(e) = self.db.delete_setting(REREAD_SETTING).await {
+                        tracing::warn!(error = %format!("{e:#}"), "could not clear the reread window");
+                    }
+                }
+                outcome
             }
-        }
+        };
+        self.offer_run(&outcome).await;
         outcome
+    }
+
+    /// After a digest in the chat with the bot, one more message with `/run`: the
+    /// owner taps it to build the next digest at once. Not for a channel: nobody
+    /// there can send commands.
+    async fn offer_run(&self, outcome: &Result<Outcome>) {
+        let delivered = match outcome {
+            Ok(Outcome::Delivered(_)) => true,
+            Ok(Outcome::Finished { status, .. }) => status == db::STATUS_OK,
+            _ => false,
+        };
+        if delivered && matches!(self.cfg.telegram.destination.as_str(), "bot" | "me") {
+            self.notify("/run").await;
+        }
     }
 
     /// `/reread N`: read all channels again for the last N days. The cursors go to 0,
@@ -417,7 +434,6 @@ impl Runner {
             &digest,
             &RenderOptions {
                 digest_title: &self.cfg.prompts.digest_title,
-                tldr_title: &self.cfg.prompts.tldr_title,
                 timezone: self.timezone(),
                 now: Utc::now(),
             },

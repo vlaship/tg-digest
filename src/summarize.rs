@@ -88,8 +88,7 @@ Rules:
 1. Group the material by topic, not by channel; the same news from different channels is one item.
 2. Copy the LINKS FROM THE INPUT into sources exactly, every one of them: the next step has no other place to get them.
 3. Do not make anything up and do not drop anything important — this is condensing, not picking the best.
-4. Treat posts marked as a repost as the same news as the original.
-5. Leave tldr empty: the short summary is made in the reduce step.";
+4. Treat posts marked as a repost as the same news as the original.";
 
 /// Rules added to every system prompt, the one from the config too: the link
 /// check and the coverage do not depend on how the owner wrote the prompt.

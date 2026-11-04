@@ -275,8 +275,6 @@ pub struct Prompts {
     /// Digest title; `{{date}}` is the date in the time zone from `[schedule]`.
     #[serde(default = "default_digest_title")]
     pub digest_title: String,
-    #[serde(default = "default_tldr_title")]
-    pub tldr_title: String,
 }
 
 impl Config {
@@ -487,9 +485,6 @@ fn default_publish_retry_window_hours() -> i64 {
 }
 fn default_digest_title() -> String {
     "📰 Digest for {{date}}".into()
-}
-fn default_tldr_title() -> String {
-    "In short".into()
 }
 
 /// Telegram expects the number as digits: we remove dashes, spaces and brackets from
