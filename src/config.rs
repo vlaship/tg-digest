@@ -139,10 +139,13 @@ pub enum ProviderKind {
     /// One key for many models, free ones too (ids end with `:free`). The model must
     /// support `response_format`; without a strict JSON schema we ask for a JSON object.
     OpenRouter,
+    /// OpenAI API (`platform.openai.com`), paid per use. A ChatGPT subscription gives
+    /// no API access.
+    OpenAI,
 }
 
 /// All model providers the service knows, as they are written in the config.
-pub const PROVIDERS: [&str; 3] = ["anthropic", "gemini", "openrouter"];
+pub const PROVIDERS: [&str; 4] = ["anthropic", "gemini", "openrouter", "openai"];
 
 impl ProviderKind {
     fn from_name(name: &str) -> Option<Self> {
@@ -150,6 +153,7 @@ impl ProviderKind {
             "anthropic" => Some(Self::Anthropic),
             "gemini" => Some(Self::Gemini),
             "openrouter" => Some(Self::OpenRouter),
+            "openai" => Some(Self::OpenAI),
             _ => None,
         }
     }
@@ -160,6 +164,7 @@ impl ProviderKind {
             Self::Anthropic => "Anthropic",
             Self::Gemini => "Gemini",
             Self::OpenRouter => "OpenRouter",
+            Self::OpenAI => "OpenAI",
         }
     }
 
@@ -171,6 +176,7 @@ impl ProviderKind {
                 "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
             }
             Self::OpenRouter => "https://openrouter.ai/api/v1/chat/completions",
+            Self::OpenAI => "https://api.openai.com/v1/chat/completions",
         }
     }
 
@@ -198,6 +204,7 @@ impl ProviderKind {
             Self::Anthropic => "https://console.anthropic.com/settings/keys",
             Self::Gemini => "https://aistudio.google.com/apikey",
             Self::OpenRouter => "https://openrouter.ai/keys",
+            Self::OpenAI => "https://platform.openai.com/api-keys",
         }
     }
 }
@@ -233,7 +240,8 @@ pub struct ModelSettings {
     /// Above this the input is condensed in parts (map-reduce).
     pub max_input_chars: Option<usize>,
     pub request_timeout_secs: Option<u64>,
-    /// Anthropic only: low | medium | high | xhigh | max.
+    /// Anthropic: low | medium | high | xhigh | max. OpenAI: sent as `reasoning_effort`
+    /// (none | minimal | low | medium | high), only when it is set.
     pub effort: Option<String>,
     /// OpenRouter only: let the model think before it answers.
     pub reasoning: Option<bool>,
@@ -255,6 +263,9 @@ pub struct ModelSpec {
     pub max_input_chars: usize,
     pub request_timeout_secs: u64,
     pub effort: String,
+    /// `effort` as the config has it, without the default: OpenAI gets
+    /// `reasoning_effort` only when it is set, a model that does not think rejects it.
+    pub effort_set: Option<String>,
     pub reasoning: bool,
     /// OpenRouter: the model can think. Then `reasoning = false` is sent as
     /// `enabled: false`: some models think by default.
@@ -382,6 +393,7 @@ impl Config {
                 .clone()
                 .or_else(|| p.effort.clone())
                 .unwrap_or_else(|| "high".into()),
+            effort_set: m.effort.clone().or_else(|| p.effort.clone()),
             // A model without reasoning would find no host with `require_parameters`.
             reasoning: m.reasoning.or(p.reasoning).unwrap_or(false)
                 && entry.and_then(|e| e.reasoning).unwrap_or(true),
