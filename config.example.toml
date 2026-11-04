@@ -26,7 +26,7 @@ fallback = ["openrouter/google/gemma-4-31b-it:free", "anthropic/claude-haiku-5-5
 # ------------------------------------------------------------------ schedule --
 [schedule]
 # Standard 5-field cron: minute hour day month weekday
-cron = "0 9 * * *"          # every day at 09:00
+cron = "0 9 * * *"          # every day at 09:00; "0 7,13,17,21 * * *" is four times a day
 
 # IANA time zone name. The cron is calculated in it, and the date in the digest
 # title uses it. Without it "09:00" means UTC.
@@ -176,7 +176,6 @@ Rules:
 6. In sources, use only links that were really in the input.
    Do not make up URLs: the service drops unknown addresses anyway.
 7. A post marked "repost from: …" and the original post are ONE news item.
-8. tldr — the 5–10 most important points, one line each.
 """
 
 user_template = """
@@ -186,9 +185,8 @@ Collected {{post_count}} posts from {{channel_count}} channels.
 {{posts}}
 """
 
-# Titles in the posted message. {{date}} is the date in the time zone from [schedule].
+# The title of the posted digest. {{date}} is the date in the time zone from [schedule].
 digest_title = "📰 Digest for {{date}}"
-tldr_title   = "In short"
 
 # Instruction for the map step: when there are too many posts for one request,
 # they are condensed in parts, and then the parts are merged with the same system

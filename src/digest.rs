@@ -34,8 +34,6 @@ pub struct Post {
 pub struct Digest {
     #[serde(default)]
     pub topics: Vec<Topic>,
-    #[serde(default)]
-    pub tldr: Vec<String>,
 }
 
 impl Digest {
@@ -44,17 +42,10 @@ impl Digest {
         self.topics.is_empty()
     }
 
-    /// Why the answer looks broken, if it does. Sometimes the model writes the short
-    /// summary in full, but then only a few topics and a stub like "placeholder". Such
-    /// a digest must not be posted: the cursors would move, and the news would be lost.
+    /// Why the answer looks broken, if it does: a stub like "placeholder" instead of
+    /// a topic. Such a digest must not be posted: the cursors would move, and the news
+    /// would be lost.
     pub fn defect(&self) -> Option<String> {
-        if self.topics.len() < self.tldr.len() {
-            return Some(format!(
-                "{} items in the short summary, but only {} topics",
-                self.tldr.len(),
-                self.topics.len()
-            ));
-        }
         for topic in &self.topics {
             let title = topic.title.trim();
             let summary = topic.summary.trim();
@@ -92,7 +83,6 @@ pub struct Source {
 /// `America/New_York` would get tomorrow's date from UTC.
 pub struct RenderOptions<'a> {
     pub digest_title: &'a str,
-    pub tldr_title: &'a str,
     pub timezone: Tz,
     pub now: DateTime<Utc>,
 }
@@ -107,7 +97,7 @@ pub fn response_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["topics", "tldr"],
+        "required": ["topics"],
         "properties": {
             "topics": {
                 "type": "array",
@@ -132,8 +122,7 @@ pub fn response_schema() -> Value {
                         }
                     }
                 }
-            },
-            "tldr": { "type": "array", "items": { "type": "string" } }
+            }
         }
     })
 }
@@ -432,9 +421,6 @@ pub fn format_partials(parts: &[Digest]) -> String {
                 out.push_str(&format!("Sources: {}\n", links.join(", ")));
             }
         }
-        for item in &part.tldr {
-            out.push_str(&format!("\n• {item}"));
-        }
     }
     out
 }
@@ -448,8 +434,8 @@ pub fn render_html(digest: &Digest, opts: &RenderOptions) -> Vec<String> {
         .collect()
 }
 
-/// One message of the digest and the topic it belongs to (`None` for the title and
-/// "In short"): photos are added to the messages of a topic.
+/// One message of the digest and the topic it belongs to (`None` for the title):
+/// photos are added to the messages of a topic.
 pub struct Part {
     pub html: String,
     pub topic: Option<usize>,
@@ -460,8 +446,7 @@ pub fn render_parts(digest: &Digest, opts: &RenderOptions) -> Vec<Part> {
         return Vec::new();
     }
 
-    // The first message is the title with "In short", then every topic is its own
-    // message. `pack` still cuts a block that alone is longer than the limit.
+    // The first message is the title, then every topic is its own message. `pack` still cuts a block that alone is longer than the limit.
     let mut blocks: Vec<String> = Vec::new();
 
     let date = opts
@@ -474,13 +459,6 @@ pub fn render_parts(digest: &Digest, opts: &RenderOptions) -> Vec<Part> {
         escape(&opts.digest_title.replace("{{date}}", &date))
     ));
 
-    if !digest.tldr.is_empty() {
-        let mut tldr = format!("<b>{}</b>", escape(opts.tldr_title));
-        for item in &digest.tldr {
-            tldr.push_str(&format!("\n• {}", escape(item)));
-        }
-        blocks.push(tldr);
-    }
     let mut messages: Vec<Part> = pack(blocks)
         .into_iter()
         .map(|html| Part { html, topic: None })

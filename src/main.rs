@@ -191,7 +191,6 @@ async fn dry_run_once(cfg: Arc<Config>) -> Result<()> {
         &result,
         &RenderOptions {
             digest_title: &cfg.prompts.digest_title,
-            tldr_title: &cfg.prompts.tldr_title,
             timezone: runner.timezone(),
             now: Utc::now(),
         },
