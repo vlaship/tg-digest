@@ -129,6 +129,11 @@ session_file = "/data/bot.session"
 #   sort                 — openrouter only: how to choose the host of a model:
 #                          price | throughput | latency (not set: OpenRouter
 #                          balances price and uptime)
+#   ignore               — openrouter only: hosts that never get the request,
+#                          e.g. ["Relace", "OpenInference"]
+#   quantizations        — openrouter only: only hosts that run the model in one
+#                          of these forms, e.g. ["fp8", "bf16"]. The cheapest hosts
+#                          often run fp4, and it can answer a big feed with nothing
 # Providers you do not use can be left out.
 
 [providers.anthropic]
@@ -149,6 +154,8 @@ api_key = "..."
 api_key = "sk-or-..."
 # One model has many hosts, and their prices differ up to five times.
 sort    = "price"
+# The cheapest hosts run strongly compressed models (fp4). Keep them out.
+quantizations = ["fp8", "bf16", "fp16"]
 
 # A big answer from a free model can take minutes: wait longer.
 [providers.openrouter.models."google/gemma-4-31b-it:free"]
