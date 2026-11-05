@@ -248,6 +248,11 @@ pub struct ModelSettings {
     /// OpenRouter only: how to choose the host of the model: price | throughput |
     /// latency. Not set: OpenRouter balances price and uptime.
     pub sort: Option<String>,
+    /// OpenRouter only: hosts that never get the request, by name ("Relace").
+    pub ignore: Option<Vec<String>>,
+    /// OpenRouter only: only hosts that run the model in one of these forms
+    /// ("fp8", "bf16"). A strongly compressed model (fp4) can answer with nothing.
+    pub quantizations: Option<Vec<String>>,
 }
 
 /// A model with all its settings in one place: what one run uses.
@@ -271,6 +276,8 @@ pub struct ModelSpec {
     /// `enabled: false`: some models think by default.
     pub can_reason: bool,
     pub sort: Option<String>,
+    pub ignore: Vec<String>,
+    pub quantizations: Vec<String>,
     /// The model takes a strict JSON schema. When not, OpenRouter is asked for a JSON object.
     pub json_schema: bool,
 }
@@ -398,7 +405,22 @@ impl Config {
             reasoning: m.reasoning.or(p.reasoning).unwrap_or(false)
                 && entry.and_then(|e| e.reasoning).unwrap_or(true),
             can_reason: entry.and_then(|e| e.reasoning).unwrap_or(false),
-            sort: m.sort.clone().or_else(|| p.sort.clone()),
+            // `sort = ""` means "not set", not a value for OpenRouter.
+            sort: m
+                .sort
+                .clone()
+                .or_else(|| p.sort.clone())
+                .filter(|s| !s.trim().is_empty()),
+            ignore: m
+                .ignore
+                .clone()
+                .or_else(|| p.ignore.clone())
+                .unwrap_or_default(),
+            quantizations: m
+                .quantizations
+                .clone()
+                .or_else(|| p.quantizations.clone())
+                .unwrap_or_default(),
             json_schema: entry.and_then(|e| e.json_schema).unwrap_or(true),
         })
     }

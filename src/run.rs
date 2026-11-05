@@ -439,6 +439,20 @@ impl Runner {
             },
         );
 
+        // Many posts and almost no topics is a broken answer, not a quiet day (a
+        // compressed model on a cheap host can do this). The run fails, and the
+        // cursors stay, so the posts go into the next run.
+        if collected.posts.len() >= MIN_POSTS_FOR_CHECK && digest.topics.len() < 2 {
+            return Err(anyhow!(
+                "the model gave {} topic(s) for {} posts (output tokens: {}). \
+                 The answer looks broken, so nothing is posted. Try again or switch \
+                 the model (/model)",
+                digest.topics.len(),
+                collected.posts.len(),
+                summary.output_tokens.unwrap_or(0)
+            ));
+        }
+
         // We do not post an empty digest, but the posts were read: we move the cursors,
         // or "unimportant" posts would be read again on every run.
         if chunks.is_empty() {
@@ -703,6 +717,8 @@ impl Runner {
 
 /// How much of each old topic goes into the prompt: enough to know the story.
 const PREVIOUS_TOPIC_CHARS: usize = 300;
+/// From this many posts, an answer with fewer than two topics is taken as broken.
+const MIN_POSTS_FOR_CHECK: usize = 30;
 
 /// "Title — start of the text" of one topic, for the next run.
 fn short_topic(title: &str, summary: &str) -> String {
