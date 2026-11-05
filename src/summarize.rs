@@ -225,6 +225,14 @@ impl Backend {
                 if let Some(sort) = &m.sort {
                     body["provider"]["sort"] = json!(sort);
                 }
+                // The cheapest hosts can run a strongly compressed model that answers
+                // a big input with an empty list. These two settings keep them out.
+                if !m.ignore.is_empty() {
+                    body["provider"]["ignore"] = json!(m.ignore);
+                }
+                if !m.quantizations.is_empty() {
+                    body["provider"]["quantizations"] = json!(m.quantizations);
+                }
                 // The model thinks before it answers: slower and more tokens, but it
                 // often groups the news better. Some models think by default, so "off"
                 // is sent too, but only to a model that can think: otherwise
