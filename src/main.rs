@@ -64,7 +64,11 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// One-time login to Telegram (code from the app, and the password with 2FA)
-    Login,
+    Login {
+        /// Log in with a QR code scanned in the Telegram app, no code is sent
+        #[arg(long)]
+        qr: bool,
+    },
     /// Show how many posts were collected, without calling the LLM
     Preview,
     /// Build the digest and save it to out/digest.html, without posting anything
@@ -90,9 +94,13 @@ async fn main() -> Result<()> {
     let cfg = Arc::new(Config::load(&cli.config)?);
 
     match cli.command {
-        Command::Login => {
+        Command::Login { qr } => {
             let session = telegram::client::connect(&cfg).await?;
-            telegram::client::login(&session.client, &cfg).await
+            if qr {
+                telegram::client::login_qr(&session, &cfg).await
+            } else {
+                telegram::client::login(&session.client, &cfg).await
+            }
         }
         Command::Preview => preview(cfg).await,
         Command::Run { dry_run } => {
