@@ -42,6 +42,8 @@ anyhow             = "1"
 tracing            = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rpassword          = "7"
+# QR code for `login --qr`, drawn in the terminal with text blocks (no image support).
+qrcode             = { version = "0.14", default-features = false }
 rand               = "0.10"
 
 [profile.release]
