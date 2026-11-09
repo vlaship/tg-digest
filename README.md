@@ -40,6 +40,7 @@ if (-not (Test-Path data\config.toml)) { Copy-Item config.example.toml data\conf
 
 docker compose build                          # build the image first, or login runs in the old one
 docker compose run --rm -it tg-digest login   # one-time login: the code, and the password if you use 2FA
+# No code comes? Use `login --qr`: scan the QR code in Telegram → Settings → Devices.
 docker compose up -d
 docker compose logs -f
 ```
@@ -93,6 +94,7 @@ pass the config file and change `session_file` and `db_file` in it:
 
 ```powershell
 cargo run -- --config config.toml login          # one-time login
+cargo run -- --config config.toml login --qr     # login by a QR code, if the code does not come
 cargo run -- --config config.toml preview        # how many posts were collected, no call to Claude
 cargo run -- --config config.toml run --dry-run  # digest in out/digest.html, nothing is posted
 cargo run -- --config config.toml serve          # the daemon: schedule + commands
