@@ -915,10 +915,33 @@ fn parse_chat(response: Value, api: &'static str) -> Result<Summary> {
         bail!("the model refused the request: {refusal}");
     }
 
-    let text = choice
+    // The OpenRouter host that answered: some hosts break the answer (see below).
+    let provider = response
+        .get("provider")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let content = choice
         .pointer("/message/content")
         .and_then(Value::as_str)
         .unwrap_or_default();
+    // Some hosts do not split the thinking from the answer: everything, with
+    // `</think>{…}`, lands in `reasoning`, and `content` is empty or a stub. The real
+    // answer is then after the last `</think>`. It goes through the same checks.
+    let leaked = choice
+        .pointer("/message/reasoning")
+        .and_then(Value::as_str)
+        .and_then(answer_after_think);
+    let text = match leaked {
+        Some(answer) => {
+            tracing::warn!(
+                %provider,
+                content_chars = content.len(),
+                "the answer is in the thinking text, taking it from there"
+            );
+            answer
+        }
+        None => content,
+    };
     if text.trim().is_empty() {
         bail!("the {api} answer has no text: {response}");
     }
@@ -936,6 +959,7 @@ fn parse_chat(response: Value, api: &'static str) -> Result<Summary> {
     let model = response.get("model").and_then(Value::as_str).unwrap_or("");
     tracing::info!(
         %model,
+        %provider,
         input_tokens = usage("prompt_tokens"),
         output_tokens = usage("completion_tokens"),
         reasoning_tokens = usage("completion_tokens_details/reasoning_tokens"),
@@ -949,6 +973,14 @@ fn parse_chat(response: Value, api: &'static str) -> Result<Summary> {
         input_tokens: usage("prompt_tokens"),
         output_tokens: usage("completion_tokens"),
     })
+}
+
+/// The text after the last `</think>` in the thinking text, if it looks like a JSON
+/// answer. A host that splits the answer right never leaves `</think>` there.
+fn answer_after_think(reasoning: &str) -> Option<&str> {
+    let (_, after) = reasoning.rsplit_once("</think>")?;
+    let after = after.trim();
+    (after.starts_with('{') || after.starts_with("```")).then_some(after)
 }
 
 /// Some models wrap the JSON in a ```json … ``` block even with a schema.
