@@ -125,7 +125,9 @@ session_file = "/data/bot.session"
 #   effort               — anthropic: low | medium | high | xhigh | max;
 #                          openai: none | minimal | low | medium | high
 #   reasoning            — openrouter only: the model thinks before it answers;
-#                          slower, and the thinking counts in max_tokens
+#                          slower, and the thinking counts in max_tokens.
+#                          A model that always thinks (glm-5.3-flash) gets it on
+#                          even with reasoning = false
 #   sort                 — openrouter only: how to choose the host of a model:
 #                          price | throughput | latency (not set: OpenRouter
 #                          balances price and uptime)
