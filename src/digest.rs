@@ -138,7 +138,10 @@ pub fn response_schema() -> Value {
 /// place: the source is still a real post. A link that is in no post is dropped.
 /// Returns the number of dropped links.
 pub fn drop_foreign_sources(digest: &mut Digest, posts: &[Post]) -> usize {
-    let by_url: HashMap<&str, &Post> = posts.iter().map(|p| (p.url.as_str(), p)).collect();
+    // A model often writes the link a bit differently: `t.me/name/1` without `https://`,
+    // the username in lower case (Telegram does not care about case), `?single` at
+    // the end. All of them are still the same post, so we compare a short key.
+    let by_url: HashMap<String, &Post> = posts.iter().map(|p| (post_key(&p.url), p)).collect();
     let mut dropped = 0;
     let mut replaced = 0;
 
@@ -146,11 +149,12 @@ pub fn drop_foreign_sources(digest: &mut Digest, posts: &[Post]) -> usize {
         let mut kept: Vec<Source> = Vec::with_capacity(topic.sources.len());
         for source in topic.sources.drain(..) {
             // The label is the channel title from our list, not what the model wrote:
-            // it writes `@username` in one run and the title in the next.
-            let source = if let Some(post) = by_url.get(source.url.as_str()) {
+            // it writes `@username` in one run and the title in the next. The URL is
+            // ours too, not the model's spelling of it.
+            let source = if let Some(post) = by_url.get(&post_key(&source.url)) {
                 Source {
                     channel: post.title.clone(),
-                    url: source.url,
+                    url: post.url.clone(),
                 }
             } else if let Some(post) = post_with_link(posts, &source.url) {
                 replaced += 1;
@@ -170,6 +174,18 @@ pub fn drop_foreign_sources(digest: &mut Digest, posts: &[Post]) -> usize {
         }
         topic.sources = kept;
     }
+    let bare = digest
+        .topics
+        .iter()
+        .filter(|t| t.sources.is_empty())
+        .count();
+    if bare > 0 {
+        tracing::warn!(
+            topics = bare,
+            of = digest.topics.len(),
+            "topics left without any source link"
+        );
+    }
     if replaced > 0 {
         tracing::info!(
             replaced,
@@ -177,6 +193,19 @@ pub fn drop_foreign_sources(digest: &mut Digest, posts: &[Post]) -> usize {
         );
     }
     dropped
+}
+
+/// A post link without the scheme, `www.`, the query, the fragment and a last `/`,
+/// in lower case: `https://t.me/Name/12?single` → `t.me/name/12`.
+fn post_key(url: &str) -> String {
+    let url = url.trim();
+    let url = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .unwrap_or(url);
+    let url = url.strip_prefix("www.").unwrap_or(url);
+    let url = url.split(['?', '#']).next().unwrap_or(url);
+    url.trim_end_matches('/').to_lowercase()
 }
 
 /// The first post whose text has this link. `https://`, `www.` and a last `/` do not count.
