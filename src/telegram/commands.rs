@@ -11,6 +11,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use grammers_client::client::UpdatesConfiguration;
 use grammers_client::message::InputMessage;
 use grammers_client::peer::Peer;
+use grammers_client::tl;
 use grammers_client::update::Update;
 use grammers_session::updates::UpdatesLike;
 use std::sync::Arc;
@@ -116,6 +117,7 @@ pub async fn listen(
         tracing::info!(command = %text, "command from the owner");
         let runner = runner.clone();
         let cancel = cancel.clone();
+        let client = bot.client.clone();
         commands.spawn(async move {
             // A long command says at once that it has started: otherwise the chat is
             // silent for minutes and it looks like nothing happened.
@@ -127,7 +129,28 @@ pub async fn listen(
                     tracing::warn!(error = %e, "could not send the working note");
                 }
             }
-            let reply = match handle(&runner, &text).await {
+            // While a long command works, the chat shows "typing…", so it is clear
+            // that the bot is busy with the digest.
+            let peer = if is_slow(&text) {
+                message.peer_ref().await.ok().flatten()
+            } else {
+                None
+            };
+            let work = Box::pin(handle(&runner, &text));
+            let result = match peer {
+                Some(peer) => {
+                    let (result, typing) = client
+                        .action(peer)
+                        .repeat(|| tl::types::SendMessageTypingAction {}, work)
+                        .await;
+                    if let Err(e) = typing {
+                        tracing::debug!(error = %e, "could not show typing");
+                    }
+                    result
+                }
+                None => work.await,
+            };
+            let reply = match result {
                 Ok(reply) => reply,
                 Err(e) if crate::telegram::client::is_fatal(&e) => return Err(e),
                 // We show a command error to the owner, we do not hide it in the log.
