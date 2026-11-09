@@ -243,10 +243,16 @@ async fn serve(cfg: Arc<Config>) -> Result<()> {
     }
 
     // The personal account reads the channels; it is also the owner of the bot.
-    let session = telegram::client::connect(&cfg).await?;
-    telegram::client::ensure_authorized(&session.client).await?;
-    let owner = session
-        .client
+    let telegram::client::Session {
+        client, updates, ..
+    } = telegram::client::connect(&cfg).await?;
+    // The personal account only reads; nobody listens to its updates. The channel is
+    // unbounded, so a kept receiver collects every update of the account (all chats
+    // and channels) until the memory runs out. Drop it: grammers then throws the
+    // updates away.
+    drop(updates);
+    telegram::client::ensure_authorized(&client).await?;
+    let owner = client
         .get_me()
         .await
         .context("could not get own profile")?
@@ -261,7 +267,7 @@ async fn serve(cfg: Arc<Config>) -> Result<()> {
     let runner = Arc::new(Runner::new(
         cfg.clone(),
         db.clone(),
-        session.client,
+        client,
         Some(bot),
         cancel.clone(),
     ));
