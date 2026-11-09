@@ -121,6 +121,168 @@ pub async fn login(client: &Client, cfg: &Config) -> Result<()> {
     }
 }
 
+/// How often we ask Telegram if the QR code was scanned.
+const QR_POLL: Duration = Duration::from_secs(3);
+/// How long we wait for a scan before we give up.
+const QR_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Login with a QR code: no code is sent by SMS or to the app. Open Telegram on the
+/// phone → Settings → Devices → Link Desktop Device, and scan the code in the terminal.
+pub async fn login_qr(session: &Session, cfg: &Config) -> Result<()> {
+    let client = &session.client;
+    if client.is_authorized().await? {
+        println!("Already logged in, no need to log in again.");
+        return Ok(());
+    }
+
+    let export = tl::functions::auth::ExportLoginToken {
+        api_id: cfg.telegram.app.api_id,
+        api_hash: cfg.telegram.app.api_hash.clone(),
+        except_ids: Vec::new(),
+    };
+    let started = std::time::Instant::now();
+    let mut shown: Vec<u8> = Vec::new();
+
+    let authorization = loop {
+        if started.elapsed() > QR_TIMEOUT {
+            bail!("the QR code was not scanned in time, run `login --qr` again");
+        }
+        let answer = match client.invoke(&export).await {
+            Ok(answer) => answer,
+            // The code was scanned, but the account has a 2FA password.
+            Err(InvocationError::Rpc(rpc)) if rpc.is("SESSION_PASSWORD_NEEDED") => {
+                return finish_with_password(client).await;
+            }
+            Err(e) => return Err(e).context("could not get a QR login token"),
+        };
+        match answer {
+            tl::enums::auth::LoginToken::Token(token) => {
+                // The token changes about every 30 seconds; draw the new one.
+                if token.token != shown {
+                    show_qr(&token.token)?;
+                    shown = token.token;
+                }
+                tokio::time::sleep(QR_POLL).await;
+            }
+            // The account lives in another data center: finish the login there.
+            tl::enums::auth::LoginToken::MigrateTo(migrate) => {
+                session
+                    .session
+                    .set_home_dc_id(migrate.dc_id)
+                    .await
+                    .context("could not switch the data center")?;
+                let import = tl::functions::auth::ImportLoginToken {
+                    token: migrate.token,
+                };
+                match client.invoke(&import).await {
+                    Ok(tl::enums::auth::LoginToken::Success(ok)) => break ok.authorization,
+                    Ok(_) => bail!("Telegram did not accept the QR login, try again"),
+                    Err(InvocationError::Rpc(rpc)) if rpc.is("SESSION_PASSWORD_NEEDED") => {
+                        return finish_with_password(client).await;
+                    }
+                    Err(e) => return Err(e).context("could not finish the QR login"),
+                }
+            }
+            tl::enums::auth::LoginToken::Success(ok) => break ok.authorization,
+        }
+    };
+
+    let tl::enums::auth::Authorization::Authorization(auth) = authorization else {
+        bail!("this account is not registered in Telegram");
+    };
+    remember_self(session, auth.user).await?;
+    Ok(())
+}
+
+/// The 2FA step after a scan. `check_password` saves the own user in the session itself.
+async fn finish_with_password(client: &Client) -> Result<()> {
+    let password: tl::types::account::Password = client
+        .invoke(&tl::functions::account::GetPassword {})
+        .await
+        .context("could not read the 2FA settings")?
+        .into();
+    let token = grammers_client::client::PasswordToken::new(password);
+    let password =
+        rpassword::prompt_password("2FA password: ").context("could not read the password")?;
+    let user = client
+        .check_password(token, password.trim())
+        .await
+        .context("wrong 2FA password")?;
+    println!("Done, logged in as {}", user.id());
+    Ok(())
+}
+
+/// Save the own user and the update state in the session, like grammers does after a
+/// code login. Without the own user the command listener gets no updates.
+async fn remember_self(session: &Session, user: tl::enums::User) -> Result<()> {
+    let tl::enums::User::User(user) = user else {
+        bail!("Telegram returned an empty user after the login");
+    };
+    session
+        .session
+        .cache_peer(&grammers_session::types::PeerInfo::User {
+            id: user.id,
+            auth: user.access_hash.map(PeerAuth::from_hash),
+            bot: Some(user.bot),
+            is_self: Some(true),
+        })
+        .await
+        .context("could not save the own user in the session")?;
+    if let Ok(tl::enums::updates::State::State(state)) = session
+        .client
+        .invoke(&tl::functions::updates::GetState {})
+        .await
+    {
+        session
+            .session
+            .set_update_state(grammers_session::types::UpdateState::All(
+                grammers_session::types::UpdatesState {
+                    pts: state.pts,
+                    qts: state.qts,
+                    date: state.date,
+                    seq: state.seq,
+                    channels: Vec::new(),
+                },
+            ))
+            .await
+            .context("could not save the update state")?;
+    }
+    println!("Done, logged in as {}", user.id);
+    Ok(())
+}
+
+/// Draw the `tg://login` link as a QR code in the terminal.
+fn show_qr(token: &[u8]) -> Result<()> {
+    use qrcode::render::unicode::Dense1x2;
+    let link = format!("tg://login?token={}", base64_url(token));
+    let code = qrcode::QrCode::new(link.as_bytes()).context("could not build the QR code")?;
+    // Light modules are drawn as blocks, so the code reads well on a dark terminal.
+    let image = code
+        .render::<Dense1x2>()
+        .dark_color(Dense1x2::Light)
+        .light_color(Dense1x2::Dark)
+        .build();
+    println!("\n{image}\n");
+    println!("Telegram on the phone → Settings → Devices → Link Desktop Device, scan this code.");
+    println!("Waiting for the scan…");
+    Ok(())
+}
+
+/// Base64 for URLs without padding, as the `tg://login` link needs.
+fn base64_url(bytes: &[u8]) -> String {
+    const ABC: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut out = String::with_capacity(bytes.len() * 4 / 3 + 3);
+    for chunk in bytes.chunks(3) {
+        let n = (u32::from(chunk[0]) << 16)
+            | (u32::from(*chunk.get(1).unwrap_or(&0)) << 8)
+            | u32::from(*chunk.get(2).unwrap_or(&0));
+        for i in 0..=chunk.len() {
+            out.push(ABC[(n >> (18 - 6 * i)) as usize & 63] as char);
+        }
+    }
+    out
+}
+
 pub async fn ensure_authorized(client: &Client) -> Result<()> {
     if !client.is_authorized().await? {
         bail!("not logged in to Telegram — run `tg-digest login`");
