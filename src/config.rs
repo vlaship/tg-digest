@@ -402,8 +402,10 @@ impl Config {
                 .unwrap_or_else(|| "high".into()),
             effort_set: m.effort.clone().or_else(|| p.effort.clone()),
             // A model without reasoning would find no host with `require_parameters`.
-            reasoning: m.reasoning.or(p.reasoning).unwrap_or(false)
-                && entry.and_then(|e| e.reasoning).unwrap_or(true),
+            // A model that always thinks rejects "off" (400), so it is always on.
+            reasoning: entry.is_some_and(|e| e.reasoning_mandatory)
+                || (m.reasoning.or(p.reasoning).unwrap_or(false)
+                    && entry.and_then(|e| e.reasoning).unwrap_or(true)),
             can_reason: entry.and_then(|e| e.reasoning).unwrap_or(false),
             // `sort = ""` means "not set", not a value for OpenRouter.
             sort: m

@@ -36,6 +36,10 @@ pub struct Entry {
     pub json_schema: Option<bool>,
     /// OpenRouter: the model can think before it answers.
     pub reasoning: Option<bool>,
+    /// OpenRouter: the model always thinks; "off" gets 400. Lists saved before
+    /// this field was added do not have it.
+    #[serde(default)]
+    pub reasoning_mandatory: bool,
     /// The model costs nothing (OpenRouter `:free`).
     pub free: bool,
 }
@@ -251,6 +255,7 @@ fn anthropic_entry(m: &Value) -> Option<Entry> {
         output_tokens: m["max_tokens"].as_u64(),
         json_schema: None,
         reasoning: None,
+        reasoning_mandatory: false,
         free: false,
     })
 }
@@ -274,6 +279,7 @@ fn gemini_entry(m: &Value) -> Option<Entry> {
         output_tokens: m["outputTokenLimit"].as_u64(),
         json_schema: None,
         reasoning: None,
+        reasoning_mandatory: false,
         free: false,
     })
 }
@@ -303,6 +309,7 @@ fn openai_entry(m: &Value) -> Option<Entry> {
         output_tokens: None,
         json_schema: None,
         reasoning: None,
+        reasoning_mandatory: false,
         free: false,
     })
 }
@@ -331,6 +338,7 @@ fn openrouter_entry(m: &Value) -> Option<Entry> {
         output_tokens: m["top_provider"]["max_completion_tokens"].as_u64(),
         json_schema: Some(params.contains(&"structured_outputs")),
         reasoning: Some(params.contains(&"reasoning")),
+        reasoning_mandatory: m["reasoning"]["mandatory"].as_bool().unwrap_or(false),
         free,
         id,
     })
