@@ -11,6 +11,13 @@ services:
     image: tg-digest
     restart: unless-stopped
 
+    # A small VM runs other services too. If memory grows, only this container is
+    # killed and restarted; the host does not hang.
+    mem_limit: 128m
+    # glibc makes many malloc arenas; in a long-running process they keep memory.
+    environment:
+      MALLOC_ARENA_MAX: "2"
+
     # All settings and state are in the host folder ./data, mounted as /data:
     # config.toml (with the secrets), tg.session, digest.db. It survives image updates
     # and `down`. ./data is in .gitignore and .dockerignore.
