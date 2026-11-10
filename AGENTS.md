@@ -13,9 +13,9 @@ use it is in [README.md](README.md).
 | File | What it does |
 |---|---|
 | `src/main.rs` | CLI (`login` / `preview` / `run --dry-run` / `serve`), scheduler, signals |
-| `src/config.rs` | `config.toml` (all settings and secrets), validation |
-| `src/db.rs` | SQLite: channels with cursors, journal of runs and delivered parts |
-| `src/run.rs` | one full run (collect, summarize, publish), the lock, recovery of undelivered runs |
+| `src/config.rs` | `config.toml` (all settings and secrets), themes, validation |
+| `src/db.rs` | SQLite: channels with cursors per theme, journal of runs and delivered parts |
+| `src/run.rs` | a trigger over the themes, one full run of a theme (collect, summarize, publish), the lock, recovery of undelivered runs |
 | `src/cancel.rs` | safe shutdown on SIGTERM / Ctrl+C |
 | `src/schedule.rs` | croner: next trigger, catch-up of missed slots |
 | `src/telegram/client.rs` | connection, login, reading posts by cursor |
@@ -74,6 +74,18 @@ config, and no sync step. Titles and usernames are read again before every run
 (`refresh_channels`, one `channels.getChannels` call); this never changes the
 list. Otherwise a renamed channel would stay in the digest forever with an old
 link.
+
+**Themes are independent digests.** A theme is a `[[themes]]` block in the
+config: a tag (one word), a title, a system prompt and, if set, its own
+`destination`. Without the blocks there is one theme, `main`, made from
+`[prompts]`. On a trigger the themes run one after another in the config order,
+like separate instances: each has its own channel rows (`channels` key is
+`(theme, id)`), cursors, runs and last digest topics. A channel can be in several
+themes, and then its news is in each digest. An error or an undelivered run in
+one theme never blocks another. Shared: the schedule, the model, the lock, the
+sessions. Commands take the tag as the first word (`/add dev @channel`,
+`/run dev`); `/add` without a tag uses the first theme. An old database gets the
+`theme` columns on start, and its rows go to the first theme.
 
 **Two Telegram clients, two jobs.** The personal account (`[telegram.app]`,
 `tg.session`) only reads: it collects posts, resolves `/add`, refreshes names. A

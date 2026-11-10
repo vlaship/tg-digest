@@ -12,7 +12,7 @@ use std::sync::Arc;
 use tokio::sync::{Mutex, MutexGuard};
 
 use crate::cancel::Cancel;
-use crate::config::{Config, Prompts};
+use crate::config::{Config, Prompts, Theme};
 use crate::db::{self, Db, NewChunk, Run};
 use crate::digest::{self, RenderOptions};
 use crate::models::Catalog;
@@ -77,6 +77,29 @@ impl std::fmt::Display for Outcome {
                 "run #{id} cancelled, cursors not moved — the posts go into the next digest"
             ),
         }
+    }
+}
+
+/// What each theme did on one trigger, in the order of the themes. The tag is
+/// empty when there is nothing to tell apart: one theme, or the lock is taken.
+pub struct Outcomes(pub Vec<(String, Outcome)>);
+
+impl std::fmt::Display for Outcomes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.0.is_empty() {
+            return write!(f, "nothing to do");
+        }
+        for (i, (tag, outcome)) in self.0.iter().enumerate() {
+            if i > 0 {
+                writeln!(f)?;
+            }
+            if tag.is_empty() {
+                write!(f, "{outcome}")?;
+            } else {
+                write!(f, "{tag}: {outcome}")?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -172,51 +195,123 @@ impl Runner {
         &self.cancel
     }
 
-    /// Entry point of every trigger: cron, catch-up, `/run`, daemon start.
-    pub async fn trigger(&self, trigger: &str) -> Result<Outcome> {
-        let Some(_guard) = self.try_lock() else {
-            return Ok(Outcome::Busy(self.running_id().await?));
-        };
-
-        // The check for an unfinished run happens on EVERY trigger, not only
-        // on start: otherwise a second digest would go on top of the first one.
-        let outcome = match self.db.unfinished_run().await? {
-            Some(run) => self.finish_unfinished(run).await,
-            None => {
-                let outcome = self.fresh_run(trigger).await;
-                if matches!(&outcome, Ok(o) if !matches!(o, Outcome::Failed(..))) {
-                    if let Err(e) = self.db.delete_setting(REREAD_SETTING).await {
-                        tracing::warn!(error = %format!("{e:#}"), "could not clear the reread window");
-                    }
-                }
-                outcome
-            }
-        };
-        self.offer_run(&outcome).await;
-        outcome
+    /// Entry point of every trigger: cron, catch-up, `/run`, daemon start. The themes
+    /// run one after another and do not depend on each other: each one has its own
+    /// channels, cursors and runs. `only` limits the trigger to one theme.
+    pub async fn trigger(&self, trigger: &str, only: Option<&Theme>) -> Result<Outcomes> {
+        self.pass(trigger, only, true).await
     }
 
-    /// After a digest in the chat with the bot, one more message with `/run`: the
-    /// owner taps it to build the next digest at once. Not for a channel: nobody
-    /// there can send commands.
-    async fn offer_run(&self, outcome: &Result<Outcome>) {
-        let delivered = match outcome {
-            Ok(Outcome::Delivered(_)) => true,
-            Ok(Outcome::Finished { status, .. }) => status == db::STATUS_OK,
-            _ => false,
+    /// Only deliver the undelivered runs, start nothing new: for the daemon start.
+    pub async fn recover(&self) -> Result<Outcomes> {
+        self.pass(TRIGGER_CATCH_UP, None, false).await
+    }
+
+    async fn pass(&self, trigger: &str, only: Option<&Theme>, fresh: bool) -> Result<Outcomes> {
+        let Some(_guard) = self.try_lock() else {
+            let busy = Outcome::Busy(self.running_id().await?);
+            return Ok(Outcomes(vec![(String::new(), busy)]));
         };
-        if delivered && matches!(self.cfg.telegram.destination.as_str(), "bot" | "me") {
+
+        let themes = match only {
+            Some(theme) => vec![theme.clone()],
+            None => self.cfg.themes(),
+        };
+        let named = self.cfg.themes().len() > 1;
+        let (mut refreshed, mut read, mut failed, mut offer) = (false, false, false, false);
+        let mut out = Vec::new();
+
+        for theme in &themes {
+            if self.cancel.is_cancelled() {
+                break;
+            }
+            // The check for an unfinished run happens on EVERY trigger, not only
+            // on start: otherwise a second digest would go on top of the first one.
+            let unfinished = self.db.unfinished_theme_run(&theme.tag).await?;
+            let is_fresh = unfinished.is_none();
+            let result = match unfinished {
+                Some(run) => self.finish_unfinished(run).await,
+                None if !fresh => continue,
+                None => {
+                    if !refreshed {
+                        self.refresh_channels().await?;
+                        refreshed = true;
+                    }
+                    self.fresh_run(trigger, theme).await
+                }
+            };
+            let outcome = match result {
+                Ok(outcome) => outcome,
+                Err(e) if tg::is_fatal(&e) => return Err(e),
+                // An error in one theme must not stop the other themes.
+                Err(e) => self.broken(trigger, theme, e).await,
+            };
+
+            if is_fresh {
+                read = true;
+                failed |= matches!(outcome, Outcome::Failed(..));
+            }
+            let delivered = match &outcome {
+                Outcome::Delivered(_) => true,
+                Outcome::Finished { status, .. } => status == db::STATUS_OK,
+                _ => false,
+            };
+            offer |= delivered && theme.to_bot();
+            let tag = if named {
+                theme.tag.clone()
+            } else {
+                String::new()
+            };
+            out.push((tag, outcome));
+        }
+
+        // The `/reread` window stays while a theme still has to read with it.
+        if read && !failed {
+            if let Err(e) = self.db.delete_setting(REREAD_SETTING).await {
+                tracing::warn!(error = %format!("{e:#}"), "could not clear the reread window");
+            }
+        }
+        // After a digest in the chat with the bot, one more message with `/run`: the
+        // owner taps it to build the next digest at once. Not for a channel: nobody
+        // there can send commands.
+        if offer {
             self.notify("/run").await;
+        }
+        Ok(Outcomes(out))
+    }
+
+    /// A theme failed with an error that is not a normal run failure (the database,
+    /// for example). We tell the owner and go on with the next theme.
+    async fn broken(&self, trigger: &str, theme: &Theme, error: anyhow::Error) -> Outcome {
+        let reason = format!("{error:#}");
+        tracing::error!(theme = %theme.tag, %trigger, %reason, "run failed");
+        let short: String = reason.chars().take(300).collect();
+        let text = format!("⚠️ The run failed: {short}");
+        if trigger != TRIGGER_MANUAL {
+            self.notify(&self.named(&theme.tag, &text)).await;
+        }
+        Outcome::Failed(self.running_id().await.unwrap_or_default(), text)
+    }
+
+    /// A notification text with the theme tag in front, when there are several themes.
+    fn named(&self, tag: &str, text: &str) -> String {
+        if self.cfg.themes().len() > 1 {
+            format!("[{tag}] {text}")
+        } else {
+            text.to_string()
         }
     }
 
-    /// `/reread N`: read all channels again for the last N days. The cursors go to 0,
-    /// and the next run uses a window of N days instead of `lookback_hours`. The
-    /// caller holds the lock and then starts the run.
-    pub async fn prepare_reread(&self, days: i64) -> Result<usize> {
-        let channels = self.db.enabled_channels().await?;
+    /// `/reread N`: read all channels again for the last N days (of one theme, or of
+    /// all). The cursors go to 0, and the next run uses a window of N days instead of
+    /// `lookback_hours`. The caller holds the lock and then starts the run.
+    pub async fn prepare_reread(&self, days: i64, only: Option<&Theme>) -> Result<usize> {
+        let channels = match only {
+            Some(theme) => self.db.theme_channels(&theme.tag).await?,
+            None => self.db.enabled_channels().await?,
+        };
         for channel in &channels {
-            self.db.reset_channel(channel.id).await?;
+            self.db.reset_channel(&channel.theme, channel.id).await?;
         }
         self.db
             .set_setting(REREAD_SETTING, &(days * 24).to_string())
@@ -301,9 +396,10 @@ impl Runner {
         // the deduplication time, so only the owner can take the risk.
         if run.stale_notified_at.is_none() {
             let text = format!(
-                "run #{} not delivered since {}, a retry is not guaranteed to be safe:\n\
+                "{}run #{} not delivered since {}, a retry is not guaranteed to be safe:\n\
                  /resume {} — deliver the undelivered parts (a duplicate is possible),\n\
                  /abandon {} — cancel",
+                self.named(&run.theme, ""),
                 run.id,
                 run.age_reference().format("%Y-%m-%d %H:%M UTC"),
                 run.id,
@@ -335,23 +431,21 @@ impl Runner {
             }
             Some(reason) => {
                 if !self.cancel.is_cancelled() {
-                    self.notify(&format!("digest not fully delivered: {reason}"))
-                        .await;
+                    let text = format!("digest not fully delivered: {reason}");
+                    self.notify(&self.named(&run.theme, &text)).await;
                 }
                 Ok(Outcome::Pending(run.id, reason))
             }
         }
     }
 
-    async fn fresh_run(&self, trigger: &str) -> Result<Outcome> {
-        self.refresh_channels().await?;
-
-        let channels = self.db.enabled_channels().await?;
-        let run_id = self.db.start_run(trigger).await?;
-        tracing::info!(run = run_id, %trigger, channels = channels.len(), "run started");
+    async fn fresh_run(&self, trigger: &str, theme: &Theme) -> Result<Outcome> {
+        let channels = self.db.theme_channels(&theme.tag).await?;
+        let run_id = self.db.start_run(trigger, &theme.tag).await?;
+        tracing::info!(run = run_id, theme = %theme.tag, %trigger, channels = channels.len(), "run started");
 
         if channels.is_empty() {
-            tracing::warn!("no channels enabled — nothing to post");
+            tracing::warn!(theme = %theme.tag, "no channels enabled — nothing to post");
             self.db.complete_run(run_id, db::STATUS_EMPTY).await?;
             return Ok(Outcome::Finished {
                 run: run_id,
@@ -372,23 +466,27 @@ impl Runner {
         .await
         {
             Ok(collected) => collected,
-            Err(e) => return self.fail(run_id, trigger, e).await,
+            Err(e) => return self.fail(run_id, trigger, theme, e).await,
         };
 
         // An excluded channel is a reason for a notification: we cannot silently lose
         // its posts, and its cursor does not move, so the next run reads the rest.
         let failed: Vec<i64> = collected.failures.iter().map(|(c, _)| c.id).collect();
         for (channel, reason) in &collected.failures {
-            self.db.set_channel_error(channel.id, Some(reason)).await?;
-            self.notify(&format!(
+            self.db
+                .set_channel_error(&theme.tag, channel.id, Some(reason))
+                .await?;
+            let text = format!(
                 "channel {} excluded from the run: {reason}",
                 channel.label()
-            ))
-            .await;
+            );
+            self.notify(&self.named(&theme.tag, &text)).await;
         }
         for channel in channels.iter().filter(|c| !failed.contains(&c.id)) {
             if channel.last_error.is_some() {
-                self.db.set_channel_error(channel.id, None).await?;
+                self.db
+                    .set_channel_error(&theme.tag, channel.id, None)
+                    .await?;
             }
         }
 
@@ -404,7 +502,7 @@ impl Runner {
             .and_then(|model| Summarizer::new(&model))
         {
             Ok(s) => s,
-            Err(e) => return self.fail(run_id, trigger, e).await,
+            Err(e) => return self.fail(run_id, trigger, theme, e).await,
         };
         // A channel often writes about yesterday's story again in a new post: tell the
         // model what the last digest already had. Not on `/reread`: the owner asked for
@@ -412,12 +510,12 @@ impl Runner {
         let previous = if reread {
             Vec::new()
         } else {
-            self.db.last_digest_topics().await.unwrap_or_else(|e| {
+            self.db.last_digest_topics(&theme.tag).await.unwrap_or_else(|e| {
                 tracing::warn!(error = %format!("{e:#}"), "could not read the last digest topics");
                 Vec::new()
             })
         };
-        let prompts = with_previous_topics(&self.cfg.prompts, &previous);
+        let prompts = with_previous_topics(&theme.prompts, &previous);
         let summary = match summarizer
             .summarize(
                 &prompts,
@@ -430,7 +528,7 @@ impl Runner {
             .await
         {
             Ok(summary) => summary,
-            Err(e) => return self.fail(run_id, trigger, e).await,
+            Err(e) => return self.fail(run_id, trigger, theme, e).await,
         };
 
         let mut digest = summary.digest;
@@ -439,7 +537,7 @@ impl Runner {
         let chunks = digest::render_parts(
             &digest,
             &RenderOptions {
-                digest_title: &self.cfg.prompts.digest_title,
+                digest_title: &theme.prompts.digest_title,
                 timezone: self.timezone(),
                 now: Utc::now(),
             },
@@ -459,7 +557,7 @@ impl Runner {
                 collected.posts.len(),
                 summary.output_tokens.unwrap_or(0)
             );
-            return self.fail(run_id, trigger, error).await;
+            return self.fail(run_id, trigger, theme, error).await;
         }
 
         // We do not post an empty digest, but the posts were read: we move the cursors,
@@ -475,14 +573,14 @@ impl Runner {
                 .await;
         }
 
-        let dest_label = self.cfg.telegram.destination.clone();
+        let dest_label = theme.destination.clone();
         let resolved = match self.bot() {
             Ok(bot) => publish::resolve_destination(bot, &dest_label).await,
             Err(e) => Err(e),
         };
         let dest = match resolved {
             Ok(dest) => dest,
-            Err(e) => return self.fail(run_id, trigger, e).await,
+            Err(e) => return self.fail(run_id, trigger, theme, e).await,
         };
 
         let journal = self
@@ -638,7 +736,13 @@ impl Runner {
     /// The full error goes to the log and the database; the owner gets a short text
     /// in plain words (`friendly_error`). A `/run` gets it as the reply, so we do not
     /// send it a second time as a notification.
-    async fn fail(&self, run_id: i64, trigger: &str, error: anyhow::Error) -> Result<Outcome> {
+    async fn fail(
+        &self,
+        run_id: i64,
+        trigger: &str,
+        theme: &Theme,
+        error: anyhow::Error,
+    ) -> Result<Outcome> {
         if tg::is_fatal(&error) {
             // There is no point in waiting out a revoked session — let it fail upwards.
             self.db.fail_run(run_id, &format!("{error:#}")).await?;
@@ -652,12 +756,12 @@ impl Runner {
         }
 
         let reason = format!("{error:#}");
-        tracing::error!(run = run_id, %reason, "run finished with an error");
+        tracing::error!(run = run_id, theme = %theme.tag, %reason, "run finished with an error");
         self.db.fail_run(run_id, &reason).await?;
 
         let text = self.friendly_error(&error).await;
         if trigger != TRIGGER_MANUAL {
-            self.notify(&text).await;
+            self.notify(&self.named(&theme.tag, &text)).await;
         }
         Ok(Outcome::Failed(run_id, text))
     }

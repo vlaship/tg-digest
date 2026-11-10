@@ -963,3 +963,20 @@ The text above about folders and the seed is history: it describes earlier steps
 - All unit tests and the `cargo test` CI step are removed at the owner's request.
   The check is `cargo fmt && cargo clippy --all-targets` plus the live order:
   `preview`, `run --dry-run`, `serve` + `/run`.
+
+## Update 2026-11-10: themes
+
+- A theme (`[[themes]]` in the config) is its own digest: a tag, a title, a
+  system prompt and, if set, a destination. Without the blocks there is one
+  theme, `main`, made from `[prompts]`.
+- The themes work like separate instances in one process. On a trigger they run
+  one after another in the config order. Each has its own channel rows, cursors,
+  runs, undelivered run and "last digest topics". A channel can be in several
+  themes; its news is then in each digest.
+- In the database `channels` has the key `(theme, id)` and `runs` has a `theme`
+  column. An old database is updated on start (`prepare_themes`,
+  `copy_old_channels`), and rows with no theme go to the first theme
+  (`adopt_legacy`). This is the only migration.
+- Shared by all themes: the schedule, the model, the lock, the `/reread` window,
+  the Telegram sessions.
+- Commands take a tag as the first word (`/add dev @channel`, `/run dev`).
