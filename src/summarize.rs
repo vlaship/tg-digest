@@ -489,8 +489,20 @@ impl Summarizer {
         // Summaries may also not fit in one request: with a hundred channels their total
         // goes over the limit again, and the final call would fail after
         // all map requests are paid for. So we reduce in several rounds.
+        let final_prompt = |partials: &[Digest]| {
+            digest::render_prompt_with(
+                &prompts.user_template,
+                &digest::format_partials(partials),
+                posts.len(),
+                lookback_hours,
+                channel_count,
+                now,
+                timezone,
+            )
+        };
         for stage in 1..=self.limits.stages {
-            let groups = match plan_reduce(&partials, stage, self.limits) {
+            let prompt_chars = final_prompt(&partials).chars().count();
+            let groups = match plan_reduce(&partials, prompt_chars, stage, self.limits) {
                 ReduceStep::Ready => break,
                 ReduceStep::Stuck => {
                     tracing::warn!(
@@ -544,15 +556,7 @@ impl Summarizer {
             partials = merged;
         }
 
-        let reduce_prompt = digest::render_prompt_with(
-            &prompts.user_template,
-            &digest::format_partials(&partials),
-            posts.len(),
-            lookback_hours,
-            channel_count,
-            now,
-            timezone,
-        );
+        let reduce_prompt = final_prompt(&partials);
         // The last check is on the real prompt, not on the summaries:
         // we get here from "cannot be split", from used-up rounds, and from simply
         // a big template. Sending a request that surely does not fit means
@@ -729,8 +733,16 @@ enum ReduceStep<'a> {
 }
 
 /// A pure decision for one reduce step — without the network, so it can be tested.
-fn plan_reduce(partials: &[Digest], stage: usize, limits: Limits) -> ReduceStep<'_> {
-    if digest::partials_size(partials) <= limits.input {
+/// `prompt_chars` is the size of the real final prompt (template and reminder
+/// included), the same number `ensure_fits` checks: with only the summaries
+/// counted, a total a little under the limit stopped reducing and then failed there.
+fn plan_reduce(
+    partials: &[Digest],
+    prompt_chars: usize,
+    stage: usize,
+    limits: Limits,
+) -> ReduceStep<'_> {
+    if prompt_chars <= limits.input {
         return ReduceStep::Ready;
     }
     if stage > limits.stages || partials.len() < 2 {

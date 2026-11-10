@@ -29,10 +29,44 @@ use crate::run::{Outcome, Runner, TRIGGER_MANUAL};
 use crate::telegram::client::is_auth_error;
 use crate::telegram::{channels, publish};
 
+/// A command reply is plain text; text between two backticks becomes `<code>`, so
+/// Telegram shows it in monospace and copies it with one tap (model ids, commands).
+/// Everything else is escaped. A backtick without a pair stays as it is. Pairs are
+/// looked for inside one line only: a stray backtick in two channel titles must not
+/// turn the lines between them into one code block.
+fn reply_html(text: &str) -> String {
+    text.split('\n')
+        .map(line_html)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn line_html(text: &str) -> String {
+    let parts: Vec<&str> = text.split('`').collect();
+    let mut out = String::with_capacity(text.len() + 16);
+    for (i, part) in parts.iter().enumerate() {
+        let escaped = crate::digest::escape(part);
+        let paired = i % 2 == 1 && i + 1 < parts.len();
+        if paired {
+            out.push_str(&format!("<code>{escaped}</code>"));
+        } else {
+            if i % 2 == 1 {
+                out.push('`');
+            }
+            out.push_str(&escaped);
+        }
+    }
+    out
+}
+
+/// Put into a command reply where a new Telegram message must start. It is a
+/// control character (record separator), so it never comes from channel titles.
+const MESSAGE_BREAK: char = '\u{1e}';
+
 const HELP: &str = "\
 Commands:
 /add [theme] @channel | link | id … — add one or more channels (no theme: the first one)
-/rm [theme] @channel | id — remove a channel
+/rm [theme] @channel | id … — remove channels (several at once, or one /rm per line)
 /list — themes, channels, cursors, errors
 /reset [theme] id — read the channel again from the lookback_hours window
 /skip [theme] — move the channels to their newest message: older posts are skipped
@@ -165,14 +199,24 @@ pub async fn listen(
                 Err(e) => format!("failed: {e:#}"),
             };
 
-            // Telegram does not cut a long reply (`/list` with fifty channels),
-            // it rejects it completely — so we split it ourselves.
-            for piece in crate::digest::split_plain(&reply) {
+            // A reply can ask for several messages (`/list`: one per theme). Telegram
+            // does not cut a long message either, it rejects it completely — so a
+            // long part is split too.
+            let pieces = reply
+                .split(MESSAGE_BREAK)
+                .map(str::trim)
+                .filter(|part| !part.is_empty())
+                .flat_map(crate::digest::split_plain);
+            for piece in pieces {
                 if cancel.is_cancelled() {
                     return Ok(());
                 }
                 if let Err(e) = message
-                    .respond(InputMessage::new().text(piece).link_preview(false))
+                    .respond(
+                        InputMessage::new()
+                            .html(reply_html(&piece))
+                            .link_preview(false),
+                    )
                     .await
                 {
                     if is_auth_error(&e) {
@@ -219,9 +263,11 @@ async fn handle(runner: &Arc<Runner>, text: &str) -> Result<String> {
         },
         // Futures are lazy: the action does not start until `guarded` lets it through.
         "/add" => guarded(runner, add_many(runner, arg)).await,
-        "/rm" => guarded(runner, remove(runner, arg)).await,
+        "/rm" => guarded(runner, remove_many(runner, arg)).await,
         "/reset" => guarded(runner, reset(runner, arg)).await,
         "/skip" => guarded(runner, skip(runner, arg)).await,
+        // Touches no cursors, but it sends: under the lock, so its parts never mix
+        // with the parts of a digest that a run is sending to the same chat.
         "/last" => guarded(runner, last(runner, arg)).await,
         other => Ok(format!("unknown command {other}\n\n{HELP}")),
     }
@@ -260,6 +306,48 @@ fn theme_tags(runner: &Runner) -> String {
     tags.join(", ")
 }
 
+/// The theme tag at the start of the argument of a command about channels already
+/// in the database (`/rm`, `/reset`), and the rest. Besides the themes of the config
+/// it knows the tags that only the database has: a theme that is gone from the
+/// config still has its channels (`/list` shows them), and they must be removable.
+async fn split_channel_theme<'a>(
+    runner: &Runner,
+    arg: &'a str,
+) -> Result<(Option<String>, &'a str)> {
+    let (theme, rest) = split_theme(runner, arg);
+    if let Some(theme) = theme {
+        return Ok((Some(theme.tag), rest));
+    }
+    if let Some((first, rest)) = arg.split_once(char::is_whitespace) {
+        let known = runner.db.channels().await?;
+        if known.iter().any(|c| c.theme == first) {
+            return Ok((Some(first.to_string()), rest.trim()));
+        }
+    }
+    Ok((None, arg))
+}
+
+/// The lines of the argument of a command that takes a list (`/add`, `/rm`). Telegram
+/// sends several lines as one message, and each next line may start with the
+/// command again: `/rm @a` and `/rm @b` on two lines remove both channels.
+fn arg_lines<'a>(arg: &'a str, command: &'a str) -> impl Iterator<Item = &'a str> {
+    arg.lines().map(move |line| {
+        let line = line.trim();
+        if command_name(line) == command {
+            line.split_once(char::is_whitespace)
+                .map_or("", |(_, rest)| rest.trim())
+        } else {
+            line
+        }
+    })
+}
+
+/// The channels in one line: separated by spaces or commas.
+fn split_items(text: &str) -> impl Iterator<Item = &str> {
+    text.split(|c: char| c.is_whitespace() || c == ',')
+        .filter(|s| !s.is_empty())
+}
+
 /// The row a command means by `[theme] channel`. Without a theme the channel must
 /// be in one theme only. The inner `Err` is the reply when it is not clear.
 async fn pick_channel(
@@ -267,15 +355,26 @@ async fn pick_channel(
     arg: &str,
     command: &str,
 ) -> Result<std::result::Result<Channel, String>> {
-    let (theme, key) = split_theme(runner, arg);
+    let (tag, key) = split_channel_theme(runner, arg).await?;
+    find_channel(runner, tag.as_deref(), key, command).await
+}
+
+/// The same as `pick_channel`, with the theme tag already split off.
+async fn find_channel(
+    runner: &Runner,
+    tag: Option<&str>,
+    key: &str,
+    command: &str,
+) -> Result<std::result::Result<Channel, String>> {
     if key.is_empty() {
         return Ok(Err(format!(
             "a channel is needed: {command} @name or {command} id"
         )));
     }
-    let mut rows = runner.db.find_channels(key).await?;
-    if let Some(theme) = &theme {
-        rows.retain(|c| c.theme == theme.tag);
+    // The same forms as `/add`: @name, name, t.me/name, https://t.me/name.
+    let mut rows = runner.db.find_channels(username_from(key)).await?;
+    if let Some(tag) = tag {
+        rows.retain(|c| c.theme == tag);
     }
     // A row that is already turned off does not make the choice unclear.
     if rows.len() > 1 && rows.iter().any(|c| c.enabled) {
@@ -294,38 +393,19 @@ async fn pick_channel(
         .ok_or_else(|| format!("channel {key} is not in the database, /list shows the list")))
 }
 
-/// Commands that touch cursors go under the same lock as the run,
-/// and they are refused if there is an undelivered run: its `runs.cursors` would
-/// overwrite any reset on delivery.
+/// Commands that touch cursors (and `/last`, which sends) go under the same lock
+/// as the run. Each command that touches cursors
+/// also checks for an undelivered run of ITS theme (`Runner::undelivered_refusal`):
+/// that run's `runs.cursors` would overwrite the change on delivery. A run of
+/// another theme does not block it.
 async fn guarded<Fut>(runner: &Arc<Runner>, action: Fut) -> Result<String>
 where
     Fut: std::future::Future<Output = Result<String>>,
 {
-    match guarded_value(runner, action).await? {
-        Ok(reply) | Err(reply) => Ok(reply),
-    }
-}
-
-/// The same for an action that gives a value, not a reply. The inner `Err` is the
-/// refusal text: a run is going, or there is an undelivered run.
-async fn guarded_value<T, Fut>(
-    runner: &Arc<Runner>,
-    action: Fut,
-) -> Result<std::result::Result<T, String>>
-where
-    Fut: std::future::Future<Output = Result<T>>,
-{
     let Some(_guard) = runner.try_lock() else {
-        let busy = Outcome::Busy(runner.running_id().await?);
-        return Ok(Err(busy.to_string()));
+        return Ok(Outcome::Busy(runner.running_id().await?).to_string());
     };
-    if let Some(run) = runner.db.unfinished_run().await? {
-        return Ok(Err(format!(
-            "there is an undelivered run #{} — /run to deliver it or /abandon {}",
-            run.id, run.id
-        )));
-    }
-    Ok(Ok(action.await?))
+    action.await
 }
 
 /// `/model` lists the models from the config with their limits, `/model provider/model`
@@ -337,7 +417,8 @@ async fn model(runner: &Arc<Runner>, arg: &str) -> Result<String> {
         let mut out = String::from("Models:");
         for key in cfg.model_keys() {
             let mark = if key == current { "✅" } else { "•" };
-            out.push_str(&format!("\n{mark} {key}"));
+            // In backticks: monospace, one tap copies it for `/model`.
+            out.push_str(&format!("\n{mark} `{key}`"));
             if key == current {
                 out.push_str(" (now)");
             }
@@ -360,7 +441,7 @@ async fn model(runner: &Arc<Runner>, arg: &str) -> Result<String> {
         return Ok(out);
     }
     match runner.set_model(arg).await {
-        Ok(()) => Ok(format!("model: {arg} (was {current})")),
+        Ok(()) => Ok(format!("model: `{arg}` (was `{current}`)")),
         Err(e) => Ok(format!("cannot switch to {arg}: {e:#}")),
     }
 }
@@ -399,9 +480,10 @@ async fn models(runner: &Arc<Runner>, arg: &str) -> Result<String> {
 
     let mut out = format!("{provider}: {} models", found.len());
     for m in found {
+        // The full key for `/model`, in backticks: one tap copies it.
         out.push_str(&format!(
             "
-• {}",
+• `{provider}/{}`",
             m.id
         ));
         if let Some(tokens) = m.input_tokens {
@@ -453,8 +535,12 @@ async fn list(runner: &Arc<Runner>) -> Result<String> {
         }
     }
 
+    // One message per theme: a long list of one theme does not mix with the next.
     let mut out = String::new();
     for (i, tag) in tags.iter().enumerate() {
+        if i > 0 {
+            out.push(MESSAGE_BREAK);
+        }
         if tags.len() > 1 {
             let note = if i >= known {
                 " (not in the config, not read)"
@@ -571,30 +657,40 @@ async fn run_status(runner: &Arc<Runner>, run: &Run) -> Result<String> {
 
 /// The channel list lives only in the database, so `/add` writes there directly.
 /// A channel that was removed with `/rm` comes back with a fresh cursor.
-/// `/add` with several channels separated by spaces, commas or new lines. Each one
-/// is added on its own: an error in one channel does not stop the others.
+/// `/add` with several channels separated by spaces, commas or new lines; a new line
+/// may start with `/add` again and with its own theme. Each one is added on its own:
+/// an error in one channel does not stop the others.
 async fn add_many(runner: &Arc<Runner>, arg: &str) -> Result<String> {
-    let (theme, arg) = split_theme(runner, arg);
-    let theme = match theme {
-        Some(theme) => theme,
-        None => runner.cfg.themes().remove(0),
-    };
-    let items: Vec<&str> = arg
-        .split(|c: char| c.is_whitespace() || c == ',')
-        .filter(|s| !s.is_empty())
-        .collect();
-    if items.len() <= 1 {
-        return add(runner, &theme, arg.trim()).await;
+    let first = runner.cfg.themes().remove(0);
+    let mut items: Vec<(Theme, &str)> = Vec::new();
+    for line in arg_lines(arg, "/add") {
+        let (theme, rest) = split_theme(runner, line);
+        let theme = theme.unwrap_or_else(|| first.clone());
+        items.extend(split_items(rest).map(|item| (theme.clone(), item)));
     }
+    match items.as_slice() {
+        // No channel: `add` answers with the usage.
+        [] => add(runner, &first, "").await,
+        [(theme, item)] => add_one(runner, theme, item).await,
+        _ => {
+            let mut out = Vec::with_capacity(items.len());
+            for (theme, item) in &items {
+                out.push(match add_one(runner, theme, item).await {
+                    Ok(reply) => reply,
+                    Err(e) => format!("{item}: {e:#}"),
+                });
+            }
+            Ok(out.join("\n\n"))
+        }
+    }
+}
 
-    let mut out = Vec::with_capacity(items.len());
-    for item in items {
-        out.push(match add(runner, &theme, item).await {
-            Ok(reply) => reply,
-            Err(e) => format!("{item}: {e:#}"),
-        });
+/// One channel of `/add`, refused while its theme has an undelivered run.
+async fn add_one(runner: &Arc<Runner>, theme: &Theme, item: &str) -> Result<String> {
+    if let Some(refusal) = runner.undelivered_refusal(Some(&theme.tag)).await? {
+        return Ok(format!("{item}: {refusal}"));
     }
-    Ok(out.join("\n\n"))
+    add(runner, theme, item).await
 }
 
 async fn add(runner: &Arc<Runner>, theme: &Theme, arg: &str) -> Result<String> {
@@ -676,11 +772,40 @@ fn already_added(channel: &Channel) -> String {
     )
 }
 
-async fn remove(runner: &Arc<Runner>, arg: &str) -> Result<String> {
-    let channel = match pick_channel(runner, arg, "/rm").await? {
+/// `/rm` with several channels: `/rm dev @a @b`, or several lines that each start
+/// with `/rm` in one message (Telegram sends them as one message, and before this
+/// the whole text was taken as one channel name, so nothing was removed).
+async fn remove_many(runner: &Arc<Runner>, arg: &str) -> Result<String> {
+    let mut keys: Vec<(Option<String>, &str)> = Vec::new();
+    for line in arg_lines(arg, "/rm") {
+        let (tag, rest) = split_channel_theme(runner, line).await?;
+        keys.extend(split_items(rest).map(|item| (tag.clone(), item)));
+    }
+    match keys.as_slice() {
+        // No channel: `remove` answers with the usage.
+        [] => remove(runner, None, "").await,
+        [(tag, key)] => remove(runner, tag.as_deref(), key).await,
+        _ => {
+            let mut out = Vec::with_capacity(keys.len());
+            for (tag, key) in &keys {
+                out.push(match remove(runner, tag.as_deref(), key).await {
+                    Ok(reply) => reply,
+                    Err(e) => format!("{key}: {e:#}"),
+                });
+            }
+            Ok(out.join("\n"))
+        }
+    }
+}
+
+async fn remove(runner: &Arc<Runner>, tag: Option<&str>, key: &str) -> Result<String> {
+    let channel = match find_channel(runner, tag, key, "/rm").await? {
         Ok(channel) => channel,
         Err(reply) => return Ok(reply),
     };
+    if let Some(refusal) = runner.undelivered_refusal(Some(&channel.theme)).await? {
+        return Ok(format!("{}: {refusal}", channel.label()));
+    }
 
     // Disabled, not deleted: `/list` still shows the channel with its last error.
     runner
@@ -698,10 +823,17 @@ async fn remove(runner: &Arc<Runner>, arg: &str) -> Result<String> {
 /// digest has only posts that come after this. A channel that cannot be read keeps
 /// its cursor.
 async fn skip(runner: &Arc<Runner>, arg: &str) -> Result<String> {
-    let channels = match only_theme(runner, arg) {
-        Ok(Some(theme)) => runner.db.theme_channels(&theme.tag).await?,
-        Ok(None) => runner.db.enabled_channels().await?,
+    let theme = match only_theme(runner, arg) {
+        Ok(theme) => theme,
         Err(refusal) => return Ok(refusal),
+    };
+    let tag = theme.as_ref().map(|t| t.tag.as_str());
+    if let Some(refusal) = runner.undelivered_refusal(tag).await? {
+        return Ok(refusal);
+    }
+    let channels = match tag {
+        Some(tag) => runner.db.theme_channels(tag).await?,
+        None => runner.db.enabled_channels().await?,
     };
     if channels.is_empty() {
         return Ok("no channels yet: add one with /add @channel".into());
@@ -738,6 +870,9 @@ async fn reset(runner: &Arc<Runner>, arg: &str) -> Result<String> {
         Ok(channel) => channel,
         Err(reply) => return Ok(reply),
     };
+    if let Some(refusal) = runner.undelivered_refusal(Some(&channel.theme)).await? {
+        return Ok(refusal);
+    }
     runner.db.reset_channel(&channel.theme, channel.id).await?;
     Ok(format!(
         "{} ({}): cursor reset, the next run reads a window of {} h",
@@ -764,13 +899,11 @@ async fn reread(runner: &Arc<Runner>, arg: &str) -> Result<String> {
         Ok(theme) => theme,
         Err(refusal) => return Ok(refusal),
     };
-    let count = match guarded_value(runner, runner.prepare_reread(days, theme.as_ref())).await? {
-        Ok(count) => count,
+    match runner.reread(days, theme.as_ref()).await? {
+        Ok((count, outcome)) => Ok(format!("reread {days} d, {count} channels:\n{outcome}")),
         // The lock is taken or there is an undelivered run: the text says why.
-        Err(refusal) => return Ok(refusal),
-    };
-    let outcome = runner.trigger(TRIGGER_MANUAL, theme.as_ref()).await?;
-    Ok(format!("reread {days} d, {count} channels:\n{outcome}"))
+        Err(refusal) => Ok(refusal),
+    }
 }
 
 /// A deliberate repeat, not a recovery: the parts go to the **current**
