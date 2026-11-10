@@ -268,16 +268,9 @@ async fn dry_run_once(runner: &Runner, theme: &Theme, many: bool) -> Result<()> 
     Ok(())
 }
 
-/// Channels that no theme of the config owns, but that are not lost: rows from
-/// before themes, and rows of the default theme after the owner added `[[themes]]`.
-/// They go to the first theme.
+/// Channels and runs from before themes have no theme: they go to the first one.
 async fn adopt_old_channels(db: &Db, cfg: &Config) -> Result<()> {
-    let first = cfg.themes().remove(0).tag;
-    db.adopt_theme("", &first).await?;
-    if cfg.theme(config::DEFAULT_THEME).is_none() {
-        db.adopt_theme(config::DEFAULT_THEME, &first).await?;
-    }
-    Ok(())
+    db.adopt_theme("", &cfg.themes()[0].tag).await
 }
 
 /// Common setup for the debug commands: database, client, login check.

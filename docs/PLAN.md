@@ -967,8 +967,9 @@ The text above about folders and the seed is history: it describes earlier steps
 ## Update 2026-11-10: themes
 
 - A theme (`[[themes]]` in the config) is its own digest: a tag, a title, a
-  system prompt and, if set, a destination. Without the blocks there is one
-  theme, `main`, made from `[prompts]`.
+  system prompt and, if set, a destination. At least one block is needed:
+  `prompts.system` and `prompts.digest_title` are gone, the config fails to load
+  with them or with no theme.
 - The themes work like separate instances in one process. On a trigger they run
   one after another in the config order. Each has its own channel rows, cursors,
   runs, undelivered run and "last digest topics". A channel can be in several

@@ -27,13 +27,17 @@ pub struct Config {
     /// a setting: the limits come from the provider's own model list.
     #[serde(default)]
     pub providers: BTreeMap<String, Provider>,
-    pub prompts: Prompts,
-    /// `[[themes]]`: independent digests, each with its own channels and system
-    /// prompt. They run one after another, in this order. Empty: one theme
-    /// (`DEFAULT_THEME`) made from `[prompts]`.
+    pub prompts: PromptsConfig,
+    /// `[[themes]]`: independent digests, each with its own channels, title and
+    /// system prompt. They run one after another, in this order. At least one is
+    /// needed.
     #[serde(default)]
     pub themes: Vec<ThemeConfig>,
-    /// Database file. In a container it is in the `/data` volume, next to the session.
+    /// The folder with all state: the database and both sessions. In a container
+    /// it is the `/data` volume.
+    #[serde(default = "default_data_dir")]
+    pub data_dir: String,
+    /// Database file: a name inside `data_dir`. After `load` it is the full path.
     #[serde(default = "default_db_file")]
     pub db_file: String,
 }
@@ -45,7 +49,8 @@ pub struct Bot {
     /// Token from @BotFather.
     #[serde(default)]
     pub token: String,
-    /// The bot session (SQLite). It is created on the first start, no login needed.
+    /// The bot session (SQLite): a name inside `data_dir`, the full path after
+    /// `load`. It is created on the first start, no login needed.
     #[serde(default = "default_bot_session_file")]
     pub session_file: String,
 }
@@ -81,6 +86,8 @@ pub struct App {
     pub api_hash: String,
     #[serde(default)]
     pub phone: String,
+    /// The account session (SQLite): a name inside `data_dir`, the full path
+    /// after `load`.
     #[serde(default = "default_session_file")]
     pub session_file: String,
 }
@@ -287,20 +294,15 @@ pub struct ModelSpec {
     pub json_schema: bool,
 }
 
-/// The tag of the only theme when the config has no `[[themes]]`.
-pub const DEFAULT_THEME: &str = "main";
-
-/// One `[[themes]]` block. What is not set comes from `[prompts]`.
+/// One `[[themes]]` block.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ThemeConfig {
     /// One word that names the theme in commands: `/add dev @channel`.
     pub tag: String,
-    /// Digest title, with `{{date}}` and `{{time}}`. Not set: `prompts.digest_title`.
-    #[serde(default)]
-    pub title: Option<String>,
-    /// System prompt of the theme. Not set: `prompts.system`.
-    #[serde(default)]
-    pub system: Option<String>,
+    /// Digest title; `{{date}}` and `{{time}}` are in the time zone from `[schedule]`.
+    pub title: String,
+    /// System prompt of the theme.
+    pub system: String,
     /// Where the digest of this theme goes: `"bot"` or `"@channel"`. Not set:
     /// `telegram.destination`.
     #[serde(default)]
@@ -324,18 +326,29 @@ impl Theme {
     }
 }
 
+/// `[prompts]`: what all themes share. The system prompt and the title are in
+/// each `[[themes]]` block.
 #[derive(Debug, Clone, Deserialize)]
-pub struct Prompts {
-    /// The system prompt for themes that do not have their own.
-    #[serde(default)]
-    pub system: String,
+pub struct PromptsConfig {
     pub user_template: String,
     /// Instruction for the map step, when the input does not fit in one request.
     /// Not set — `summarize::DEFAULT_MAP_SYSTEM` is used.
     #[serde(default)]
     pub map_system: Option<String>,
-    /// Digest title; `{{date}}` and `{{time}}` are in the time zone from `[schedule]`.
-    #[serde(default = "default_digest_title")]
+    /// Old keys, from before themes. They are read only to say where they moved.
+    #[serde(default)]
+    system: Option<String>,
+    #[serde(default)]
+    digest_title: Option<String>,
+}
+
+/// The prompts of one theme: what a run gives to the model.
+#[derive(Debug, Clone)]
+pub struct Prompts {
+    pub system: String,
+    pub user_template: String,
+    pub map_system: Option<String>,
+    /// Digest title of the theme.
     pub digest_title: String,
 }
 
@@ -353,37 +366,30 @@ impl Config {
 
         cfg.telegram.app.phone = normalize_phone(&cfg.telegram.app.phone);
         cfg.validate()?;
+        // From here on the three files are full paths: the rest of the code does
+        // not know about `data_dir`.
+        cfg.db_file = in_dir(&cfg.data_dir, &cfg.db_file);
+        cfg.telegram.app.session_file = in_dir(&cfg.data_dir, &cfg.telegram.app.session_file);
+        cfg.telegram.bot.session_file = in_dir(&cfg.data_dir, &cfg.telegram.bot.session_file);
         Ok(cfg)
     }
 
-    /// The themes in the order they run. Without `[[themes]]` it is one theme
-    /// made from `[prompts]`.
+    /// The themes in the order they run. `validate` makes sure there is at least one.
     pub fn themes(&self) -> Vec<Theme> {
-        if self.themes.is_empty() {
-            return vec![Theme {
-                tag: DEFAULT_THEME.into(),
-                prompts: self.prompts.clone(),
-                destination: self.telegram.destination.clone(),
-            }];
-        }
         self.themes
             .iter()
-            .map(|t| {
-                let mut prompts = self.prompts.clone();
-                if let Some(system) = &t.system {
-                    prompts.system = system.clone();
-                }
-                if let Some(title) = &t.title {
-                    prompts.digest_title = title.clone();
-                }
-                Theme {
-                    tag: t.tag.clone(),
-                    prompts,
-                    destination: t
-                        .destination
-                        .clone()
-                        .unwrap_or_else(|| self.telegram.destination.clone()),
-                }
+            .map(|t| Theme {
+                tag: t.tag.clone(),
+                prompts: Prompts {
+                    system: t.system.clone(),
+                    user_template: self.prompts.user_template.clone(),
+                    map_system: self.prompts.map_system.clone(),
+                    digest_title: t.title.clone(),
+                },
+                destination: t
+                    .destination
+                    .clone()
+                    .unwrap_or_else(|| self.telegram.destination.clone()),
             })
             .collect()
     }
@@ -561,6 +567,30 @@ impl Config {
                 self.schedule.timezone
             );
         }
+        if self.prompts.system.is_some() || self.prompts.digest_title.is_some() {
+            bail!(
+                "prompts.system and prompts.digest_title are not used any more: move them \
+                 into a [[themes]] block as `system` and `title` (see config.example.toml)"
+            );
+        }
+        if self.themes.is_empty() {
+            bail!(
+                "there is no [[themes]] block: at least one theme is needed, with `tag`, \
+                 `title` and `system` (see config.example.toml)"
+            );
+        }
+        for (key, name) in [
+            ("db_file", &self.db_file),
+            ("telegram.app.session_file", &self.telegram.app.session_file),
+            ("telegram.bot.session_file", &self.telegram.bot.session_file),
+        ] {
+            if name.is_empty() || name.contains(['/', '\\']) {
+                bail!(
+                    "{key} = {name:?} must be a file name, not a path: the folder is \
+                     `data_dir` at the top of the config"
+                );
+            }
+        }
         // The tag is the key of the theme in the database, so its form is strict.
         let mut tags: Vec<&str> = Vec::new();
         for theme in &self.themes {
@@ -577,10 +607,10 @@ impl Config {
             }
             tags.push(tag);
         }
-        for theme in self.themes() {
-            if theme.prompts.system.trim().is_empty() {
+        for theme in &self.themes {
+            if theme.system.trim().is_empty() || theme.title.trim().is_empty() {
                 bail!(
-                    "theme {:?} has no system prompt: set `system` in its [[themes]] block or in [prompts]",
+                    "theme {:?}: `system` and `title` must not be empty",
                     theme.tag
                 );
             }
@@ -604,17 +634,20 @@ impl Config {
 fn default_timezone() -> String {
     "UTC".into()
 }
+fn default_data_dir() -> String {
+    "/data".into()
+}
 fn default_session_file() -> String {
-    "/data/tg.session".into()
+    "tg.session".into()
 }
 fn default_db_file() -> String {
-    "/data/digest.db".into()
+    "digest.db".into()
 }
 fn default_destination() -> String {
     "bot".into()
 }
 fn default_bot_session_file() -> String {
-    "/data/bot.session".into()
+    "bot.session".into()
 }
 fn default_lookback_hours() -> i64 {
     24
@@ -637,8 +670,10 @@ fn default_pause_ms() -> u64 {
 fn default_publish_retry_window_hours() -> i64 {
     2
 }
-fn default_digest_title() -> String {
-    "📰 Digest for {{date}}".into()
+
+/// The path of a state file: its name inside the data folder.
+fn in_dir(dir: &str, name: &str) -> String {
+    Path::new(dir).join(name).to_string_lossy().into_owned()
 }
 
 /// Telegram expects the number as digits: we remove dashes, spaces and brackets from

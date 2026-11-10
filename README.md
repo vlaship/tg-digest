@@ -97,8 +97,11 @@ cargo build --release
 Copy-Item config.example.toml config.toml
 ```
 
-The default paths are for the container (`/data/...`). When you run locally,
-pass the config file and change `session_file` and `db_file` in it:
+The default folder is for the container (`data_dir = "/data"`). When you run
+locally, pass the config file and set `data_dir = "data"` in it. The database and
+the two sessions are files in that folder; their names (`db_file`,
+`session_file`) are optional and default to `digest.db`, `tg.session` and
+`bot.session`:
 
 ```powershell
 cargo run -- --config config.toml login          # one-time login
@@ -153,8 +156,8 @@ every run, so a renamed channel keeps correct links.
 ### Themes
 
 A theme is its own digest: its own channels, system prompt, title and, if you
-want, its own destination. You describe themes in the config as `[[themes]]`
-blocks (see `config.example.toml`: `world` for general news and `dev` for
+want, its own destination. The config needs at least one theme. You describe
+themes as `[[themes]]` blocks (see `config.example.toml`: `world` for general news and `dev` for
 programming channels, which also drops adverts for courses):
 
 ```toml

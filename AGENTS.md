@@ -48,7 +48,9 @@ use it is in [README.md](README.md).
   restart the container, follow the logs.
 
 The CLI default paths point to `/data`, the container volume. When you run
-locally, pass `--config` and change `session_file` / `db_file`.
+locally, pass `--config` and set `data_dir` (for example `"data"`). The database
+and both sessions are file names inside it (`db_file`, `session_file`); without
+them the names are `digest.db`, `tg.session` and `bot.session`.
 
 **Check before every commit:** `cargo fmt && cargo clippy --all-targets`. The project has no tests.
 
@@ -77,8 +79,8 @@ link.
 
 **Themes are independent digests.** A theme is a `[[themes]]` block in the
 config: a tag (one word), a title, a system prompt and, if set, its own
-`destination`. Without the blocks there is one theme, `main`, made from
-`[prompts]`. On a trigger the themes run one after another in the config order,
+`destination`. At least one block is needed; `[prompts]` has only what the themes
+share (`user_template`, `map_system`). On a trigger the themes run one after another in the config order,
 like separate instances: each has its own channel rows (`channels` key is
 `(theme, id)`), cursors, runs and last digest topics. A channel can be in several
 themes, and then its news is in each digest. An error or an undelivered run in
