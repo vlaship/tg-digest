@@ -65,6 +65,10 @@ pub async fn refresh_names(client: &Client, db: &Db) -> Result<usize> {
         return Ok(0);
     }
 
+    // A channel that is in several themes has a row in each: ask about it once.
+    let mut seen = std::collections::HashSet::new();
+    let channels: Vec<Channel> = channels.into_iter().filter(|c| seen.insert(c.id)).collect();
+
     let peers: Vec<ChannelPeer> = channels.iter().map(ChannelPeer::from).collect();
     let fresh = describe_all(client, &peers).await?;
 

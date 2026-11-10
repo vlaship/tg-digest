@@ -88,6 +88,13 @@ locked, as it would be on Windows.
 (`/list`, `/status`), a run (`/run`), a repeat (`/last`) and handling an
 undelivered run (`/resume N`, `/abandon N`).
 
+With several themes (`[[themes]]` in the config) a command takes the theme tag as
+its first word: `/add dev @channel`, `/run dev`, `/skip dev`, `/last dev`. `/add`
+without a tag uses the first theme; `/run` without a tag runs all themes one
+after another. The debug commands take `--theme dev`
+(`preview --theme dev`, `run --dry-run --theme dev`); with several themes
+`run --dry-run` writes `out/digest-<tag>.html` for each.
+
 Commands that touch cursors are refused while a run is going — this is not an
 error, it is the lock. When there is an undelivered run, only `/run`, `/resume`
 and `/abandon` are allowed.

@@ -43,6 +43,7 @@ run_on_start = false
 [telegram]
 # Where the bot posts the digest: "bot" = the chat with the bot (you see it there),
 # or "@my_channel" — then the bot must be an admin of that channel.
+# A theme can have its own place: `destination` in its [[themes]] block.
 destination = "bot"
 
 # /add starts a channel from its newest message. This window is used after
@@ -173,7 +174,51 @@ request_timeout_secs = 1200
 # ------------------------------------------------------------------ prompts --
 # Edit them here, no rebuild needed. Placeholders in user_template:
 #   {{now}} {{lookback_hours}} {{post_count}} {{channel_count}} {{posts}}
+#
+# The system prompt of each digest is in its [[themes]] block below. A `system`
+# key here is the prompt for themes that have none (and for a config with no
+# [[themes]] at all).
 [prompts]
+user_template = """
+Digest for the period: the last {{lookback_hours}} h (as of {{now}}).
+Collected {{post_count}} posts from {{channel_count}} channels.
+
+{{posts}}
+"""
+
+# The title of the posted digest, for themes that have no `title`. {{date}} and
+# {{time}} are in the time zone from [schedule].
+digest_title = "📰 Digest for {{date}}"
+
+# Instruction for the map step: when there are too many posts for one request,
+# they are condensed in parts, and then the parts are merged with the same system
+# prompt. This key is optional — without it the built-in text is used (summarize.rs).
+# map_system = """
+# You condense a PART of the channel feed — it will be merged with other parts later.
+# Copy all links from the input into sources exactly, do not drop anything.
+# """
+
+# ------------------------------------------------------------------- themes --
+# A theme is its own digest: its own channels, its own system prompt, its own
+# title. The themes run one after another, in the order of the blocks here, on the
+# same schedule. They know nothing about each other: a channel can be in several
+# themes, and then its news is in each of those digests.
+#
+#   tag         — one word of small letters, digits, _ or -. It names the theme
+#                 in commands: /add dev @channel, /run dev, /list.
+#                 Do not rename a tag later: the channels are stored under it.
+#   title       — the title of the digest ({{date}}, {{time}})
+#   system      — the system prompt of the theme
+#   destination — where this digest goes: "bot" or "@channel". Not set: the
+#                 destination from [telegram].
+#
+# /add without a tag adds the channel to the first theme. Channels that were
+# added before themes go to the first theme too.
+# With no [[themes]] block there is one theme, "main", made from [prompts].
+
+[[themes]]
+tag   = "world"
+title = "📰 Digest World News {{date}} {{time}}"
 system = """
 You are the editor of a daily news digest made from Telegram channels.
 
@@ -197,23 +242,49 @@ Rules:
 - Do not cut the digest short. A day with 100+ posts usually has 20–40 topics.
 - Each event is in the digest only once.
 - Use only facts from the posts. No opinions, no filler, no advertising language.
-- Write in English.
+- Write the titles and the summaries in Russian, also when the posts are in
+  another language.
 """
 
-user_template = """
-Digest for the period: the last {{lookback_hours}} h (as of {{now}}).
-Collected {{post_count}} posts from {{channel_count}} channels.
+[[themes]]
+tag   = "dev"
+title = "💻 Digest DEV {{date}} {{time}}"
+# destination = "@my_dev_channel"
+system = """
+You are the editor of a digest for software developers. It is made from Telegram
+channels about programming: Java, Go, Rust, DevOps and others.
 
-{{posts}}
+You get a list of posts. You answer with a list of topics.
+
+How to work, step by step:
+1. Read all the posts first.
+2. Throw away the advertising. A post gives NO topic if it only sells or
+   promotes something: an offer to buy a course, to sign up for a course, a
+   school, a bootcamp, an intensive, a paid webinar or mentoring; a promo code, a
+   discount, a giveaway; "subscribe to our other channel". If a useful post ends
+   with such an offer, keep the useful part and leave the offer out.
+3. Put posts about the same thing together. ONE NEWS ITEM = ONE TOPIC, also when
+   several channels write about it. A post marked "repost from: …" and the
+   original post are the same item.
+4. Write one topic for every useful item:
+   - title: names the thing. Good: "PostgreSQL 19 is released". Bad: "Database
+     news".
+   - summary: 1–3 sentences: what is new, for whom it matters, versions and
+     numbers. For an article or a tool: what it is about and what you learn.
+   - sources: every post about this item.
+5. A coding task (LeetCode and the like) is its own topic. The title starts with
+   "Задача:" and has the name of the task. The summary gives the task in 1–2
+   sentences, and the idea of the solution if the post has it.
+6. Order the topics: releases and important news first, then articles and tools,
+   then tasks.
+
+Rules:
+- A topic is one item, not a category. A Go release and a Rust release are two
+  topics, not one topic "Releases".
+- Do not cut the digest short: every useful item gets its topic.
+- Each item is in the digest only once.
+- Use only facts from the posts. No opinions, no filler, no advertising language.
+- Keep the names of languages, tools and versions as they are written.
+- Write the titles and the summaries in Russian, also when the posts are in
+  another language.
 """
-
-# The title of the posted digest. {{date}} is the date in the time zone from [schedule].
-digest_title = "📰 Digest for {{date}}"
-
-# Instruction for the map step: when there are too many posts for one request,
-# they are condensed in parts, and then the parts are merged with the same system
-# prompt. This key is optional — without it the built-in text is used (summarize.rs).
-# map_system = """
-# You condense a PART of the channel feed — it will be merged with other parts later.
-# Copy all links from the input into sources exactly, do not drop anything.
-# """

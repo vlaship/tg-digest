@@ -497,15 +497,12 @@ pub fn render_parts(digest: &Digest, opts: &RenderOptions) -> Vec<Part> {
     // The first message is the title, then every topic is its own message. `pack` still cuts a block that alone is longer than the limit.
     let mut blocks: Vec<String> = Vec::new();
 
-    let date = opts
-        .now
-        .with_timezone(&opts.timezone)
-        .format("%d.%m.%Y")
-        .to_string();
-    blocks.push(format!(
-        "<b>{}</b>",
-        escape(&opts.digest_title.replace("{{date}}", &date))
-    ));
+    let now = opts.now.with_timezone(&opts.timezone);
+    let title = opts
+        .digest_title
+        .replace("{{date}}", &now.format("%d.%m.%Y").to_string())
+        .replace("{{time}}", &now.format("%H:%M").to_string());
+    blocks.push(format!("<b>{}</b>", escape(&title)));
 
     let mut messages: Vec<Part> = pack(blocks)
         .into_iter()
