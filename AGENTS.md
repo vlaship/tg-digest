@@ -44,6 +44,8 @@ use it is in [README.md](README.md).
 - `cargo run -- --config config.toml run --dry-run` — make `out/digest.html` with Anthropic, post nothing.
 - `cargo run -- --config config.toml serve` — run the scheduler and the command listener.
 - `docker compose run --rm -it tg-digest login`, then `docker compose up -d --build` — the normal deploy.
+- `make update` — pull the CI image, start it, follow the logs; `make restart` —
+  restart the container, follow the logs.
 
 The CLI default paths point to `/data`, the container volume. When you run
 locally, pass `--config` and change `session_file` / `db_file`.

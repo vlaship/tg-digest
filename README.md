@@ -65,8 +65,16 @@ Pull requests only build the image, they do not publish it. To build it by hand
 without publishing, run the `docker` workflow from the Actions tab (or
 `gh workflow run docker`); tick "publish" only if you want to push the result.
 
-To use it instead of a local build, change `image:` in `compose.yaml` to one of
-these tags and run `docker compose pull` instead of `docker compose build`.
+`compose.yaml` uses `latest`, so `docker compose pull` takes the new image.
+For one exact build, put its tag in `image:`.
+
+Two short forms are in the `Makefile`:
+
+- `make update` — `docker compose pull`, `up -d`, then follow the logs;
+- `make restart` — restart the container (it reads `data/config.toml` again),
+  then follow the logs.
+
+`Ctrl+C` stops following the logs, the container keeps running.
 
 Stopping (`docker stop`) is safe. Collecting posts and the model request stop at
 once. The current part of the digest is sent to the end. Anything not delivered
