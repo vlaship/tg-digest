@@ -22,8 +22,9 @@ run that posts, on purpose: two processes on one database would post two digests
 The CLI is kept for debugging: `login`, `preview`, `run --dry-run`.
 
 The default paths point to the container volume (`/data`). So locally every
-command needs `--config config.toml`, and the config itself needs local
-`session_file` and `db_file` paths.
+command needs `--config config.toml`, and the config itself needs a local
+`data_dir` (for example `"data"`). `db_file` and `session_file` are file names
+inside it, with defaults.
 
 ## Before you start
 

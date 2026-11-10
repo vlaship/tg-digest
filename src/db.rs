@@ -288,10 +288,9 @@ impl Db {
         })
     }
 
-    /// Channels and runs with no theme in the config go to this theme, the first one
-    /// in the config. `from` is an empty tag (rows from before themes) or the tag of
-    /// the default theme (rows from the time when the config had no `[[themes]]`).
-    /// Called on every start; it does nothing when no such rows are left.
+    /// Channels and runs of the tag `from` go to this theme. With an empty `from`
+    /// these are the rows from before themes; they go to the first theme of the
+    /// config. Called on every start; it does nothing when no such rows are left.
     pub async fn adopt_theme(&self, from: &str, theme: &str) -> Result<()> {
         let channels = self
             .conn
