@@ -10,10 +10,17 @@
 # Channels are not set here: add them with /add in the chat with the bot. The list is
 # stored in the database.
 
+# The folder with all state: the database and both session files. In the
+# container it is the /data volume. For a local run: "data".
+# The three file names below are optional: without them the files are
+# digest.db, tg.session and bot.session.
+data_dir = "/data"
+
 # Database: channels, cursors, journal of runs and digest parts.
 # It is in the same volume as the session: an unfinished run must survive
 # a container restart, together with the text of its parts and their random_id.
-db_file = "/data/digest.db"
+# A file name inside data_dir, not a path.
+# db_file = "digest.db"
 
 # Which model writes the digest, as "provider/model" from [providers] below.
 # /model in the bot switches it; this is the default.
@@ -92,7 +99,8 @@ phone    = "+1-000-00-00"
 
 # Session file (SQLite). The `tg-digest login` command creates it.
 # WARNING: it gives full access to the account — do not commit it or copy it anywhere.
-session_file = "/data/tg.session"
+# A file name inside data_dir, not a path.
+# session_file = "tg.session"
 
 # ------------------------------------------------------------- telegram.bot --
 # The bot you talk to: you write commands to it, and it writes back the replies,
@@ -107,7 +115,8 @@ session_file = "/data/tg.session"
 token = ""
 
 # Bot session (SQLite), created on the first start. No login is needed for a bot.
-session_file = "/data/bot.session"
+# A file name inside data_dir, not a path.
+# session_file = "bot.session"
 
 # ---------------------------------------------------------------- providers --
 # Each provider needs only its key. `model` and `fallback` at the top of this file
@@ -175,9 +184,8 @@ request_timeout_secs = 1200
 # Edit them here, no rebuild needed. Placeholders in user_template:
 #   {{now}} {{lookback_hours}} {{post_count}} {{channel_count}} {{posts}}
 #
-# The system prompt of each digest is in its [[themes]] block below. A `system`
-# key here is the prompt for themes that have none (and for a config with no
-# [[themes]] at all).
+# This part is shared by all themes. The system prompt and the title of each
+# digest are in its [[themes]] block below.
 [prompts]
 user_template = """
 Digest for the period: the last {{lookback_hours}} h (as of {{now}}).
@@ -185,10 +193,6 @@ Collected {{post_count}} posts from {{channel_count}} channels.
 
 {{posts}}
 """
-
-# The title of the posted digest, for themes that have no `title`. {{date}} and
-# {{time}} are in the time zone from [schedule].
-digest_title = "📰 Digest for {{date}}"
 
 # Instruction for the map step: when there are too many posts for one request,
 # they are condensed in parts, and then the parts are merged with the same system
@@ -199,6 +203,7 @@ digest_title = "📰 Digest for {{date}}"
 # """
 
 # ------------------------------------------------------------------- themes --
+# At least one theme is needed.
 # A theme is its own digest: its own channels, its own system prompt, its own
 # title. The themes run one after another, in the order of the blocks here, on the
 # same schedule. They know nothing about each other: a channel can be in several
@@ -207,18 +212,19 @@ digest_title = "📰 Digest for {{date}}"
 #   tag         — one word of small letters, digits, _ or -. It names the theme
 #                 in commands: /add dev @channel, /run dev, /list.
 #                 Do not rename a tag later: the channels are stored under it.
-#   title       — the title of the digest ({{date}}, {{time}})
-#   system      — the system prompt of the theme
+#   title       — the title of the digest, needed. {{date}} and {{time}} are in
+#                 the time zone from [schedule]
+#   system      — the system prompt of the theme, needed
 #   destination — where this digest goes: "bot" or "@channel". Not set: the
 #                 destination from [telegram].
 #
 # /add without a tag adds the channel to the first theme. Channels that were
 # added before themes go to the first theme too.
-# With no [[themes]] block there is one theme, "main", made from [prompts].
 
 [[themes]]
 tag   = "world"
 title = "📰 Digest World News {{date}} {{time}}"
+# destination = "@my_world_channel"
 system = """
 You are the editor of a daily news digest made from Telegram channels.
 
