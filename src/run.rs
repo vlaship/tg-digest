@@ -28,8 +28,29 @@ pub const TRIGGER_MANUAL: &str = "manual";
 /// Key in the `settings` table for the model the owner chose.
 const MODEL_SETTING: &str = "model";
 /// Key in the `settings` table for a one-time window set by `/reread`, in hours.
-/// It stays until a run reads the posts (any outcome but a failure).
-const REREAD_SETTING: &str = "reread_hours";
+/// One key per theme: it stays until a run of THAT theme reads the posts (any
+/// outcome but a failure), so a failed theme keeps its window for its next run.
+fn reread_setting(theme: &str) -> String {
+    format!("reread_hours:{theme}")
+}
+
+/// The key of the `/reread` window from before it was per theme: one window for all.
+const OLD_REREAD_SETTING: &str = "reread_hours";
+
+/// A database from before: a `/reread` window that still waits for a run goes to
+/// every theme, and the old key is deleted. Called on every start; it does nothing
+/// when there is no old key.
+pub async fn adopt_old_reread(db: &Db, cfg: &Config) -> Result<()> {
+    let Some(hours) = db.setting(OLD_REREAD_SETTING).await? else {
+        return Ok(());
+    };
+    for theme in cfg.themes() {
+        db.set_setting(&reread_setting(&theme.tag), &hours).await?;
+    }
+    db.delete_setting(OLD_REREAD_SETTING).await?;
+    tracing::info!(%hours, "the reread window now belongs to every theme");
+    Ok(())
+}
 
 /// How a trigger ended. We reply to `/run` with the same text.
 pub enum Outcome {
@@ -200,29 +221,43 @@ impl Runner {
     /// run one after another and do not depend on each other: each one has its own
     /// channels, cursors and runs. `only` limits the trigger to one theme.
     pub async fn trigger(&self, trigger: &str, only: Option<&Theme>) -> Result<Outcomes> {
-        self.pass(trigger, only, true).await
+        self.pass(trigger, &self.themes(only), true).await
+    }
+
+    /// A trigger for a chosen set of themes in ONE pass: the names are refreshed
+    /// once and the `/run` tap comes once at the end. For the daemon start, where
+    /// only some themes have to run.
+    pub async fn trigger_themes(&self, trigger: &str, themes: &[Theme]) -> Result<Outcomes> {
+        self.pass(trigger, themes, true).await
+    }
+
+    fn themes(&self, only: Option<&Theme>) -> Vec<Theme> {
+        match only {
+            Some(theme) => vec![theme.clone()],
+            None => self.cfg.themes(),
+        }
     }
 
     /// Only deliver the undelivered runs, start nothing new: for the daemon start.
     pub async fn recover(&self) -> Result<Outcomes> {
-        self.pass(TRIGGER_CATCH_UP, None, false).await
+        self.pass(TRIGGER_CATCH_UP, &self.cfg.themes(), false).await
     }
 
-    async fn pass(&self, trigger: &str, only: Option<&Theme>, fresh: bool) -> Result<Outcomes> {
+    async fn pass(&self, trigger: &str, themes: &[Theme], fresh: bool) -> Result<Outcomes> {
         let Some(_guard) = self.try_lock() else {
             let busy = Outcome::Busy(self.running_id().await?);
             return Ok(Outcomes(vec![(String::new(), busy)]));
         };
+        self.pass_locked(trigger, themes, fresh).await
+    }
 
-        let themes = match only {
-            Some(theme) => vec![theme.clone()],
-            None => self.cfg.themes(),
-        };
+    /// The same as `pass`, for a caller that already holds the lock.
+    async fn pass_locked(&self, trigger: &str, themes: &[Theme], fresh: bool) -> Result<Outcomes> {
         let named = self.cfg.themes().len() > 1;
-        let (mut refreshed, mut read, mut failed, mut offer) = (false, false, false, false);
+        let (mut refreshed, mut offer) = (false, false);
         let mut out = Vec::new();
 
-        for theme in &themes {
+        for theme in themes {
             if self.cancel.is_cancelled() {
                 break;
             }
@@ -254,9 +289,13 @@ impl Runner {
                 Err(e) => self.broken(trigger, theme, e).instrument(span).await,
             };
 
-            if is_fresh {
-                read = true;
-                failed |= matches!(outcome, Outcome::Failed(..));
+            // The `/reread` window of the theme is used up once the theme has read
+            // its posts. A failed theme keeps it for its next run.
+            if is_fresh && !matches!(outcome, Outcome::Failed(..)) {
+                let key = reread_setting(&theme.tag);
+                if let Err(e) = self.db.delete_setting(&key).await {
+                    tracing::warn!(error = %format!("{e:#}"), "could not clear the reread window");
+                }
             }
             let delivered = match &outcome {
                 Outcome::Delivered(_) => true,
@@ -272,12 +311,6 @@ impl Runner {
             out.push((tag, outcome));
         }
 
-        // The `/reread` window stays while a theme still has to read with it.
-        if read && !failed {
-            if let Err(e) = self.db.delete_setting(REREAD_SETTING).await {
-                tracing::warn!(error = %format!("{e:#}"), "could not clear the reread window");
-            }
-        }
         // After a digest in the chat with the bot, one more message with `/run`: the
         // owner taps it to build the next digest at once. Not for a channel: nobody
         // there can send commands.
@@ -294,10 +327,28 @@ impl Runner {
         tracing::error!(%trigger, %reason, "run failed");
         let short: String = reason.chars().take(300).collect();
         let text = format!("⚠️ The run failed: {short}");
+
+        // A run that broke while collecting must not stay `collecting` until the next
+        // restart. A run that is `summarized` or `publishing` is kept: it has its
+        // parts and is delivered later.
+        let mut run_id = self.running_id().await.unwrap_or_default();
+        match self.db.last_theme_run(&theme.tag).await {
+            Ok(Some(run)) if run.status == db::STATUS_COLLECTING => {
+                run_id = run.id;
+                if let Err(e) = self.db.fail_run(run.id, &reason).await {
+                    tracing::warn!(error = %format!("{e:#}"), run = run.id, "could not mark the run as failed");
+                }
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(error = %format!("{e:#}"), "could not read the run of the theme")
+            }
+        }
+
         if trigger != TRIGGER_MANUAL {
             self.notify(&self.named(&theme.tag, &text)).await;
         }
-        Outcome::Failed(self.running_id().await.unwrap_or_default(), text)
+        Outcome::Failed(run_id, text)
     }
 
     /// A notification text with the theme tag in front, when there are several themes.
@@ -310,26 +361,78 @@ impl Runner {
     }
 
     /// `/reread N`: read all channels again for the last N days (of one theme, or of
-    /// all). The cursors go to 0, and the next run uses a window of N days instead of
-    /// `lookback_hours`. The caller holds the lock and then starts the run.
-    pub async fn prepare_reread(&self, days: i64, only: Option<&Theme>) -> Result<usize> {
-        let channels = match only {
-            Some(theme) => self.db.theme_channels(&theme.tag).await?,
-            None => self.db.enabled_channels().await?,
+    /// all), then run at once. The cursors go to 0, and the next run of each theme
+    /// uses a window of N days instead of `lookback_hours`. One lock covers both
+    /// steps, so a scheduled run cannot start between them. The `Err` is the
+    /// refusal text: a run is going, or a theme has an undelivered run.
+    pub async fn reread(
+        &self,
+        days: i64,
+        only: Option<&Theme>,
+    ) -> Result<std::result::Result<(usize, Outcomes), String>> {
+        let Some(_guard) = self.try_lock() else {
+            return Ok(Err(Outcome::Busy(self.running_id().await?).to_string()));
         };
-        for channel in &channels {
-            self.db.reset_channel(&channel.theme, channel.id).await?;
+        let themes = self.themes(only);
+        for theme in &themes {
+            if let Some(refusal) = self.undelivered_refusal(Some(&theme.tag)).await? {
+                return Ok(Err(refusal));
+            }
         }
-        self.db
-            .set_setting(REREAD_SETTING, &(days * 24).to_string())
-            .await?;
-        tracing::info!(days, channels = channels.len(), "reread prepared");
-        Ok(channels.len())
+
+        let mut count = 0;
+        for theme in &themes {
+            for channel in self.db.theme_channels(&theme.tag).await? {
+                self.db.reset_channel(&channel.theme, channel.id).await?;
+                count += 1;
+            }
+            self.db
+                .set_setting(&reread_setting(&theme.tag), &(days * 24).to_string())
+                .await?;
+        }
+        tracing::info!(days, channels = count, "reread prepared");
+
+        let outcomes = self.pass_locked(TRIGGER_MANUAL, &themes, true).await?;
+        Ok(Ok((count, outcomes)))
     }
 
-    /// The window of the next run, in hours: from `/reread`, else `lookback_hours`.
-    async fn lookback_hours(&self) -> (i64, bool) {
-        match self.db.setting(REREAD_SETTING).await {
+    /// The refusal for a command that touches cursors while a run is undelivered:
+    /// delivery would write the run's saved cursors over the change. Only the theme
+    /// of the command counts (`None`: any theme); a run of one theme never blocks
+    /// another theme.
+    pub async fn undelivered_refusal(&self, theme: Option<&str>) -> Result<Option<String>> {
+        let run = match theme {
+            Some(theme) => self.db.unfinished_theme_run(theme).await?,
+            None => self.db.unfinished_run().await?,
+        };
+        Ok(run.map(|run| {
+            format!(
+                "there is an undelivered run #{} ({}) — /run to deliver it or /abandon {}",
+                run.id, run.theme, run.id
+            )
+        }))
+    }
+
+    /// The prompts of the theme for the model. A channel often writes about
+    /// yesterday's story again in a new post: tell the model what the last digest
+    /// already had. Not on `/reread`: the owner asked for these days again, the old
+    /// topics would be dropped. `run --dry-run` uses this too, so it sees the same.
+    pub async fn theme_prompts(&self, theme: &Theme, reread: bool) -> Prompts {
+        let previous = if reread {
+            Vec::new()
+        } else {
+            self.db.last_digest_topics(&theme.tag).await.unwrap_or_else(|e| {
+                tracing::warn!(error = %format!("{e:#}"), "could not read the last digest topics");
+                Vec::new()
+            })
+        };
+        with_previous_topics(&theme.prompts, &previous)
+    }
+
+    /// The window of the next run of the theme, in hours: from `/reread`, else
+    /// `lookback_hours`. The flag says it is a `/reread` window.
+    pub async fn lookback_hours(&self, theme: &str) -> (i64, bool) {
+        match self.db.setting(&reread_setting(theme)).await {
             Ok(Some(hours)) => match hours.parse() {
                 Ok(hours) => (hours, true),
                 Err(_) => (self.cfg.telegram.lookback_hours, false),
@@ -465,7 +568,7 @@ impl Runner {
             });
         }
 
-        let (lookback_hours, reread) = self.lookback_hours().await;
+        let (lookback_hours, reread) = self.lookback_hours(&theme.tag).await;
         let collected = match tg::collect_posts(
             &self.client,
             &self.cfg,
@@ -514,18 +617,7 @@ impl Runner {
             Ok(s) => s,
             Err(e) => return self.fail(run_id, trigger, theme, e).await,
         };
-        // A channel often writes about yesterday's story again in a new post: tell the
-        // model what the last digest already had. Not on `/reread`: the owner asked for
-        // these days again, the old topics would be dropped.
-        let previous = if reread {
-            Vec::new()
-        } else {
-            self.db.last_digest_topics(&theme.tag).await.unwrap_or_else(|e| {
-                tracing::warn!(error = %format!("{e:#}"), "could not read the last digest topics");
-                Vec::new()
-            })
-        };
-        let prompts = with_previous_topics(&theme.prompts, &previous);
+        let prompts = self.theme_prompts(theme, reread).await;
         let summary = match summarizer
             .summarize(
                 &prompts,

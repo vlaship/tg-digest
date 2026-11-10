@@ -977,7 +977,7 @@ The text above about folders and the seed is history: it describes earlier steps
 - In the database `channels` has the key `(theme, id)` and `runs` has a `theme`
   column. An old database is updated on start (`prepare_themes`,
   `copy_old_channels`), and rows with no theme go to the first theme
-  (`adopt_legacy`). This is the only migration.
-- Shared by all themes: the schedule, the model, the lock, the `/reread` window,
+  (`Db::adopt_theme`, called by `adopt_old_channels`). This is the only migration.
+- Shared by all themes: the schedule, the model, the lock,
   the Telegram sessions.
 - Commands take a tag as the first word (`/add dev @channel`, `/run dev`).

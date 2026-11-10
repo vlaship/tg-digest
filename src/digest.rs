@@ -678,7 +678,7 @@ fn len16(s: &str) -> usize {
 
 /// Telegram-HTML needs `&`, `<`, `>` to be escaped; we escape the quote too,
 /// or a URL with `"` would break the `href` attribute.
-fn escape(s: &str) -> String {
+pub(crate) fn escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")

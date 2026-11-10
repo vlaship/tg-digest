@@ -25,7 +25,7 @@ use it is in [README.md](README.md).
 | `src/telegram/bot.rs` | the bot: login with the token, the chat with the owner, notifications |
 | `src/telegram/commands.rs` | commands to the bot (`/add`, `/rm`, `/run`, `/status`, …), only from the owner |
 | `src/models.rs` | the model catalog: each provider's model list and limits from its API, kept in `settings` |
-| `src/summarize.rs` | HTTP calls to the model API (Anthropic, Gemini or OpenRouter, `[providers]`), map-reduce |
+| `src/summarize.rs` | HTTP calls to the model API (Anthropic, Gemini, OpenRouter or OpenAI, `[providers]`), map-reduce |
 | `src/digest.rs` | JSON schema of the answer, link checks, Telegram-HTML rendering, splitting |
 | `Dockerfile`, `compose.yaml` | image and run; all state is in the `/data` volume |
 
@@ -82,7 +82,7 @@ config: a tag (one word), a title, a system prompt and, if set, its own
 `destination`. At least one block is needed; `[prompts]` has only what the themes
 share (`user_template`, `map_system`). On a trigger the themes run one after another in the config order,
 like separate instances: each has its own channel rows (`channels` key is
-`(theme, id)`), cursors, runs and last digest topics. A channel can be in several
+`(theme, id)`), cursors, runs, last digest topics and `/reread` window. A channel can be in several
 themes, and then its news is in each digest. An error or an undelivered run in
 one theme never blocks another. Shared: the schedule, the model, the lock, the
 sessions. Commands take the tag as the first word (`/add dev @channel`,

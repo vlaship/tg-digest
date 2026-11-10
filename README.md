@@ -118,8 +118,11 @@ they do not change the saved channels or cursors.
 
 When the daemon starts, it always checks for an undelivered digest, whatever
 `catch_up` and `run_on_start` say. A fresh one is delivered. For an old one it
-waits for `/resume` or `/abandon`. Commands also work during a manual run, but
-commands that change state are refused at that time. They are not queued.
+waits for `/resume` or `/abandon`. A theme that had an undelivered digest does not
+also get a new run on that start (`run_on_start` or `catch_up`); the other themes
+do. Commands also work during a manual run, but commands that change state (and
+`/last`) are refused at that time. They are not queued. An undelivered digest of
+one theme blocks `/add`, `/rm`, `/reset`, `/skip` and `/reread` only for that theme.
 
 ## Settings
 
@@ -183,16 +186,16 @@ that is not in the config as "not read".
 
 | Command | What it does |
 |---|---|
-| `/add @channel`, `/add t.me/name`, `/add t.me/+link`, `/add id` | add the channel; the digest starts from your read mark if you follow it, else only posts after adding go into it. Several channels at once: `/add @a @b @c` (spaces, commas or new lines). With a theme: `/add dev @a @b`; without one the first theme is used |
-| `/rm @channel` · `/rm id` | turn the channel off. `/rm dev @channel` when the channel is in several themes |
-| `/list` | channels by theme: id, username, on/off, cursor, last error |
+| `/add @channel`, `/add t.me/name`, `/add t.me/+link`, `/add id` | add the channel; the digest starts from your read mark if you follow it, else only posts after adding go into it. Several channels at once: `/add @a @b @c` (spaces, commas or new lines; a new line may start with `/add` again). With a theme: `/add dev @a @b`; without one the first theme is used |
+| `/rm @channel` · `/rm id` | turn the channel off (`@name`, `t.me/name` or id). Several at once: `/rm @a @b`, or one `/rm` per line in one message. `/rm dev @channel` when the channel is in several themes |
+| `/list` | channels by theme, one message per theme: id, username, on/off, cursor, last error |
 | `/reset id` | read the channel again from the `lookback_hours` window (`/reset dev id` for one theme) |
 | `/skip` | move all channels to their newest message: older posts are skipped (`/skip dev` for one theme) |
 | `/run` | run all themes now (or deliver an undelivered digest); `/run dev` runs one theme. After a digest in the chat the bot sends `/run` to tap |
-| `/reread N` | read all channels again for the last N days (1–7) and run now; the last digest topics are not excluded. `/reread N dev` for one theme |
+| `/reread N` | read all channels again for the last N days (1–7) and run now; the last digest topics are not excluded. `/reread N dev` for one theme. Each theme keeps its window until it has read its posts: a theme whose run failed uses it on its next run |
 | `/status` | last run of each theme: status, posts, topics, tokens, parts |
 | `/last` | send the last digest of each theme again (`/last dev` for one) |
-| `/model [provider/model]` | the models from the config with their limits, or switch to any model of a provider |
+| `/model [provider/model]` | the models from the config with their limits, or switch to any model of a provider. Model ids are in monospace: one tap copies them |
 | `/models provider [word]` | the models the provider has; the word filters the ids, `free` keeps the free ones |
 | `/fallback` | switch to the next model in `fallback` and run now |
 | `/resume N` · `/abandon N` | deliver or cancel an undelivered run |
