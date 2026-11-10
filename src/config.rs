@@ -362,15 +362,20 @@ impl Config {
             .map_or(&none, |m| &m.settings);
         let p = &provider.settings;
 
-        let max_tokens = m
-            .max_tokens
-            .or_else(|| {
-                entry?
-                    .output_tokens
-                    .map(|t| t.min(u64::from(kind.default_max_tokens())) as u32)
-            })
-            .or(p.max_tokens)
-            .unwrap_or_else(|| kind.default_max_tokens());
+        let max_tokens = m.max_tokens.unwrap_or_else(|| {
+            let wanted = entry
+                .and_then(|e| e.output_tokens)
+                .map(|t| t.min(u64::from(kind.default_max_tokens())) as u32)
+                .or(p.max_tokens)
+                .unwrap_or_else(|| kind.default_max_tokens());
+            // A small model (32k tokens for everything) with the default answer limit
+            // would have almost no room for the input: every post would go to the
+            // model alone. The answer gets at most half of the window.
+            match entry.and_then(|e| e.input_tokens) {
+                Some(window) => wanted.min(u32::try_from(window / 2).unwrap_or(u32::MAX).max(1)),
+                None => wanted,
+            }
+        });
         let max_input_chars = m
             .max_input_chars
             .or_else(|| {
@@ -466,6 +471,12 @@ impl Config {
         self.model(&self.model, None).context("model")?;
         for key in &self.fallback {
             self.model(key, None).context("fallback")?;
+        }
+        if self.schedule.timezone.parse::<chrono_tz::Tz>().is_err() {
+            bail!(
+                "schedule.timezone {:?} is unknown, an IANA name like America/New_York is needed",
+                self.schedule.timezone
+            );
         }
         if self.telegram.lookback_hours <= 0 {
             bail!("telegram.lookback_hours must be greater than zero");

@@ -310,13 +310,13 @@ async fn schedule_loop(runner: Arc<Runner>, scheduler: Scheduler, cancel: Cancel
 
     if runner.db.unfinished_run().await?.is_some() {
         tracing::info!("recovering an undelivered run on start");
-        report(runner.trigger(TRIGGER_CATCH_UP).await?);
+        fire(&runner, TRIGGER_CATCH_UP).await?;
     } else if runner.cfg.schedule.run_on_start {
         tracing::info!("run_on_start: start run");
-        report(runner.trigger(TRIGGER_CRON).await?);
+        fire(&runner, TRIGGER_CRON).await?;
     } else if runner.cfg.schedule.catch_up && scheduler.missed_since(last_finished, Utc::now())? {
         tracing::info!(?last_finished, "missed slot, catching up");
-        report(runner.trigger(TRIGGER_CATCH_UP).await?);
+        fire(&runner, TRIGGER_CATCH_UP).await?;
     }
 
     loop {
@@ -328,11 +328,26 @@ async fn schedule_loop(runner: Arc<Runner>, scheduler: Scheduler, cancel: Cancel
             return Ok(());
         }
 
-        // An error in one run must not break the daemon: it is already saved in the
-        // database and sent as a notification, we wait for the next slot. Only
-        // fatal errors go out — for example, a revoked session.
-        report(runner.trigger(TRIGGER_CRON).await?);
+        fire(&runner, TRIGGER_CRON).await?;
     }
+}
+
+/// One scheduled run. An error in one run must not break the daemon: we tell the
+/// owner and wait for the next slot. Only fatal errors go out — for example, a
+/// revoked session. Otherwise Docker restarts the daemon, `run_on_start` or
+/// `catch_up` starts the same run again, and every restart pays for the model.
+async fn fire(runner: &Runner, trigger: &str) -> Result<()> {
+    match runner.trigger(trigger).await {
+        Ok(outcome) => report(outcome),
+        Err(e) if telegram::client::is_fatal(&e) => return Err(e),
+        Err(e) => {
+            let reason = format!("{e:#}");
+            tracing::error!(%trigger, %reason, "run failed");
+            let short: String = reason.chars().take(300).collect();
+            runner.notify(&format!("⚠️ The run failed: {short}")).await;
+        }
+    }
+    Ok(())
 }
 
 /// A missed slot is a warn, not an info: the owner notices a silently missed
