@@ -6,6 +6,10 @@
 //!
 //! Channels are named by `@username` or by numeric `id`: private channels have
 //! no username, so `/list` and the `/add` reply always show the `id`.
+//!
+//! A command can start its argument with a theme tag (`/add dev @channel`,
+//! `/run dev`). Without a tag `/add` uses the first theme, `/rm` and `/reset` find
+//! the theme of the channel, and the other commands work on all themes.
 
 use anyhow::{anyhow, bail, Context, Result};
 use grammers_client::client::UpdatesConfiguration;
@@ -19,28 +23,32 @@ use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::task::JoinSet;
 
 use crate::cancel::Cancel;
-use crate::db::Channel;
+use crate::config::Theme;
+use crate::db::{Channel, Run};
 use crate::run::{Outcome, Runner, TRIGGER_MANUAL};
 use crate::telegram::client::is_auth_error;
 use crate::telegram::{channels, publish};
 
 const HELP: &str = "\
 Commands:
-/add @channel | link | id … — add one or more channels
-/rm @channel | id — remove a channel
-/list — channels, cursors, errors
-/reset id — read the channel again from the lookback_hours window
-/skip — move all channels to their newest message: older posts are skipped
-/run — run now (or deliver an undelivered digest)
-/reread N — read all channels again for the last N days (1–7) and run now
-/status — version and last run: status, posts, tokens
+/add [theme] @channel | link | id … — add one or more channels (no theme: the first one)
+/rm [theme] @channel | id — remove a channel
+/list — themes, channels, cursors, errors
+/reset [theme] id — read the channel again from the lookback_hours window
+/skip [theme] — move the channels to their newest message: older posts are skipped
+/run [theme] — run now (or deliver an undelivered digest)
+/reread N [theme] — read the channels again for the last N days (1–7) and run now
+/status — version and the last run of each theme: status, posts, tokens
 /model [provider/model] — the models from the config, or switch to any model
 /models provider [word] — the models the provider has (word: a part of the id, or free)
 /fallback — switch to the next fallback model and run now
-/last — send the last digest again
+/last [theme] — send the last digest again
 /resume N — deliver an old run (a duplicate is possible)
 /abandon N — cancel an undelivered run
-/help — this help";
+/help — this help
+
+A theme is its tag from the config, one word. A channel can be in several themes:
+each theme reads it on its own.";
 
 /// Run the updates loop until the shutdown signal comes.
 pub async fn listen(
@@ -193,7 +201,13 @@ async fn handle(runner: &Arc<Runner>, text: &str) -> Result<String> {
         "/fallback" => fallback(runner).await,
         "/list" => list(runner).await,
         "/status" => status(runner).await,
-        "/run" => Ok(runner.trigger(TRIGGER_MANUAL).await?.to_string()),
+        "/run" => match only_theme(runner, arg) {
+            Ok(theme) => Ok(runner
+                .trigger(TRIGGER_MANUAL, theme.as_ref())
+                .await?
+                .to_string()),
+            Err(refusal) => Ok(refusal),
+        },
         "/reread" => reread(runner, arg).await,
         "/resume" => match arg.parse::<i64>() {
             Ok(id) => Ok(runner.resume(id).await?.to_string()),
@@ -207,10 +221,77 @@ async fn handle(runner: &Arc<Runner>, text: &str) -> Result<String> {
         "/add" => guarded(runner, add_many(runner, arg)).await,
         "/rm" => guarded(runner, remove(runner, arg)).await,
         "/reset" => guarded(runner, reset(runner, arg)).await,
-        "/skip" => guarded(runner, skip(runner)).await,
-        "/last" => guarded(runner, last(runner)).await,
+        "/skip" => guarded(runner, skip(runner, arg)).await,
+        "/last" => guarded(runner, last(runner, arg)).await,
         other => Ok(format!("unknown command {other}\n\n{HELP}")),
     }
+}
+
+/// The theme tag at the start of the argument, and the rest. No tag there: `None`
+/// and the whole argument.
+fn split_theme<'a>(runner: &Runner, arg: &'a str) -> (Option<Theme>, &'a str) {
+    let (first, rest) = match arg.split_once(char::is_whitespace) {
+        Some((first, rest)) => (first, rest.trim()),
+        None => (arg, ""),
+    };
+    match runner.cfg.theme(first) {
+        Some(theme) => (Some(theme), rest),
+        None => (None, arg),
+    }
+}
+
+/// For a command whose whole argument is a theme tag or nothing (`/run`, `/skip`,
+/// `/last`). The `Err` is the reply for a word that is not a theme.
+fn only_theme(runner: &Runner, arg: &str) -> std::result::Result<Option<Theme>, String> {
+    if arg.is_empty() {
+        return Ok(None);
+    }
+    match runner.cfg.theme(arg) {
+        Some(theme) => Ok(Some(theme)),
+        None => Err(format!(
+            "there is no theme {arg}. Themes: {}",
+            theme_tags(runner)
+        )),
+    }
+}
+
+fn theme_tags(runner: &Runner) -> String {
+    let tags: Vec<String> = runner.cfg.themes().into_iter().map(|t| t.tag).collect();
+    tags.join(", ")
+}
+
+/// The row a command means by `[theme] channel`. Without a theme the channel must
+/// be in one theme only. The inner `Err` is the reply when it is not clear.
+async fn pick_channel(
+    runner: &Runner,
+    arg: &str,
+    command: &str,
+) -> Result<std::result::Result<Channel, String>> {
+    let (theme, key) = split_theme(runner, arg);
+    if key.is_empty() {
+        return Ok(Err(format!(
+            "a channel is needed: {command} @name or {command} id"
+        )));
+    }
+    let mut rows = runner.db.find_channels(key).await?;
+    if let Some(theme) = &theme {
+        rows.retain(|c| c.theme == theme.tag);
+    }
+    // A row that is already turned off does not make the choice unclear.
+    if rows.len() > 1 && rows.iter().any(|c| c.enabled) {
+        rows.retain(|c| c.enabled);
+    }
+    if rows.len() > 1 {
+        let tags: Vec<&str> = rows.iter().map(|c| c.theme.as_str()).collect();
+        return Ok(Err(format!(
+            "{key} is in the themes {}. Write the theme: {command} {} {key}",
+            tags.join(", "),
+            tags[0]
+        )));
+    }
+    Ok(rows
+        .pop()
+        .ok_or_else(|| format!("channel {key} is not in the database, /list shows the list")))
 }
 
 /// Commands that touch cursors go under the same lock as the run,
@@ -351,7 +432,7 @@ async fn fallback(runner: &Arc<Runner>) -> Result<String> {
     if let Err(e) = runner.set_model(&fallback).await {
         return Ok(format!("cannot switch to {fallback}: {e:#}"));
     }
-    let outcome = runner.trigger(TRIGGER_MANUAL).await?;
+    let outcome = runner.trigger(TRIGGER_MANUAL, None).await?;
     Ok(format!(
         "model: {fallback} (was {current}). /model {current} switches back.\n\n{outcome}"
     ))
@@ -363,40 +444,93 @@ async fn list(runner: &Arc<Runner>) -> Result<String> {
         return Ok("no channels yet: add one with /add @channel".into());
     }
 
-    let mut out = String::new();
+    // The themes in the config order, then the tags that only the database has.
+    let mut tags: Vec<String> = runner.cfg.themes().into_iter().map(|t| t.tag).collect();
+    let known = tags.len();
     for channel in &channels {
-        out.push_str(&format!(
-            "{} {} — id {}, {}, cursor {}{}\n",
-            if channel.enabled { "✅" } else { "⛔" },
-            channel.title,
-            channel.id,
-            channel
-                .username
-                .as_ref()
-                .map(|u| format!("@{u}"))
-                .unwrap_or_else(|| "private".into()),
-            channel.last_msg_id,
-            channel
-                .last_error
-                .as_ref()
-                .map(|e| format!("\n   error: {e}"))
-                .unwrap_or_default(),
-        ));
+        if !tags.contains(&channel.theme) {
+            tags.push(channel.theme.clone());
+        }
+    }
+
+    let mut out = String::new();
+    for (i, tag) in tags.iter().enumerate() {
+        if tags.len() > 1 {
+            let note = if i >= known {
+                " (not in the config, not read)"
+            } else {
+                ""
+            };
+            out.push_str(&format!("— {tag}{note} —\n"));
+        }
+        let rows: Vec<&Channel> = channels.iter().filter(|c| c.theme == *tag).collect();
+        if rows.is_empty() {
+            out.push_str(&format!("no channels: /add {tag} @channel\n"));
+        }
+        for channel in rows {
+            out.push_str(&format!(
+                "{} {} — id {}, {}, cursor {}{}\n",
+                if channel.enabled { "✅" } else { "⛔" },
+                channel.title,
+                channel.id,
+                channel
+                    .username
+                    .as_ref()
+                    .map(|u| format!("@{u}"))
+                    .unwrap_or_else(|| "private".into()),
+                channel.last_msg_id,
+                channel
+                    .last_error
+                    .as_ref()
+                    .map(|e| format!("\n   error: {e}"))
+                    .unwrap_or_default(),
+            ));
+        }
     }
     Ok(out)
 }
 
 async fn status(runner: &Arc<Runner>) -> Result<String> {
-    let version = crate::version();
-    let Some(run) = runner.db.last_run().await? else {
-        return Ok(format!("version {version}\nthere were no runs yet"));
-    };
+    let mut out = format!("version {}", crate::version());
+    let themes = runner.cfg.themes();
+    let mut any = false;
+    for theme in &themes {
+        let Some(run) = runner.db.last_theme_run(&theme.tag).await? else {
+            continue;
+        };
+        any = true;
+        if themes.len() > 1 {
+            out.push_str(&format!("\n\n— {} —", theme.tag));
+        }
+        out.push_str(&run_status(runner, &run).await?);
+    }
+    if !any {
+        out.push_str("\nthere were no runs yet");
+    }
 
+    let channels = runner.db.channels().await?;
+    let broken: Vec<&Channel> = channels.iter().filter(|c| c.last_error.is_some()).collect();
+    if !broken.is_empty() {
+        out.push_str("\n\nchannels with errors:");
+        for channel in broken {
+            out.push_str(&format!(
+                "\n{} ({}) — {}",
+                channel.label(),
+                channel.theme,
+                channel.last_error.as_deref().unwrap_or_default()
+            ));
+        }
+    }
+    Ok(out)
+}
+
+/// One run for `/status`: the numbers and the delivery of each part.
+async fn run_status(runner: &Arc<Runner>, run: &Run) -> Result<String> {
     let chunks = runner.db.chunks(run.id).await?;
     let delivered = chunks.iter().filter(|c| c.delivered_at.is_some()).count();
 
     let mut out = format!(
-        "version {version}\nrun #{} ({}): {}\nstarted {}\nfinished {}\nposts {}, topics {}\ntokens: {} / {}\nparts: {delivered} of {}\ndestination: {}",
+        "\nrun #{} ({}): {}\nstarted {}\nfinished {}\nposts {}, topics {}\ntokens: {} / {}\nparts: {delivered} of {}\ndestination: {}",
         run.id,
         run.trigger,
         run.status,
@@ -432,19 +566,6 @@ async fn status(runner: &Arc<Runner>) -> Result<String> {
             (None, _) => format!("\n  part {}: not delivered", chunk.idx + 1),
         });
     }
-
-    let channels = runner.db.channels().await?;
-    let broken: Vec<&Channel> = channels.iter().filter(|c| c.last_error.is_some()).collect();
-    if !broken.is_empty() {
-        out.push_str("\n\nchannels with errors:");
-        for channel in broken {
-            out.push_str(&format!(
-                "\n{} — {}",
-                channel.label(),
-                channel.last_error.as_deref().unwrap_or_default()
-            ));
-        }
-    }
     Ok(out)
 }
 
@@ -453,17 +574,22 @@ async fn status(runner: &Arc<Runner>) -> Result<String> {
 /// `/add` with several channels separated by spaces, commas or new lines. Each one
 /// is added on its own: an error in one channel does not stop the others.
 async fn add_many(runner: &Arc<Runner>, arg: &str) -> Result<String> {
+    let (theme, arg) = split_theme(runner, arg);
+    let theme = match theme {
+        Some(theme) => theme,
+        None => runner.cfg.themes().remove(0),
+    };
     let items: Vec<&str> = arg
         .split(|c: char| c.is_whitespace() || c == ',')
         .filter(|s| !s.is_empty())
         .collect();
     if items.len() <= 1 {
-        return add(runner, arg.trim()).await;
+        return add(runner, &theme, arg.trim()).await;
     }
 
     let mut out = Vec::with_capacity(items.len());
     for item in items {
-        out.push(match add(runner, item).await {
+        out.push(match add(runner, &theme, item).await {
             Ok(reply) => reply,
             Err(e) => format!("{item}: {e:#}"),
         });
@@ -471,24 +597,28 @@ async fn add_many(runner: &Arc<Runner>, arg: &str) -> Result<String> {
     Ok(out.join("\n\n"))
 }
 
-async fn add(runner: &Arc<Runner>, arg: &str) -> Result<String> {
+async fn add(runner: &Arc<Runner>, theme: &Theme, arg: &str) -> Result<String> {
     if arg.is_empty() {
-        return Ok("a channel is needed: /add @name, /add https://t.me/+invite or /add id".into());
+        return Ok(
+            "a channel is needed: /add @name, /add https://t.me/+invite or /add id. \
+             With a theme: /add <theme> @name"
+                .into(),
+        );
     }
+    let tag = theme.tag.as_str();
 
-    // Already in the list: say so and touch nothing, its cursor stays. For a username
+    // Already in the theme: say so and touch nothing, its cursor stays. For a username
     // or an id the database answers without a request to Telegram.
     if !is_invite(arg) {
-        if let Some(channel) = runner.db.find_channel(username_from(arg)).await? {
-            if channel.enabled {
-                return Ok(already_added(&channel));
-            }
+        let rows = runner.db.find_channels(username_from(arg)).await?;
+        if let Some(channel) = rows.iter().find(|c| c.theme == tag && c.enabled) {
+            return Ok(already_added(channel));
         }
     }
 
     let peer = resolve_new_channel(runner, arg).await?;
     // An invite link is resolved only now, so check again by id.
-    if let Some(channel) = runner.db.channel(peer.id).await? {
+    if let Some(channel) = runner.db.theme_channel(tag, peer.id).await? {
         if channel.enabled {
             return Ok(already_added(&channel));
         }
@@ -497,16 +627,21 @@ async fn add(runner: &Arc<Runner>, arg: &str) -> Result<String> {
     let (username, title) = channels::describe(&runner.client, peer).await?;
     runner
         .db
-        .upsert_channel(peer.id, peer.access_hash, username.as_deref(), &title)
+        .upsert_channel(tag, peer.id, peer.access_hash, username.as_deref(), &title)
         .await?;
+    let place = if runner.cfg.themes().len() > 1 {
+        format!(" to {tag}")
+    } else {
+        String::new()
+    };
 
     // The account follows the channel: start from its read mark, so the posts it did
     // not read yet go into the digest.
     match channels::read_mark(&runner.client, peer).await {
         Ok(Some(mark)) => {
-            runner.db.set_cursor(peer.id, mark).await?;
+            runner.db.set_cursor(tag, peer.id, mark).await?;
             return Ok(format!(
-                "added: {title}, id {}. The digest starts from your read mark in Telegram \
+                "added{place}: {title}, id {}. The digest starts from your read mark in Telegram \
                  (cursor {mark}): the posts you did not read go into it",
                 peer.id
             ));
@@ -520,7 +655,7 @@ async fn add(runner: &Arc<Runner>, arg: &str) -> Result<String> {
     // Otherwise start from the newest message: only posts after adding go into the digest.
     // If we cannot read it, the channel keeps cursor 0 (the lookback_hours window).
     match channels::last_message_id(&runner.client, peer).await {
-        Ok(Some(last)) => runner.db.set_cursor(peer.id, last).await?,
+        Ok(Some(last)) => runner.db.set_cursor(tag, peer.id, last).await?,
         Ok(None) => {}
         Err(e) => {
             tracing::warn!(error = %format!("{e:#}"), channel = peer.id, "could not read the last message, the lookback window is used")
@@ -528,7 +663,7 @@ async fn add(runner: &Arc<Runner>, arg: &str) -> Result<String> {
     }
 
     Ok(format!(
-        "added: {title}, id {}. Only new posts from now on go into the digest \
+        "added{place}: {title}, id {}. Only new posts from now on go into the digest \
          (/reset {} reads the last lookback_hours too)",
         peer.id, peer.id
     ))
@@ -536,31 +671,38 @@ async fn add(runner: &Arc<Runner>, arg: &str) -> Result<String> {
 
 fn already_added(channel: &Channel) -> String {
     format!(
-        "already in the list: {}, id {}. /list shows all channels",
-        channel.title, channel.id
+        "already in the list of {}: {}, id {}. /list shows all channels",
+        channel.theme, channel.title, channel.id
     )
 }
 
 async fn remove(runner: &Arc<Runner>, arg: &str) -> Result<String> {
-    if arg.is_empty() {
-        return Ok("a channel is needed: /rm @name or /rm id".into());
-    }
-    let Some(channel) = runner.db.find_channel(arg).await? else {
-        return Ok(format!(
-            "channel {arg} is not in the database, /list shows the list"
-        ));
+    let channel = match pick_channel(runner, arg, "/rm").await? {
+        Ok(channel) => channel,
+        Err(reply) => return Ok(reply),
     };
 
     // Disabled, not deleted: `/list` still shows the channel with its last error.
-    runner.db.disable_channel(channel.id).await?;
+    runner
+        .db
+        .disable_channel(&channel.theme, channel.id)
+        .await?;
 
-    Ok(format!("disabled: {}, id {}", channel.title, channel.id))
+    Ok(format!(
+        "disabled in {}: {}, id {}",
+        channel.theme, channel.title, channel.id
+    ))
 }
 
-/// `/skip`: move every enabled channel to its newest message, so the next digest
-/// has only posts that come after this. A channel that cannot be read keeps its cursor.
-async fn skip(runner: &Arc<Runner>) -> Result<String> {
-    let channels = runner.db.enabled_channels().await?;
+/// `/skip [theme]`: move every enabled channel to its newest message, so the next
+/// digest has only posts that come after this. A channel that cannot be read keeps
+/// its cursor.
+async fn skip(runner: &Arc<Runner>, arg: &str) -> Result<String> {
+    let channels = match only_theme(runner, arg) {
+        Ok(Some(theme)) => runner.db.theme_channels(&theme.tag).await?,
+        Ok(None) => runner.db.enabled_channels().await?,
+        Err(refusal) => return Ok(refusal),
+    };
     if channels.is_empty() {
         return Ok("no channels yet: add one with /add @channel".into());
     }
@@ -569,7 +711,10 @@ async fn skip(runner: &Arc<Runner>) -> Result<String> {
     for channel in &channels {
         match channels::last_message_id(&runner.client, channel.into()).await {
             Ok(Some(last)) => {
-                runner.db.set_cursor(channel.id, last).await?;
+                runner
+                    .db
+                    .set_cursor(&channel.theme, channel.id, last)
+                    .await?;
                 moved += 1;
             }
             Ok(None) => {}
@@ -589,65 +734,89 @@ async fn skip(runner: &Arc<Runner>) -> Result<String> {
 }
 
 async fn reset(runner: &Arc<Runner>, arg: &str) -> Result<String> {
-    let Some(channel) = runner.db.find_channel(arg).await? else {
-        return Ok(format!(
-            "channel {arg} is not in the database, /list shows the list"
-        ));
+    let channel = match pick_channel(runner, arg, "/reset").await? {
+        Ok(channel) => channel,
+        Err(reply) => return Ok(reply),
     };
-    runner.db.reset_channel(channel.id).await?;
+    runner.db.reset_channel(&channel.theme, channel.id).await?;
     Ok(format!(
-        "{}: cursor reset, the next run reads a window of {} h",
-        channel.title, runner.cfg.telegram.lookback_hours
+        "{} ({}): cursor reset, the next run reads a window of {} h",
+        channel.title, channel.theme, runner.cfg.telegram.lookback_hours
     ))
 }
 
-/// `/reread N`: all channels again for the last N days, then a run at once. Takes
-/// `2`, `-2`, `2d` or `-2day`.
+/// `/reread N [theme]`: the channels again for the last N days, then a run at once.
+/// Takes `2`, `-2`, `2d` or `-2day`.
 async fn reread(runner: &Arc<Runner>, arg: &str) -> Result<String> {
-    let digits: String = arg.chars().filter(char::is_ascii_digit).collect();
+    const USAGE: &str = "write the number of days, 1 to 7: /reread 2 or /reread 2 <theme>";
+    let mut words = arg.split_whitespace();
+    let digits: String = words
+        .next()
+        .unwrap_or_default()
+        .chars()
+        .filter(char::is_ascii_digit)
+        .collect();
     let days = match digits.parse::<i64>() {
         Ok(days) if (1..=7).contains(&days) => days,
-        _ => return Ok("write the number of days, 1 to 7: /reread 2".into()),
+        _ => return Ok(USAGE.into()),
     };
-    let count = match guarded_value(runner, runner.prepare_reread(days)).await? {
+    let theme = match only_theme(runner, words.next().unwrap_or_default()) {
+        Ok(theme) => theme,
+        Err(refusal) => return Ok(refusal),
+    };
+    let count = match guarded_value(runner, runner.prepare_reread(days, theme.as_ref())).await? {
         Ok(count) => count,
         // The lock is taken or there is an undelivered run: the text says why.
         Err(refusal) => return Ok(refusal),
     };
-    let outcome = runner.trigger(TRIGGER_MANUAL).await?;
+    let outcome = runner.trigger(TRIGGER_MANUAL, theme.as_ref()).await?;
     Ok(format!("reread {days} d, {count} channels:\n{outcome}"))
 }
 
 /// A deliberate repeat, not a recovery: the parts go to the **current**
-/// `destination` and with new `random_id`.
-async fn last(runner: &Arc<Runner>) -> Result<String> {
-    let Some(run) = runner.db.last_ok_run().await? else {
-        return Ok("there were no published digests yet".into());
+/// destination of the theme and with new `random_id`.
+async fn last(runner: &Arc<Runner>, arg: &str) -> Result<String> {
+    let themes = match only_theme(runner, arg) {
+        Ok(Some(theme)) => vec![theme],
+        Ok(None) => runner.cfg.themes(),
+        Err(refusal) => return Ok(refusal),
     };
-    let chunks: Vec<String> = runner
-        .db
-        .chunks(run.id)
-        .await?
-        .into_iter()
-        .map(|c| c.html)
-        // Photo-only parts: their files are deleted after delivery, /last sends the text.
-        .filter(|html| !html.is_empty())
-        .collect();
-    if chunks.is_empty() {
-        return Ok(format!("run #{} has no saved parts", run.id));
-    }
-
     let bot = runner.bot()?;
-    let dest = publish::resolve_destination(bot, &runner.cfg.telegram.destination).await?;
-    let peer = publish::destination_ref(dest)?;
-    publish::resend(&bot.client, peer, &chunks, runner.cancellation()).await?;
+    let mut out = Vec::new();
+    for theme in &themes {
+        let Some(run) = runner.db.last_ok_run(&theme.tag).await? else {
+            out.push(format!(
+                "{}: there were no published digests yet",
+                theme.tag
+            ));
+            continue;
+        };
+        let chunks: Vec<String> = runner
+            .db
+            .chunks(run.id)
+            .await?
+            .into_iter()
+            .map(|c| c.html)
+            // Photo-only parts: their files are deleted after delivery, /last sends the text.
+            .filter(|html| !html.is_empty())
+            .collect();
+        if chunks.is_empty() {
+            out.push(format!("run #{} has no saved parts", run.id));
+            continue;
+        }
 
-    Ok(format!(
-        "run #{} sent again to {} ({} parts)",
-        run.id,
-        runner.cfg.telegram.destination,
-        chunks.len()
-    ))
+        let dest = publish::resolve_destination(bot, &theme.destination).await?;
+        let peer = publish::destination_ref(dest)?;
+        publish::resend(&bot.client, peer, &chunks, runner.cancellation()).await?;
+
+        out.push(format!(
+            "run #{} sent again to {} ({} parts)",
+            run.id,
+            theme.destination,
+            chunks.len()
+        ));
+    }
+    Ok(out.join("\n"))
 }
 
 /// `@username`, an invite link or a numeric id.

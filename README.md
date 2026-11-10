@@ -104,7 +104,7 @@ pass the config file and change `session_file` and `db_file` in it:
 cargo run -- --config config.toml login          # one-time login
 cargo run -- --config config.toml login --qr     # login by a QR code, if the code does not come
 cargo run -- --config config.toml preview        # how many posts were collected, no call to Claude
-cargo run -- --config config.toml run --dry-run  # digest in out/digest.html, nothing is posted
+cargo run -- --config config.toml run --dry-run  # digest in out/digest.html (out/digest-<tag>.html with several themes), nothing is posted; --theme dev for one theme
 cargo run -- --config config.toml serve          # the daemon: schedule + commands
 ```
 
@@ -150,19 +150,45 @@ account already follows). Remove it with `/rm`: the channel is turned off, not
 deleted, so `/list` still shows it. Titles and usernames are read again before
 every run, so a renamed channel keeps correct links.
 
+### Themes
+
+A theme is its own digest: its own channels, system prompt, title and, if you
+want, its own destination. You describe themes in the config as `[[themes]]`
+blocks (see `config.example.toml`: `world` for general news and `dev` for
+programming channels, which also drops adverts for courses):
+
+```toml
+[[themes]]
+tag         = "dev"
+title       = "💻 Digest DEV {{date}} {{time}}"
+destination = "@my_dev_channel"   # optional, else [telegram].destination
+system      = """..."""
+```
+
+On each schedule slot the themes run one after another, in the order of the
+blocks, and each one posts its own digest. They do not depend on each other: a
+channel can be in several themes (each theme keeps its own cursor for it, so its
+news is in each digest), and an error in one theme does not stop the others.
+
+The tag names the theme in commands: `/add dev @channel`, `/run dev`. `/add`
+without a tag uses the first theme. Channels from before themes go to the first
+theme on the first start; an old database is updated by itself. Do not rename a
+tag later: the channels are stored under it, and `/list` shows channels of a tag
+that is not in the config as "not read".
+
 ## Commands to the bot
 
 | Command | What it does |
 |---|---|
-| `/add @channel`, `/add t.me/name`, `/add t.me/+link`, `/add id` | add the channel; the digest starts from your read mark if you follow it, else only posts after adding go into it. Several channels at once: `/add @a @b @c` (spaces, commas or new lines) |
-| `/rm @channel` · `/rm id` | turn the channel off |
-| `/list` | channels: id, username, on/off, cursor, last error |
-| `/reset id` | read the channel again from the `lookback_hours` window |
-| `/skip` | move all channels to their newest message: older posts are skipped |
-| `/run` | run now (or deliver an undelivered digest); after each digest in the chat the bot sends `/run` to tap |
-| `/reread N` | read all channels again for the last N days (1–7) and run now; the last digest topics are not excluded |
-| `/status` | last run: status, posts, topics, tokens, parts |
-| `/last` | send the last digest again |
+| `/add @channel`, `/add t.me/name`, `/add t.me/+link`, `/add id` | add the channel; the digest starts from your read mark if you follow it, else only posts after adding go into it. Several channels at once: `/add @a @b @c` (spaces, commas or new lines). With a theme: `/add dev @a @b`; without one the first theme is used |
+| `/rm @channel` · `/rm id` | turn the channel off. `/rm dev @channel` when the channel is in several themes |
+| `/list` | channels by theme: id, username, on/off, cursor, last error |
+| `/reset id` | read the channel again from the `lookback_hours` window (`/reset dev id` for one theme) |
+| `/skip` | move all channels to their newest message: older posts are skipped (`/skip dev` for one theme) |
+| `/run` | run all themes now (or deliver an undelivered digest); `/run dev` runs one theme. After a digest in the chat the bot sends `/run` to tap |
+| `/reread N` | read all channels again for the last N days (1–7) and run now; the last digest topics are not excluded. `/reread N dev` for one theme |
+| `/status` | last run of each theme: status, posts, topics, tokens, parts |
+| `/last` | send the last digest of each theme again (`/last dev` for one) |
 | `/model [provider/model]` | the models from the config with their limits, or switch to any model of a provider |
 | `/models provider [word]` | the models the provider has; the word filters the ids, `free` keeps the free ones |
 | `/fallback` | switch to the next model in `fallback` and run now |

@@ -28,6 +28,11 @@ pub struct Config {
     #[serde(default)]
     pub providers: BTreeMap<String, Provider>,
     pub prompts: Prompts,
+    /// `[[themes]]`: independent digests, each with its own channels and system
+    /// prompt. They run one after another, in this order. Empty: one theme
+    /// (`DEFAULT_THEME`) made from `[prompts]`.
+    #[serde(default)]
+    pub themes: Vec<ThemeConfig>,
     /// Database file. In a container it is in the `/data` volume, next to the session.
     #[serde(default = "default_db_file")]
     pub db_file: String,
@@ -282,15 +287,54 @@ pub struct ModelSpec {
     pub json_schema: bool,
 }
 
+/// The tag of the only theme when the config has no `[[themes]]`.
+pub const DEFAULT_THEME: &str = "main";
+
+/// One `[[themes]]` block. What is not set comes from `[prompts]`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ThemeConfig {
+    /// One word that names the theme in commands: `/add dev @channel`.
+    pub tag: String,
+    /// Digest title, with `{{date}}` and `{{time}}`. Not set: `prompts.digest_title`.
+    #[serde(default)]
+    pub title: Option<String>,
+    /// System prompt of the theme. Not set: `prompts.system`.
+    #[serde(default)]
+    pub system: Option<String>,
+    /// Where the digest of this theme goes: `"bot"` or `"@channel"`. Not set:
+    /// `telegram.destination`.
+    #[serde(default)]
+    pub destination: Option<String>,
+}
+
+/// A theme with everything one run needs: `prompts` already has the system prompt
+/// and the title of this theme.
+#[derive(Debug, Clone)]
+pub struct Theme {
+    pub tag: String,
+    pub prompts: Prompts,
+    /// `"bot"` (or `"me"`, for old configs), or `"@channel"`.
+    pub destination: String,
+}
+
+impl Theme {
+    /// The digest goes to the chat with the bot, where the owner can send commands.
+    pub fn to_bot(&self) -> bool {
+        matches!(self.destination.as_str(), "bot" | "me")
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Prompts {
+    /// The system prompt for themes that do not have their own.
+    #[serde(default)]
     pub system: String,
     pub user_template: String,
     /// Instruction for the map step, when the input does not fit in one request.
     /// Not set — `summarize::DEFAULT_MAP_SYSTEM` is used.
     #[serde(default)]
     pub map_system: Option<String>,
-    /// Digest title; `{{date}}` is the date in the time zone from `[schedule]`.
+    /// Digest title; `{{date}}` and `{{time}}` are in the time zone from `[schedule]`.
     #[serde(default = "default_digest_title")]
     pub digest_title: String,
 }
@@ -310,6 +354,45 @@ impl Config {
         cfg.telegram.app.phone = normalize_phone(&cfg.telegram.app.phone);
         cfg.validate()?;
         Ok(cfg)
+    }
+
+    /// The themes in the order they run. Without `[[themes]]` it is one theme
+    /// made from `[prompts]`.
+    pub fn themes(&self) -> Vec<Theme> {
+        if self.themes.is_empty() {
+            return vec![Theme {
+                tag: DEFAULT_THEME.into(),
+                prompts: self.prompts.clone(),
+                destination: self.telegram.destination.clone(),
+            }];
+        }
+        self.themes
+            .iter()
+            .map(|t| {
+                let mut prompts = self.prompts.clone();
+                if let Some(system) = &t.system {
+                    prompts.system = system.clone();
+                }
+                if let Some(title) = &t.title {
+                    prompts.digest_title = title.clone();
+                }
+                Theme {
+                    tag: t.tag.clone(),
+                    prompts,
+                    destination: t
+                        .destination
+                        .clone()
+                        .unwrap_or_else(|| self.telegram.destination.clone()),
+                }
+            })
+            .collect()
+    }
+
+    /// The theme with this tag; the case of the letters does not matter.
+    pub fn theme(&self, tag: &str) -> Option<Theme> {
+        self.themes()
+            .into_iter()
+            .find(|t| t.tag.eq_ignore_ascii_case(tag))
     }
 
     /// The provider API and its key. Fails with a clear message if the provider is
@@ -477,6 +560,30 @@ impl Config {
                 "schedule.timezone {:?} is unknown, an IANA name like America/New_York is needed",
                 self.schedule.timezone
             );
+        }
+        // The tag is the key of the theme in the database, so its form is strict.
+        let mut tags: Vec<&str> = Vec::new();
+        for theme in &self.themes {
+            let tag = theme.tag.as_str();
+            let word = !tag.is_empty()
+                && tag
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-');
+            if !word {
+                bail!("themes: tag {tag:?} must be one word of small letters, digits, _ or -");
+            }
+            if tags.contains(&tag) {
+                bail!("themes: tag {tag:?} is used twice");
+            }
+            tags.push(tag);
+        }
+        for theme in self.themes() {
+            if theme.prompts.system.trim().is_empty() {
+                bail!(
+                    "theme {:?} has no system prompt: set `system` in its [[themes]] block or in [prompts]",
+                    theme.tag
+                );
+            }
         }
         if self.telegram.lookback_hours <= 0 {
             bail!("telegram.lookback_hours must be greater than zero");
