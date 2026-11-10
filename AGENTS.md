@@ -198,9 +198,11 @@ changes, add sample output.
 
 CI has two workflows:
 
-- `.github/workflows/cargo.yml` — on every push to a branch except `main`:
+- `.github/workflows/cargo.yml` — on every push:
   `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
-  `cargo build --release`, all with `--locked`.
+  `cargo build --release`, all with `--locked`. On `main` it runs to save the
+  build cache: only `main` saves it, branches read it. So a new branch does not
+  build everything from zero.
 - `.github/workflows/docker.yml` — a push to `main` builds and
   publishes one image to `ghcr.io/vlaship/tg-digest`, tagged `latest` and with the
   UTC build time (`20261103-041200`). The same time is built into the binary as the

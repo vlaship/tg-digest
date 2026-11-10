@@ -1,5 +1,9 @@
-# Checks every commit on a branch: format, lint and a release build. Not on main:
-# main gets only merged PRs, and their commits were checked on the branch.
+# Checks every commit on a branch: format, lint and a release build.
+#
+# It also runs on main, but only to save the build cache. A branch can read the
+# cache of main and its own, not the cache of another branch. Without a cache on
+# main every new branch built everything from zero (4 minutes, not 1.5) and then
+# saved its own 400 MB copy.
 name: cargo
 
 # Only push, no pull_request: a PR branch is already checked by its push. A second,
@@ -7,7 +11,6 @@ name: cargo
 # on main and could let a broken PR merge.
 on:
   push:
-    branches-ignore: [main]
   workflow_dispatch:
 
 permissions:
@@ -30,7 +33,11 @@ jobs:
         with:
           components: rustfmt, clippy
 
+      # Only main saves the cache; branches only read it. The job must be the same
+      # on main and on a branch: its name is a part of the cache key.
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Format
         run: cargo fmt --check
