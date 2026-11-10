@@ -225,7 +225,7 @@ impl Db {
     /// A database from before themes, step one (before the schema): the old
     /// `channels` table is put aside, because the theme is now a part of its key,
     /// and `runs` gets the `theme` column. The old rows have an empty theme until
-    /// `adopt_legacy` gives them one.
+    /// `adopt_theme` (called by `adopt_old_channels` in `main.rs`) gives them one.
     async fn prepare_themes(&self) -> Result<()> {
         if self.has_table("channels").await? && !self.has_column("channels", "theme").await? {
             tracing::info!("database from before themes: moving the channels");
@@ -314,9 +314,44 @@ impl Db {
     // --------------------------------------------------------------- channels
 
     /// Debug commands (`preview`, `run --dry-run`) work on a copy: refreshing names there
-    /// must not change the daemon database.
+    /// must not change the daemon database. The copy has the channels, all settings
+    /// (the model from `/model`, the cached model lists, the `/reread` windows) and the
+    /// topics of the last digest of each theme, so a dry run sees what a real run sees.
     pub async fn preview_copy(&self) -> Result<Self> {
         let copy = Self::open(":memory:").await?;
+
+        let mut rows = self
+            .conn
+            .query("SELECT key, value FROM settings", ())
+            .await?;
+        while let Some(row) = rows.next().await? {
+            let (key, value): (String, String) = (row.get(0)?, row.get(1)?);
+            copy.set_setting(&key, &value).await?;
+        }
+
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT theme, digest_topics, started_at FROM runs r
+                 WHERE status = 'ok' AND digest_topics IS NOT NULL
+                   AND id = (SELECT MAX(id) FROM runs
+                             WHERE theme = r.theme AND status = 'ok'
+                               AND digest_topics IS NOT NULL)",
+                (),
+            )
+            .await?;
+        while let Some(row) = rows.next().await? {
+            let (theme, topics, started_at): (String, String, String) =
+                (row.get(0)?, row.get(1)?, row.get(2)?);
+            copy.conn
+                .execute(
+                    "INSERT INTO runs (started_at, status, trigger, digest_topics, theme)
+                     VALUES (?1, 'ok', 'copy', ?2, ?3)",
+                    params![started_at, topics, theme],
+                )
+                .await?;
+        }
+
         for channel in self.channels().await? {
             copy.conn.execute(
                 "INSERT INTO channels (id, access_hash, username, title, enabled, last_msg_id, last_error, added_at, theme)
@@ -638,10 +673,12 @@ impl Db {
     /// The last run that reached the end: the scheduler counts catch-up from it.
     /// An empty run is also successful, or after a quiet day every restart
     /// would run the catch-up again.
-    pub async fn last_finished_run(&self) -> Result<Option<Run>> {
+    /// Per theme: one theme that finished must not hide the slot another theme missed.
+    pub async fn last_finished_run(&self, theme: &str) -> Result<Option<Run>> {
         self.query_run(
-            "SELECT * FROM runs WHERE status IN ('ok','empty') ORDER BY started_at DESC LIMIT 1",
-            params![],
+            "SELECT * FROM runs WHERE status IN ('ok','empty') AND theme = ?1
+             ORDER BY started_at DESC LIMIT 1",
+            params![theme],
         )
         .await
     }

@@ -162,11 +162,13 @@ async fn preview(runner: &Runner, theme: &Theme) -> Result<()> {
     let cfg = &runner.cfg;
     let channels = runner.db.theme_channels(&theme.tag).await?;
     println!("== theme {} ==", theme.tag);
+    // The same window as a real run: a `/reread` window counts here too.
+    let (lookback_hours, _) = runner.lookback_hours(&theme.tag).await;
     let collected = telegram::client::collect_posts(
         &runner.client,
         cfg,
         &channels,
-        cfg.telegram.lookback_hours,
+        lookback_hours,
         &Cancel::never(),
     )
     .await?;
@@ -205,11 +207,15 @@ async fn preview(runner: &Runner, theme: &Theme) -> Result<()> {
 async fn dry_run_once(runner: &Runner, theme: &Theme, many: bool) -> Result<()> {
     let cfg = &runner.cfg;
     let channels = runner.db.theme_channels(&theme.tag).await?;
+    // The same window and prompts as a real run: the `/reread` window and the
+    // topics of the last digest (the copy of the database has them).
+    let (lookback_hours, reread) = runner.lookback_hours(&theme.tag).await;
+    let prompts = runner.theme_prompts(theme, reread).await;
     let collected = telegram::client::collect_posts(
         &runner.client,
         cfg,
         &channels,
-        cfg.telegram.lookback_hours,
+        lookback_hours,
         &Cancel::never(),
     )
     .await?;
@@ -225,9 +231,9 @@ async fn dry_run_once(runner: &Runner, theme: &Theme, many: bool) -> Result<()> 
     let summarizer = Summarizer::new(&runner.catalog.spec(&runner.model().await).await?)?;
     let summary = summarizer
         .summarize(
-            &theme.prompts,
+            &prompts,
             &collected.posts,
-            cfg.telegram.lookback_hours,
+            lookback_hours,
             channels.len(),
             runner.timezone(),
             &Cancel::never(),
@@ -273,8 +279,10 @@ async fn dry_run_once(runner: &Runner, theme: &Theme, many: bool) -> Result<()> 
 }
 
 /// Channels and runs from before themes have no theme: they go to the first one.
+/// A `/reread` window from before it was per theme goes to every theme.
 async fn adopt_old_channels(db: &Db, cfg: &Config) -> Result<()> {
-    db.adopt_theme("", &cfg.themes()[0].tag).await
+    db.adopt_theme("", &cfg.themes()[0].tag).await?;
+    run::adopt_old_reread(db, cfg).await
 }
 
 /// Common setup for the debug commands: database, client, login check.
@@ -371,21 +379,52 @@ async fn finish_service_loops(
 }
 
 async fn schedule_loop(runner: Arc<Runner>, scheduler: Scheduler, cancel: Cancel) -> Result<()> {
-    let last_finished = runner
-        .db
-        .last_finished_run()
-        .await?
-        .map(|run| run.started_at);
-
-    if runner.db.unfinished_run().await?.is_some() {
-        tracing::info!("recovering an undelivered run on start");
+    // First deliver what is undelivered. This does not stop the start checks below:
+    // the other themes may still have to run.
+    let mut recovered = Vec::new();
+    for theme in runner.cfg.themes() {
+        if runner.db.unfinished_theme_run(&theme.tag).await?.is_some() {
+            recovered.push(theme.tag);
+        }
+    }
+    if !recovered.is_empty() {
+        tracing::info!(themes = ?recovered, "recovering an undelivered run on start");
         finish(&runner, TRIGGER_CATCH_UP, runner.recover().await).await?;
-    } else if runner.cfg.schedule.run_on_start {
-        tracing::info!("run_on_start: start run");
-        fire(&runner, TRIGGER_CRON).await?;
-    } else if runner.cfg.schedule.catch_up && scheduler.missed_since(last_finished, Utc::now())? {
-        tracing::info!(?last_finished, "missed slot, catching up");
-        fire(&runner, TRIGGER_CATCH_UP).await?;
+    }
+
+    // A theme that had an undelivered run is left alone on this start, as before
+    // themes: either its old digest was just delivered (a new one now would post
+    // two digests in a row), or it is still undelivered and the recovery already
+    // told the owner. The other themes are checked one by one, but they run in ONE
+    // pass, so the names are refreshed once and the `/run` tap comes once.
+    let mut start = Vec::new();
+    let mut trigger = TRIGGER_CATCH_UP;
+    for theme in runner.cfg.themes() {
+        if recovered.contains(&theme.tag) {
+            continue;
+        }
+        if runner.cfg.schedule.run_on_start {
+            trigger = TRIGGER_CRON;
+            start.push(theme);
+        } else if runner.cfg.schedule.catch_up {
+            // Each theme counts its own last finished run (a recovered run counts too).
+            let last_finished = runner
+                .db
+                .last_finished_run(&theme.tag)
+                .await?
+                .map(|run| run.started_at);
+            if scheduler.missed_since(last_finished, Utc::now())? {
+                tracing::info!(theme = %theme.tag, ?last_finished, "missed slot, catching up");
+                start.push(theme);
+            }
+        }
+    }
+    if !start.is_empty() {
+        if trigger == TRIGGER_CRON {
+            tracing::info!("run_on_start: start run");
+        }
+        let result = runner.trigger_themes(trigger, &start).await;
+        finish(&runner, trigger, result).await?;
     }
 
     loop {
