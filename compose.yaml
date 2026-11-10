@@ -8,7 +8,9 @@ services:
       args:
         BUILD_TIME: ${BUILD_TIME:-}
         GIT_SHA: ${GIT_SHA:-}
-    image: tg-digest
+    # The image CI publishes from main: `docker compose pull` takes the new one.
+    # `docker compose up -d --build` builds it here from the source instead.
+    image: ghcr.io/vlaship/tg-digest:latest
     restart: unless-stopped
 
     # A small VM runs other services too. If memory grows, only this container is
