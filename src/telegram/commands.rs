@@ -20,7 +20,7 @@ use tokio::task::JoinSet;
 
 use crate::cancel::Cancel;
 use crate::db::Channel;
-use crate::run::{Runner, TRIGGER_MANUAL};
+use crate::run::{Outcome, Runner, TRIGGER_MANUAL};
 use crate::telegram::client::is_auth_error;
 use crate::telegram::{channels, publish};
 
@@ -181,17 +181,11 @@ pub async fn listen(
 }
 
 async fn handle(runner: &Arc<Runner>, text: &str) -> Result<String> {
-    let mut parts = text.splitn(2, char::is_whitespace);
-    // Telegram may add the bot name: `/list@my_digest_bot`.
-    let command = parts
-        .next()
-        .unwrap_or_default()
-        .split('@')
-        .next()
-        .unwrap_or_default();
-    let arg = parts.next().unwrap_or("").trim();
+    let arg = text
+        .split_once(char::is_whitespace)
+        .map_or("", |(_, arg)| arg.trim());
 
-    match command {
+    match command_name(text) {
         "/help" => Ok(HELP.into()),
         "/start" => Ok(HELP.into()),
         "/model" => model(runner, arg).await,
@@ -226,22 +220,31 @@ async fn guarded<Fut>(runner: &Arc<Runner>, action: Fut) -> Result<String>
 where
     Fut: std::future::Future<Output = Result<String>>,
 {
+    match guarded_value(runner, action).await? {
+        Ok(reply) | Err(reply) => Ok(reply),
+    }
+}
+
+/// The same for an action that gives a value, not a reply. The inner `Err` is the
+/// refusal text: a run is going, or there is an undelivered run.
+async fn guarded_value<T, Fut>(
+    runner: &Arc<Runner>,
+    action: Fut,
+) -> Result<std::result::Result<T, String>>
+where
+    Fut: std::future::Future<Output = Result<T>>,
+{
     let Some(_guard) = runner.try_lock() else {
-        let id = runner
-            .db
-            .last_run()
-            .await?
-            .map(|r| r.id)
-            .unwrap_or_default();
-        return Ok(format!("run #{id} is going, try again later"));
+        let busy = Outcome::Busy(runner.running_id().await?);
+        return Ok(Err(busy.to_string()));
     };
     if let Some(run) = runner.db.unfinished_run().await? {
-        return Ok(format!(
+        return Ok(Err(format!(
             "there is an undelivered run #{} — /run to deliver it or /abandon {}",
             run.id, run.id
-        ));
+        )));
     }
-    action.await
+    Ok(Ok(action.await?))
 }
 
 /// `/model` lists the models from the config with their limits, `/model provider/model`
@@ -475,8 +478,7 @@ async fn add(runner: &Arc<Runner>, arg: &str) -> Result<String> {
 
     // Already in the list: say so and touch nothing, its cursor stays. For a username
     // or an id the database answers without a request to Telegram.
-    let invite = arg.contains("t.me/+") || arg.contains("joinchat");
-    if !invite {
+    if !is_invite(arg) {
         if let Some(channel) = runner.db.find_channel(username_from(arg)).await? {
             if channel.enabled {
                 return Ok(already_added(&channel));
@@ -565,11 +567,7 @@ async fn skip(runner: &Arc<Runner>) -> Result<String> {
 
     let (mut moved, mut failed) = (0, Vec::new());
     for channel in &channels {
-        let peer = channels::ChannelPeer {
-            id: channel.id,
-            access_hash: channel.access_hash,
-        };
-        match channels::last_message_id(&runner.client, peer).await {
+        match channels::last_message_id(&runner.client, channel.into()).await {
             Ok(Some(last)) => {
                 runner.db.set_cursor(channel.id, last).await?;
                 moved += 1;
@@ -611,20 +609,13 @@ async fn reread(runner: &Arc<Runner>, arg: &str) -> Result<String> {
         Ok(days) if (1..=7).contains(&days) => days,
         _ => return Ok("write the number of days, 1 to 7: /reread 2".into()),
     };
-    let prepared = guarded(runner, async {
-        let count = runner.prepare_reread(days).await?;
-        Ok(format!("{count} channels"))
-    })
-    .await?;
-    if !prepared.ends_with(" channels") {
-        // The lock is taken or there is an undelivered run: `guarded` says why.
-        return Ok(prepared);
-    }
+    let count = match guarded_value(runner, runner.prepare_reread(days)).await? {
+        Ok(count) => count,
+        // The lock is taken or there is an undelivered run: the text says why.
+        Err(refusal) => return Ok(refusal),
+    };
     let outcome = runner.trigger(TRIGGER_MANUAL).await?;
-    Ok(format!(
-        "reread {days} d, {prepared}:
-{outcome}"
-    ))
+    Ok(format!("reread {days} d, {count} channels:\n{outcome}"))
 }
 
 /// A deliberate repeat, not a recovery: the parts go to the **current**
@@ -671,10 +662,7 @@ async fn resolve_new_channel(runner: &Arc<Runner>, arg: &str) -> Result<channels
             .db
             .channel(id)
             .await?
-            .map(|channel| channels::ChannelPeer {
-                id: channel.id,
-                access_hash: channel.access_hash,
-            });
+            .map(|channel| channels::ChannelPeer::from(&channel));
         return match known {
             Some(peer) => Ok(peer),
             None => channels::find_in_dialogs(client, id)
@@ -687,7 +675,7 @@ async fn resolve_new_channel(runner: &Arc<Runner>, arg: &str) -> Result<channels
         };
     }
 
-    let peer = if arg.contains("t.me/+") || arg.contains("joinchat") {
+    let peer = if is_invite(arg) {
         client
             .accept_invite_link(arg)
             .await
@@ -738,17 +726,22 @@ async fn resolve_new_channel(runner: &Arc<Runner>, arg: &str) -> Result<channels
 /// Commands that can take a long time: they read channels, call the model or send a
 /// digest. The bot answers them with a "working on it" note first.
 fn is_slow(text: &str) -> bool {
-    let command = text
-        .split_whitespace()
-        .next()
-        .unwrap_or_default()
-        .split('@')
-        .next()
-        .unwrap_or_default();
     matches!(
-        command,
+        command_name(text),
         "/run" | "/reread" | "/resume" | "/last" | "/skip" | "/add" | "/fallback"
     )
+}
+
+/// The command without its argument and without the bot name that Telegram may
+/// add: `/list@my_digest_bot` is `/list`.
+fn command_name(text: &str) -> &str {
+    let word = text.split_whitespace().next().unwrap_or_default();
+    word.split('@').next().unwrap_or_default()
+}
+
+/// A private invite link (`t.me/+…` or the old `joinchat`), not a username.
+fn is_invite(arg: &str) -> bool {
+    arg.contains("t.me/+") || arg.contains("joinchat")
 }
 
 /// The username from `@name`, `name`, `t.me/name` or `https://t.me/name/123`.

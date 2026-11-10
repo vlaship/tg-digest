@@ -21,6 +21,15 @@ pub struct ChannelPeer {
     pub access_hash: i64,
 }
 
+impl From<&Channel> for ChannelPeer {
+    fn from(channel: &Channel) -> Self {
+        Self {
+            id: channel.id,
+            access_hash: channel.access_hash,
+        }
+    }
+}
+
 /// A private channel by numeric id: we do not have its `access_hash`, and without it
 /// `channels.getChannels` does not answer. We take the peer from the dialog list — it
 /// is there if the account follows the channel.
@@ -56,13 +65,7 @@ pub async fn refresh_names(client: &Client, db: &Db) -> Result<usize> {
         return Ok(0);
     }
 
-    let peers: Vec<ChannelPeer> = channels
-        .iter()
-        .map(|c| ChannelPeer {
-            id: c.id,
-            access_hash: c.access_hash,
-        })
-        .collect();
+    let peers: Vec<ChannelPeer> = channels.iter().map(ChannelPeer::from).collect();
     let fresh = describe_all(client, &peers).await?;
 
     let mut changed = 0;

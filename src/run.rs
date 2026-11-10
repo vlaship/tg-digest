@@ -123,7 +123,7 @@ impl Runner {
     }
 
     /// A notification to the owner through the bot. Without a bot it only goes to the log.
-    async fn notify(&self, text: &str) {
+    pub async fn notify(&self, text: &str) {
         match &self.bot {
             Some(bot) => bot.notify(text).await,
             None => tracing::warn!(%text, "notification (no bot in this command)"),
@@ -175,8 +175,7 @@ impl Runner {
     /// Entry point of every trigger: cron, catch-up, `/run`, daemon start.
     pub async fn trigger(&self, trigger: &str) -> Result<Outcome> {
         let Some(_guard) = self.try_lock() else {
-            let busy = self.db.last_run().await?.map(|r| r.id).unwrap_or_default();
-            return Ok(Outcome::Busy(busy));
+            return Ok(Outcome::Busy(self.running_id().await?));
         };
 
         // The check for an unfinished run happens on EVERY trigger, not only
@@ -243,38 +242,45 @@ impl Runner {
         let Some(_guard) = self.try_lock() else {
             return Ok(Outcome::Busy(self.running_id().await?));
         };
-        let Some(run) = self.db.run(run_id).await? else {
-            return Ok(Outcome::Failed(run_id, "no such run".into()));
-        };
-        if !run.is_unfinished() {
-            return Ok(Outcome::Failed(
-                run_id,
-                format!("run has status {}, nothing to deliver", run.status),
-            ));
+        match self.undelivered(run_id, "deliver").await? {
+            Ok(run) => self.deliver(&run, true).await,
+            Err(refusal) => Ok(refusal),
         }
-        self.deliver(&run, true).await
     }
 
     pub async fn abandon(&self, run_id: i64) -> Result<Outcome> {
         let Some(_guard) = self.try_lock() else {
             return Ok(Outcome::Busy(self.running_id().await?));
         };
-        let Some(run) = self.db.run(run_id).await? else {
-            return Ok(Outcome::Failed(run_id, "no such run".into()));
-        };
-        if !run.is_unfinished() {
-            return Ok(Outcome::Failed(
-                run_id,
-                format!("run has status {}, nothing to cancel", run.status),
-            ));
+        if let Err(refusal) = self.undelivered(run_id, "cancel").await? {
+            return Ok(refusal);
         }
         self.db.abandon_run(run_id).await?;
         photos::remove(&self.photos_dir(), run_id);
         Ok(Outcome::Abandoned(run_id))
     }
 
+    /// The undelivered run with this number, for `/resume` and `/abandon`. The inner
+    /// `Err` is the reply when there is no such run or it has nothing to `verb`.
+    async fn undelivered(
+        &self,
+        run_id: i64,
+        verb: &str,
+    ) -> Result<std::result::Result<Run, Outcome>> {
+        let Some(run) = self.db.run(run_id).await? else {
+            return Ok(Err(Outcome::Failed(run_id, "no such run".into())));
+        };
+        if !run.is_unfinished() {
+            return Ok(Err(Outcome::Failed(
+                run_id,
+                format!("run has status {}, nothing to {verb}", run.status),
+            )));
+        }
+        Ok(Ok(run))
+    }
+
     /// Number of the run that holds the lock now: the last one in the journal.
-    async fn running_id(&self) -> Result<i64> {
+    pub async fn running_id(&self) -> Result<i64> {
         Ok(self.db.last_run().await?.map(|r| r.id).unwrap_or_default())
     }
 
@@ -442,15 +448,18 @@ impl Runner {
         // Many posts and almost no topics is a broken answer, not a quiet day (a
         // compressed model on a cheap host can do this). The run fails, and the
         // cursors stay, so the posts go into the next run.
+        // It goes through `fail` like any other run error: a plain `Err` here would
+        // leave the run in `collecting` and stop the daemon on a cron trigger.
         if collected.posts.len() >= MIN_POSTS_FOR_CHECK && digest.topics.len() < 2 {
-            return Err(anyhow!(
+            let error = anyhow!(
                 "the model gave {} topic(s) for {} posts (output tokens: {}). \
                  The answer looks broken, so nothing is posted. Try again or switch \
                  the model (/model)",
                 digest.topics.len(),
                 collected.posts.len(),
                 summary.output_tokens.unwrap_or(0)
-            ));
+            );
+            return self.fail(run_id, trigger, error).await;
         }
 
         // We do not post an empty digest, but the posts were read: we move the cursors,

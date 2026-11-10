@@ -93,6 +93,9 @@ pub struct RenderOptions<'a> {
 ///
 /// API limits: `additionalProperties: false` is required, keywords like
 /// `minLength`/`maximum` are not supported.
+///
+/// The descriptions are part of the prompt: the model reads them next to each
+/// field, and a small model follows them better than a rule far away in the text.
 pub fn response_schema() -> Value {
     json!({
         "type": "object",
@@ -101,22 +104,36 @@ pub fn response_schema() -> Value {
         "properties": {
             "topics": {
                 "type": "array",
+                "description": "One item per event or story, the most important first.",
                 "items": {
                     "type": "object",
                     "additionalProperties": false,
                     "required": ["title", "summary", "sources"],
                     "properties": {
-                        "title":   { "type": "string" },
-                        "summary": { "type": "string" },
+                        "title": {
+                            "type": "string",
+                            "description": "A short headline that names the event, not a category."
+                        },
+                        "summary": {
+                            "type": "string",
+                            "description": "1-3 sentences with the facts: who, what, where, numbers."
+                        },
                         "sources": {
                             "type": "array",
+                            "description": "Every post about this event, at least one.",
                             "items": {
                                 "type": "object",
                                 "additionalProperties": false,
                                 "required": ["channel", "url"],
                                 "properties": {
-                                    "channel": { "type": "string" },
-                                    "url":     { "type": "string" }
+                                    "channel": {
+                                        "type": "string",
+                                        "description": "The channel name, as in the input."
+                                    },
+                                    "url": {
+                                        "type": "string",
+                                        "description": "The https://t.me/... link of the post, copied exactly from the input."
+                                    }
                                 }
                             }
                         }
@@ -126,6 +143,11 @@ pub fn response_schema() -> Value {
         }
     })
 }
+
+/// The answer as an example, for a model without a strict JSON schema: a small
+/// model copies a shape better than it reads a schema. The values are not real,
+/// and the link check drops the address if the model copies it.
+pub const ANSWER_SHAPE: &str = r#"{"topics":[{"title":"Headline of the event","summary":"What happened, in 1-3 sentences.","sources":[{"channel":"Channel name","url":"https://t.me/channel/123"}]}]}"#;
 
 /// We drop from the answer everything that was not in the input posts.
 ///
@@ -198,28 +220,25 @@ pub fn drop_foreign_sources(digest: &mut Digest, posts: &[Post]) -> usize {
 /// A post link without the scheme, `www.`, the query, the fragment and a last `/`,
 /// in lower case: `https://t.me/Name/12?single` → `t.me/name/12`.
 fn post_key(url: &str) -> String {
+    let url = bare_link(url);
+    let url = url.split(['?', '#']).next().unwrap_or(url);
+    url.trim_end_matches('/').to_lowercase()
+}
+
+/// A link without the scheme, `www.` and a last `/`.
+fn bare_link(url: &str) -> &str {
     let url = url.trim();
     let url = url
         .strip_prefix("https://")
         .or_else(|| url.strip_prefix("http://"))
         .unwrap_or(url);
     let url = url.strip_prefix("www.").unwrap_or(url);
-    let url = url.split(['?', '#']).next().unwrap_or(url);
-    url.trim_end_matches('/').to_lowercase()
+    url.trim_end_matches('/')
 }
 
 /// The first post whose text has this link. `https://`, `www.` and a last `/` do not count.
 fn post_with_link<'a>(posts: &'a [Post], url: &str) -> Option<&'a Post> {
-    fn bare(url: &str) -> &str {
-        let url = url.trim();
-        let url = url
-            .strip_prefix("https://")
-            .or_else(|| url.strip_prefix("http://"))
-            .unwrap_or(url);
-        let url = url.strip_prefix("www.").unwrap_or(url);
-        url.trim_end_matches('/')
-    }
-    let needle = bare(url);
+    let needle = bare_link(url);
     // A too short "link" would match almost any text.
     if needle.len() < 12 {
         return None;

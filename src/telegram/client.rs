@@ -685,15 +685,17 @@ fn with_hidden_links(text: &str, entities: Option<&Vec<tl::enums::MessageEntity>
         return text.to_string();
     };
 
-    let mut urls: Vec<&str> = entities
-        .iter()
-        .filter_map(|entity| match entity {
-            tl::enums::MessageEntity::TextUrl(e) => Some(e.url.as_str()),
-            _ => None,
-        })
-        .filter(|url| !text.contains(*url))
-        .collect();
-    urls.dedup();
+    // Each address once, in the order of the text. `dedup` would only drop
+    // neighbours, and a post often has the same link at the start and at the end.
+    let mut urls: Vec<&str> = Vec::new();
+    for entity in entities {
+        if let tl::enums::MessageEntity::TextUrl(e) = entity {
+            let url = e.url.as_str();
+            if !text.contains(url) && !urls.contains(&url) {
+                urls.push(url);
+            }
+        }
+    }
 
     if urls.is_empty() {
         return text.to_string();
