@@ -10,6 +10,7 @@ use chrono_tz::Tz;
 use grammers_client::client::Client;
 use std::sync::Arc;
 use tokio::sync::{Mutex, MutexGuard};
+use tracing::Instrument;
 
 use crate::cancel::Cancel;
 use crate::config::{Config, Prompts, Theme};
@@ -229,22 +230,28 @@ impl Runner {
             // on start: otherwise a second digest would go on top of the first one.
             let unfinished = self.db.unfinished_theme_run(&theme.tag).await?;
             let is_fresh = unfinished.is_none();
+            // Every log line of the work on a theme starts with `run{theme=…}`, so
+            // the log shows which theme the collecting, the model and the sending
+            // belong to.
+            let span = theme_span(&theme.tag);
             let result = match unfinished {
-                Some(run) => self.finish_unfinished(run).await,
+                Some(run) => self.finish_unfinished(run).instrument(span.clone()).await,
                 None if !fresh => continue,
                 None => {
                     if !refreshed {
                         self.refresh_channels().await?;
                         refreshed = true;
                     }
-                    self.fresh_run(trigger, theme).await
+                    self.fresh_run(trigger, theme)
+                        .instrument(span.clone())
+                        .await
                 }
             };
             let outcome = match result {
                 Ok(outcome) => outcome,
                 Err(e) if tg::is_fatal(&e) => return Err(e),
                 // An error in one theme must not stop the other themes.
-                Err(e) => self.broken(trigger, theme, e).await,
+                Err(e) => self.broken(trigger, theme, e).instrument(span).await,
             };
 
             if is_fresh {
@@ -284,7 +291,7 @@ impl Runner {
     /// for example). We tell the owner and go on with the next theme.
     async fn broken(&self, trigger: &str, theme: &Theme, error: anyhow::Error) -> Outcome {
         let reason = format!("{error:#}");
-        tracing::error!(theme = %theme.tag, %trigger, %reason, "run failed");
+        tracing::error!(%trigger, %reason, "run failed");
         let short: String = reason.chars().take(300).collect();
         let text = format!("⚠️ The run failed: {short}");
         if trigger != TRIGGER_MANUAL {
@@ -338,7 +345,10 @@ impl Runner {
             return Ok(Outcome::Busy(self.running_id().await?));
         };
         match self.undelivered(run_id, "deliver").await? {
-            Ok(run) => self.deliver(&run, true).await,
+            Ok(run) => {
+                let span = theme_span(&run.theme);
+                self.deliver(&run, true).instrument(span).await
+            }
             Err(refusal) => Ok(refusal),
         }
     }
@@ -442,10 +452,10 @@ impl Runner {
     async fn fresh_run(&self, trigger: &str, theme: &Theme) -> Result<Outcome> {
         let channels = self.db.theme_channels(&theme.tag).await?;
         let run_id = self.db.start_run(trigger, &theme.tag).await?;
-        tracing::info!(run = run_id, theme = %theme.tag, %trigger, channels = channels.len(), "run started");
+        tracing::info!(run = run_id, %trigger, channels = channels.len(), "run started");
 
         if channels.is_empty() {
-            tracing::warn!(theme = %theme.tag, "no channels enabled — nothing to post");
+            tracing::warn!("no channels enabled — nothing to post");
             self.db.complete_run(run_id, db::STATUS_EMPTY).await?;
             return Ok(Outcome::Finished {
                 run: run_id,
@@ -756,7 +766,7 @@ impl Runner {
         }
 
         let reason = format!("{error:#}");
-        tracing::error!(run = run_id, theme = %theme.tag, %reason, "run finished with an error");
+        tracing::error!(run = run_id, %reason, "run finished with an error");
         self.db.fail_run(run_id, &reason).await?;
 
         let text = self.friendly_error(&error).await;
@@ -826,6 +836,11 @@ impl Runner {
             }
         }
     }
+}
+
+/// The log span of the work on one theme: its lines start with `run{theme=…}`.
+pub fn theme_span(tag: &str) -> tracing::Span {
+    tracing::info_span!("run", theme = %tag)
 }
 
 /// How much of each old topic goes into the prompt: enough to know the story.

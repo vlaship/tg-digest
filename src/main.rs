@@ -22,6 +22,7 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
+use tracing::Instrument;
 
 use cancel::Cancel;
 use config::{Config, Theme};
@@ -114,7 +115,9 @@ async fn main() -> Result<()> {
             let runner = prepare(cfg.clone()).await?;
             runner.refresh_channels().await?;
             for theme in &themes {
-                preview(&runner, theme).await?;
+                preview(&runner, theme)
+                    .instrument(run::theme_span(&theme.tag))
+                    .await?;
             }
             Ok(())
         }
@@ -129,7 +132,9 @@ async fn main() -> Result<()> {
             let runner = prepare(cfg.clone()).await?;
             runner.refresh_channels().await?;
             for theme in &themes {
-                dry_run_once(&runner, theme, themes.len() > 1).await?;
+                dry_run_once(&runner, theme, themes.len() > 1)
+                    .instrument(run::theme_span(&theme.tag))
+                    .await?;
             }
             Ok(())
         }
@@ -259,7 +264,6 @@ async fn dry_run_once(runner: &Runner, theme: &Theme, many: bool) -> Result<()> 
     std::fs::write(&file, &html).with_context(|| format!("could not write {file}"))?;
     println!("{html}");
     tracing::info!(
-        theme = %theme.tag,
         topics = result.topics.len(),
         parts = chunks.len(),
         %file,
