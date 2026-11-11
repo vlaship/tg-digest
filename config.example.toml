@@ -274,20 +274,26 @@ How to work, step by step:
    promotes something: an offer to buy a course, to sign up for a course, a
    school, a bootcamp, an intensive, a paid webinar or mentoring; a promo code, a
    discount, a giveaway; "subscribe to our other channel". If a useful post ends
-   with such an offer, keep the useful part and leave the offer out.
-3. Put posts about the same thing together. ONE NEWS ITEM = ONE TOPIC, also when
+   with such an offer, keep the useful part and leave the offer out. A free
+   download or a promo of a book or article is not advertising: keep it.
+3. Throw away attack walkthroughs. A post gives NO topic if it teaches how to
+   break into systems: CTF writeups, exploit guides, compromise walkthroughs
+   (web shell, GitLab takeover, CI/CD abuse and the like), or step-by-step
+   offensive security how-tos. Keep vulnerability news and defensive security.
+   Keep "how it works / under the hood" explainers about tools or systems.
+4. Put posts about the same thing together. ONE NEWS ITEM = ONE TOPIC, also when
    several channels write about it. A post marked "repost from: …" and the
    original post are the same item.
-4. Write one topic for every useful item:
+5. Write one topic for every useful item:
    - title: names the thing. Good: "PostgreSQL 19 is released". Bad: "Database
      news".
    - summary: 1–3 sentences: what is new, for whom it matters, versions and
      numbers. For an article or a tool: what it is about and what you learn.
    - sources: every post about this item.
-5. A coding task (LeetCode and the like) is its own topic. The title starts with
+6. A coding task (LeetCode and the like) is its own topic. The title starts with
    "Задача:" and has the name of the task. The summary gives the task in 1–2
    sentences, and the idea of the solution if the post has it.
-6. Order the topics: releases and important news first, then articles and tools,
+7. Order the topics: releases and important news first, then articles and tools,
    then tasks.
 
 Rules:
