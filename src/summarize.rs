@@ -217,6 +217,11 @@ pub struct Summarizer {
 /// OpenRouter says this when no host of the model supports a parameter we sent.
 const NO_ENDPOINTS: &str = "No endpoints found that can handle the requested parameters";
 
+/// The model stopped because it ran out of answer tokens. The one-request path
+/// catches this text and asks again with the input split (see `summarize`), so the
+/// words must stay the same in all three parsers.
+const CUT_ANSWER: &str = "the answer was cut at max_tokens";
+
 /// Which API writes the digest: a copy of the model settings from the config.
 struct Backend(ModelSpec);
 
@@ -404,24 +409,45 @@ impl Summarizer {
             limit = self.limits.input,
             "input for the model"
         );
-        if chars > self.limits.input {
-            return self
-                .map_reduce(
-                    prompts,
-                    posts,
-                    lookback_hours,
-                    channel_count,
-                    timezone,
-                    cancel,
-                )
-                .await;
+        let mut batch = self.limits.batch;
+        if chars <= self.limits.input {
+            match self
+                .ask("digest", &prompts.system, &user_prompt, cancel)
+                .await
+            {
+                Ok(summary) => return Ok(summary),
+                // The input fits the context window, but the answer (with the
+                // thinking) does not fit `max_tokens`. One digest of everything is
+                // too long to write in one go, so we split the input and try again:
+                // every part gets its own answer. Without this the run fails, the
+                // cursors stay, and the next run is even bigger.
+                Err(e) if format!("{e:#}").contains(CUT_ANSWER) => {
+                    tracing::warn!(
+                        error = %format!("{e:#}"),
+                        "the answer did not fit max_tokens, asking again with the input split"
+                    );
+                    // The parts must be smaller than the input the model just
+                    // refused to answer, whatever the limit of the model allows.
+                    batch = batch.min(chars.div_ceil(2));
+                }
+                Err(e) => return Err(e),
+            }
         }
 
-        self.ask("digest", &prompts.system, &user_prompt, cancel)
-            .await
+        self.map_reduce(
+            prompts,
+            posts,
+            batch,
+            lookback_hours,
+            channel_count,
+            timezone,
+            cancel,
+        )
+        .await
     }
 
-    /// The input does not fit in one request: we condense it in parts, then reduce.
+    /// One request is not enough: we condense the posts in parts of at most `batch`
+    /// characters, then reduce the summaries into one digest.
     ///
     /// This costs more than one request (N+1 calls), but the other option is to cut
     /// the tail, and we must not do that. Post links are carried through the summaries,
@@ -431,17 +457,18 @@ impl Summarizer {
         &self,
         prompts: &Prompts,
         posts: &[Post],
+        batch: usize,
         lookback_hours: i64,
         channel_count: usize,
         timezone: Tz,
         cancel: &Cancel,
     ) -> Result<Summary> {
         let now = Utc::now();
-        let batches = digest::split_batches(posts, self.limits.batch);
+        let batches = digest::split_batches(posts, batch);
         tracing::info!(
             batches = batches.len(),
-            batch_limit = self.limits.batch,
-            "the input is over the limit: condensing in parts, then reducing"
+            batch_limit = batch,
+            "condensing the input in parts, then reducing"
         );
 
         let map_system = prompts.map_system.as_deref().unwrap_or(DEFAULT_MAP_SYSTEM);
@@ -822,7 +849,7 @@ fn parse_summary(response: Value) -> Result<Summary> {
         bail!("the model refused the request (stop_reason=refusal): {details}");
     }
     if stop_reason == "max_tokens" {
-        bail!("the answer was cut at max_tokens — raise max_tokens of the model in the config");
+        bail!("{CUT_ANSWER} — raise max_tokens of the model in the config");
     }
 
     let usage = |field: &str| {
@@ -885,7 +912,7 @@ fn parse_gemini(response: Value) -> Result<Summary> {
         .and_then(Value::as_str)
         .unwrap_or("");
     if finish_reason == "MAX_TOKENS" {
-        bail!("the answer was cut at max_tokens — raise max_tokens of the model in the config");
+        bail!("{CUT_ANSWER} — raise max_tokens of the model in the config");
     }
     if finish_reason != "STOP" && !finish_reason.is_empty() {
         bail!("Gemini stopped the answer (finishReason={finish_reason})");
@@ -967,7 +994,7 @@ fn parse_chat(response: Value, api: &'static str) -> Result<Summary> {
         .and_then(Value::as_str)
         .unwrap_or("");
     if finish_reason == "length" {
-        bail!("the answer was cut at max_tokens — raise max_tokens of the model in the config");
+        bail!("{CUT_ANSWER} — raise max_tokens of the model in the config");
     }
     if finish_reason == "content_filter" {
         bail!("the model refused the request (finish_reason=content_filter)");
