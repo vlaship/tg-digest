@@ -589,18 +589,19 @@ impl Summarizer {
                                 return Ok(summary);
                             }
                             Err(e)
-                                if partials.len() > 1
-                                    && stage <= self.limits.stages
-                                    && format!("{e:#}").contains(CUT_ANSWER) =>
+                                if partials.len() > 1 && format!("{e:#}").contains(CUT_ANSWER) =>
                             {
-                                tracing::warn!(
-                                    stage,
-                                    partials = partials.len(),
-                                    chars = prompt_chars,
-                                    "the final answer did not fit max_tokens, reducing the summaries in between"
-                                );
-                                force_reduce = true;
-                                continue;
+                                if stage <= self.limits.stages {
+                                    tracing::warn!(
+                                        stage,
+                                        partials = partials.len(),
+                                        chars = prompt_chars,
+                                        "the final answer did not fit max_tokens, reducing the summaries in between"
+                                    );
+                                    force_reduce = true;
+                                    continue;
+                                }
+                                return Ok(keep_partials(partials, input_tokens, output_tokens));
                             }
                             Err(e) => {
                                 return Err(e)
@@ -615,26 +616,40 @@ impl Summarizer {
                             chars = digest::partials_size(&partials),
                             "summaries cannot be split further"
                         );
-                        // The last check is on the real prompt, not on the summaries:
-                        // we get here from "cannot be split", from used-up rounds, and
-                        // from simply a big template. Sending a request that surely
-                        // does not fit means losing these tokens too.
+                        if ensure_fits(&reduce_prompt, partials.len(), self.limits).is_err()
+                            && partials.len() > 1
+                        {
+                            return Ok(keep_partials(partials, input_tokens, output_tokens));
+                        }
                         ensure_fits(&reduce_prompt, partials.len(), self.limits)?;
-                        let mut summary = self
+                        match self
                             .ask("final", &prompts.system, &reduce_prompt, cancel)
                             .await
-                            .context("could not reduce the part summaries into a digest")?;
-                        summary.input_tokens = add(input_tokens, summary.input_tokens);
-                        summary.output_tokens = add(output_tokens, summary.output_tokens);
-                        return Ok(summary);
+                        {
+                            Ok(mut summary) => {
+                                summary.input_tokens = add(input_tokens, summary.input_tokens);
+                                summary.output_tokens = add(output_tokens, summary.output_tokens);
+                                return Ok(summary);
+                            }
+                            Err(e)
+                                if partials.len() > 1 && format!("{e:#}").contains(CUT_ANSWER) =>
+                            {
+                                return Ok(keep_partials(partials, input_tokens, output_tokens));
+                            }
+                            Err(e) => {
+                                return Err(e)
+                                    .context("could not reduce the part summaries into a digest");
+                            }
+                        }
                     }
                     ReduceStep::Compress(groups) => groups,
                 }
             };
 
+            let before = partials.len();
             tracing::info!(
                 stage,
-                from = partials.len(),
+                from = before,
                 to = groups.len(),
                 "summaries do not fit in one request, reducing in between"
             );
@@ -643,6 +658,13 @@ impl Summarizer {
             let mut merged = Vec::with_capacity(queue.len());
             let mut done = 0;
             while let Some(group) = queue.pop_front() {
+                // A group of one summary is already condensed: asking the model
+                // with `map_system` again only copies it and wastes tokens.
+                if let [single] = group {
+                    done += 1;
+                    merged.push(single.clone());
+                    continue;
+                }
                 let (number, total) = (done + 1, done + 1 + queue.len());
                 let prompt = digest::render_prompt_with(
                     &prompts.user_template,
@@ -687,6 +709,12 @@ impl Summarizer {
                 merged.push(summary.digest);
             }
             partials = merged;
+            // Every group of two or more summaries was cut at `max_tokens` and
+            // split down to single summaries: another round or a single final
+            // request would hit the same limit, so we keep the summaries we have.
+            if partials.len() >= before {
+                return Ok(keep_partials(partials, input_tokens, output_tokens));
+            }
             stage += 1;
         }
     }
@@ -855,6 +883,29 @@ enum ReduceStep<'a> {
     Compress(Vec<&'a [Digest]>),
     /// Nothing more to split or the rounds are used up: `ensure_fits` decides.
     Stuck,
+}
+
+/// Join already-condensed part summaries into one digest when the final answer
+/// does not fit `max_tokens` even after intermediate reduce rounds. Every part
+/// has already passed the schema and stub checks, so keeping them saves the run
+/// and all paid map/reduce tokens.
+fn keep_partials(
+    partials: Vec<Digest>,
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+) -> Summary {
+    let parts = partials.len();
+    let topics: Vec<_> = partials.into_iter().flat_map(|d| d.topics).collect();
+    tracing::warn!(
+        parts,
+        topics = topics.len(),
+        "the summaries do not fit in one final answer, keeping the condensed parts as the digest"
+    );
+    Summary {
+        digest: Digest { topics },
+        input_tokens,
+        output_tokens,
+    }
 }
 
 /// A pure decision for one reduce step — without the network, so it can be tested.

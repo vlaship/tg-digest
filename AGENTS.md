@@ -124,7 +124,11 @@ map-reduce (`summarize.rs`):
   the budget.
 - If the summaries together are bigger than the part budget (`max_input_chars / 2`),
   or if the final answer is cut at `max_tokens`, they are merged in extra rounds
-  (up to `MAX_REDUCE_STAGES`) before the final request.
+  (up to `MAX_REDUCE_STAGES`) before the final request. A group of one summary is
+  kept without a new request. When the summaries cannot be merged further without
+  hitting `max_tokens`, or when the final answer is still cut after the rounds,
+  the condensed part summaries are joined and kept as the digest so the paid work
+  is not lost.
 - Before the final request, the whole prompt is checked (`ensure_fits`). If it
   does not fit, the run fails with a clear error. It does not send a bad request
   and does not drop topics. The cursors do not move, so the posts go into the next
