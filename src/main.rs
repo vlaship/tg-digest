@@ -408,14 +408,22 @@ async fn serve(cfg: Arc<Config>) -> Result<()> {
     // The command listener and the scheduler are two tasks. A revoked session breaks
     // either of them, the process exits with a non-zero code, Docker restarts it, and
     // the logs say what to do (`login`).
-    let listener = telegram::commands::listen(runner.clone(), bot_updates, cancel.clone());
+    //
+    // Pin both on the heap before joining. Their state machines hold the full run
+    // and command paths (~25 KiB + ~12 KiB in debug). On Windows the main thread
+    // stack is about 1 MiB; keeping the futures there overflows right after
+    // "daemon started" (STATUS_STACK_OVERFLOW).
+    let listener = Box::pin(telegram::commands::listen(
+        runner.clone(),
+        bot_updates,
+        cancel.clone(),
+    ));
+    let schedule = Box::pin(schedule_loop(runner, scheduler, cancel));
 
     tracing::info!(version = %version(), cron = %cfg.schedule.cron, tz = %cfg.schedule.timezone, "daemon started");
 
-    let schedule_loop = schedule_loop(runner, scheduler, cancel);
-
     // Normal shutdown must wait for both loops: either may own a publication.
-    finish_service_loops(schedule_loop, listener).await
+    finish_service_loops(schedule, listener).await
 }
 
 async fn finish_service_loops(
