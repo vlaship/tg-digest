@@ -30,7 +30,7 @@ pub struct Post {
     pub photos: Vec<i32>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Clone, Deserialize)]
 pub struct Digest {
     #[serde(default)]
     pub topics: Vec<Topic>,
@@ -71,7 +71,7 @@ fn is_stub(text: &str) -> bool {
         || (lower.contains("placeholder") && lower.chars().count() <= 40)
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct Topic {
     pub title: String,
     pub summary: String,
@@ -79,7 +79,7 @@ pub struct Topic {
     pub sources: Vec<Source>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct Source {
     pub channel: String,
     pub url: String,
