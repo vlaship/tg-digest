@@ -107,6 +107,7 @@ the two sessions are files in that folder; their names (`db_file`,
 cargo run -- --config config.toml login          # one-time login
 cargo run -- --config config.toml login --qr     # login by a QR code, if the code does not come
 cargo run -- --config config.toml preview        # how many posts were collected, no call to Claude
+cargo run -- --config config.toml preview --theme dev --dump  # same, and write out/posts-dev.md (raw posts, no LLM)
 cargo run -- --config config.toml run --dry-run  # digest in out/digest.html (out/digest-<tag>.html with several themes), nothing is posted; --theme dev for one theme
 cargo run -- --config config.toml serve          # the daemon: schedule + commands
 ```
@@ -114,7 +115,9 @@ cargo run -- --config config.toml serve          # the daemon: schedule + comman
 The CLI has no run that posts. Only the daemon posts: on the schedule or after
 the `/run` command. Otherwise two processes on one database could post two
 digests. `preview` and `run --dry-run` use a copy of the database in memory:
-they do not change the saved channels or cursors.
+they do not change the saved channels or cursors. `preview --dump` (or
+`--out path.md`) writes the collected posts as markdown for offline use; the
+default file is `out/posts-<theme>.md`.
 
 When the daemon starts, it always checks for an undelivered digest, whatever
 `catch_up` and `run_on_start` say. A fresh one is delivered. For an old one it

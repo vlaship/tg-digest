@@ -3,8 +3,9 @@
 //!
 //! The normal mode is `serve` in a container: the scheduler and the bot that listens
 //! for commands live in one process, channels and cursors in the
-//! database. The other CLI commands are for debugging: `login` once, and `preview` /
-//! `run --dry-run` to check the post selection and the prompt without posting anything.
+//! database. The other CLI commands are for debugging: `login` once, and `preview`
+//! (optionally `--dump` to write raw posts as markdown) / `run --dry-run` to check
+//! the post selection and the prompt without posting anything.
 
 mod cancel;
 mod config;
@@ -75,6 +76,14 @@ enum Command {
         /// Only this theme (a tag from [[themes]]); without it, all themes
         #[arg(long)]
         theme: Option<String>,
+        /// Write the collected posts as markdown (same text the model gets in
+        /// {{posts}}); does not call the LLM and does not change cursors
+        #[arg(long)]
+        dump: bool,
+        /// Markdown file for --dump (default: out/posts-<theme>.md). Implies --dump.
+        /// With several themes, pass --theme or omit --out so each theme gets its own file
+        #[arg(long)]
+        out: Option<PathBuf>,
     },
     /// Build the digest and save it to out/digest.html, without posting anything
     Run {
@@ -110,12 +119,19 @@ async fn main() -> Result<()> {
                 telegram::client::login(&session.client, &cfg).await
             }
         }
-        Command::Preview { theme } => {
+        Command::Preview { theme, dump, out } => {
+            let dump = dump || out.is_some();
             let themes = chosen_themes(&cfg, theme.as_deref())?;
+            if out.is_some() && themes.len() > 1 {
+                bail!(
+                    "preview --out needs one theme: pass --theme <tag>, or omit --out \
+                     so each theme is written to out/posts-<tag>.md"
+                );
+            }
             let runner = prepare(cfg.clone()).await?;
             runner.refresh_channels().await?;
             for theme in &themes {
-                preview(&runner, theme)
+                preview(&runner, theme, dump, out.clone())
                     .instrument(run::theme_span(&theme.tag))
                     .await?;
             }
@@ -157,8 +173,9 @@ fn chosen_themes(cfg: &Config, tag: Option<&str>) -> Result<Vec<Theme>> {
 }
 
 /// A cheap check of the selection: channels, cursors, album merging — all without
-/// a single Anthropic token.
-async fn preview(runner: &Runner, theme: &Theme) -> Result<()> {
+/// a single Anthropic token. With `dump`, also writes the raw posts as markdown
+/// (the same `format_posts` block the model gets); the database stays a copy.
+async fn preview(runner: &Runner, theme: &Theme, dump: bool, out: Option<PathBuf>) -> Result<()> {
     let cfg = &runner.cfg;
     let channels = runner.db.theme_channels(&theme.tag).await?;
     println!("== theme {} ==", theme.tag);
@@ -197,7 +214,38 @@ async fn preview(runner: &Runner, theme: &Theme) -> Result<()> {
     for (channel, reason) in &collected.failures {
         println!("! {} excluded: {reason}", channel.label());
     }
-    println!();
+
+    if dump {
+        let file = out.unwrap_or_else(|| PathBuf::from(format!("out/posts-{}.md", theme.tag)));
+        if let Some(parent) = file.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("could not create {}", parent.display()))?;
+            }
+        }
+        let body = format!(
+            "# Raw posts: {}\n\n\
+             - collected: {}\n\
+             - lookback_hours: {}\n\
+             - channels: {}\n\
+             {}\n",
+            theme.tag,
+            collected.posts.len(),
+            lookback_hours,
+            channels.len(),
+            digest::format_posts(&collected.posts)
+        );
+        let path = file.display().to_string();
+        std::fs::write(&file, &body).with_context(|| format!("could not write {path}"))?;
+        println!("wrote {path}\n");
+        tracing::info!(
+            %path,
+            posts = collected.posts.len(),
+            "preview dump: saved, state not changed"
+        );
+    } else {
+        println!();
+    }
     Ok(())
 }
 

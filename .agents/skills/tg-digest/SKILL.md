@@ -94,7 +94,10 @@ its first word: `/add dev @channel`, `/run dev`, `/skip dev`, `/last dev`. `/add
 without a tag uses the first theme; `/run` without a tag runs all themes one
 after another. The debug commands take `--theme dev`
 (`preview --theme dev`, `run --dry-run --theme dev`); with several themes
-`run --dry-run` writes `out/digest-<tag>.html` for each.
+`run --dry-run` writes `out/digest-<tag>.html` for each. `preview --dump`
+(or `--out path.md`) writes the collected posts as markdown
+(`out/posts-<theme>.md` by default) without an LLM call and without moving
+cursors.
 
 Commands that touch cursors are refused while a run is going — this is not an
 error, it is the lock. When there is an undelivered run, only `/run`, `/resume`
