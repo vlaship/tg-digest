@@ -50,7 +50,10 @@ impl Digest {
             let title = topic.title.trim();
             let summary = topic.summary.trim();
             if title.is_empty() || summary.is_empty() || is_stub(title) || is_stub(summary) {
-                return Some(format!("a topic is a stub: title {title:?}"));
+                let start: String = summary.chars().take(80).collect();
+                return Some(format!(
+                    "a topic is a stub: title {title:?}, summary {start:?}"
+                ));
             }
         }
         None
@@ -59,10 +62,13 @@ impl Digest {
 
 fn is_stub(text: &str) -> bool {
     let lower = text.to_lowercase();
+    // "placeholder" inside a real text is a real word too: a post about Spring
+    // property placeholders is news, not a stub. So only a short text with it
+    // counts, like "[placeholder]" or "Placeholder summary".
     ["placeholder", "todo", "tbd", "lorem ipsum", "..."]
         .iter()
         .any(|stub| lower == *stub)
-        || lower.contains("placeholder")
+        || (lower.contains("placeholder") && lower.chars().count() <= 40)
 }
 
 #[derive(Debug, Deserialize)]
