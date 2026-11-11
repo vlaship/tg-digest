@@ -566,20 +566,70 @@ impl Summarizer {
                 timezone,
             )
         };
-        for stage in 1..=self.limits.stages {
-            let prompt_chars = final_prompt(&partials).chars().count();
-            let groups = match plan_reduce(&partials, prompt_chars, stage, self.limits) {
-                ReduceStep::Ready => break,
-                ReduceStep::Stuck => {
-                    tracing::warn!(
-                        stage,
-                        partials = partials.len(),
-                        chars = digest::partials_size(&partials),
-                        "summaries cannot be split further"
-                    );
-                    break;
+        let mut stage = 1;
+        let mut force_reduce = false;
+        loop {
+            let reduce_prompt = final_prompt(&partials);
+            let prompt_chars = reduce_prompt.chars().count();
+            let groups = if force_reduce {
+                force_reduce = false;
+                let (first, second) = partials.split_at(partials.len() / 2);
+                vec![first, second]
+            } else {
+                match plan_reduce(&partials, prompt_chars, stage, self.limits) {
+                    ReduceStep::Ready => {
+                        ensure_fits(&reduce_prompt, partials.len(), self.limits)?;
+                        match self
+                            .ask("final", &prompts.system, &reduce_prompt, cancel)
+                            .await
+                        {
+                            Ok(mut summary) => {
+                                summary.input_tokens = add(input_tokens, summary.input_tokens);
+                                summary.output_tokens = add(output_tokens, summary.output_tokens);
+                                return Ok(summary);
+                            }
+                            Err(e)
+                                if partials.len() > 1
+                                    && stage <= self.limits.stages
+                                    && format!("{e:#}").contains(CUT_ANSWER) =>
+                            {
+                                tracing::warn!(
+                                    stage,
+                                    partials = partials.len(),
+                                    chars = prompt_chars,
+                                    "the final answer did not fit max_tokens, reducing the summaries in between"
+                                );
+                                force_reduce = true;
+                                continue;
+                            }
+                            Err(e) => {
+                                return Err(e)
+                                    .context("could not reduce the part summaries into a digest");
+                            }
+                        }
+                    }
+                    ReduceStep::Stuck => {
+                        tracing::warn!(
+                            stage,
+                            partials = partials.len(),
+                            chars = digest::partials_size(&partials),
+                            "summaries cannot be split further"
+                        );
+                        // The last check is on the real prompt, not on the summaries:
+                        // we get here from "cannot be split", from used-up rounds, and
+                        // from simply a big template. Sending a request that surely
+                        // does not fit means losing these tokens too.
+                        ensure_fits(&reduce_prompt, partials.len(), self.limits)?;
+                        let mut summary = self
+                            .ask("final", &prompts.system, &reduce_prompt, cancel)
+                            .await
+                            .context("could not reduce the part summaries into a digest")?;
+                        summary.input_tokens = add(input_tokens, summary.input_tokens);
+                        summary.output_tokens = add(output_tokens, summary.output_tokens);
+                        return Ok(summary);
+                    }
+                    ReduceStep::Compress(groups) => groups,
                 }
-                ReduceStep::Compress(groups) => groups,
             };
 
             tracing::info!(
@@ -589,8 +639,11 @@ impl Summarizer {
                 "summaries do not fit in one request, reducing in between"
             );
 
-            let mut merged = Vec::with_capacity(groups.len());
-            for (index, group) in groups.iter().enumerate() {
+            let mut queue: std::collections::VecDeque<&[Digest]> = groups.into_iter().collect();
+            let mut merged = Vec::with_capacity(queue.len());
+            let mut done = 0;
+            while let Some(group) = queue.pop_front() {
+                let (number, total) = (done + 1, done + 1 + queue.len());
                 let prompt = digest::render_prompt_with(
                     &prompts.user_template,
                     &digest::format_partials(group),
@@ -600,43 +653,42 @@ impl Summarizer {
                     now,
                     timezone,
                 );
-                let summary = self
+                let summary = match self
                     .ask(
-                        &format!("reduce {stage}: {}/{}", index + 1, groups.len()),
+                        &format!("reduce {stage}: {number}/{total}"),
                         map_system,
                         &prompt,
                         cancel,
                     )
                     .await
-                    .with_context(|| {
-                        format!(
-                            "could not reduce group {} of {} at stage {stage}",
-                            index + 1,
-                            groups.len()
-                        )
-                    })?;
+                {
+                    Ok(summary) => summary,
+                    Err(e) if group.len() > 1 && format!("{e:#}").contains(CUT_ANSWER) => {
+                        let (first, second) = group.split_at(group.len() / 2);
+                        tracing::warn!(
+                            stage,
+                            group = number,
+                            parts = group.len(),
+                            "the answer for the reduce group did not fit max_tokens, splitting the group in two"
+                        );
+                        queue.push_front(second);
+                        queue.push_front(first);
+                        continue;
+                    }
+                    Err(e) => {
+                        return Err(e).with_context(|| {
+                            format!("could not reduce group {number} of {total} at stage {stage}")
+                        })
+                    }
+                };
+                done += 1;
                 input_tokens = add(input_tokens, summary.input_tokens);
                 output_tokens = add(output_tokens, summary.output_tokens);
                 merged.push(summary.digest);
             }
             partials = merged;
+            stage += 1;
         }
-
-        let reduce_prompt = final_prompt(&partials);
-        // The last check is on the real prompt, not on the summaries:
-        // we get here from "cannot be split", from used-up rounds, and from simply
-        // a big template. Sending a request that surely does not fit means
-        // losing these tokens too.
-        ensure_fits(&reduce_prompt, partials.len(), self.limits)?;
-
-        let mut summary = self
-            .ask("final", &prompts.system, &reduce_prompt, cancel)
-            .await
-            .context("could not reduce the part summaries into a digest")?;
-
-        summary.input_tokens = add(input_tokens, summary.input_tokens);
-        summary.output_tokens = add(output_tokens, summary.output_tokens);
-        Ok(summary)
     }
 
     /// One request to the model. It can be stopped: on shutdown the tokens are wasted,
@@ -815,14 +867,21 @@ fn plan_reduce(
     stage: usize,
     limits: Limits,
 ) -> ReduceStep<'_> {
-    if prompt_chars <= limits.input {
+    // Part summaries are much denser than raw posts: 300k characters of them can
+    // hold 800+ topics, which does not fit in one final answer. So we reduce in
+    // between as soon as the prompt is over the part budget (`limits.batch`),
+    // not only when it is over the whole window (`limits.input`).
+    if prompt_chars <= limits.batch {
         return ReduceStep::Ready;
     }
     if stage > limits.stages || partials.len() < 2 {
         return ReduceStep::Stuck;
     }
 
-    let groups = digest::split_partials(partials, limits.batch);
+    let budget = limits
+        .batch
+        .min(digest::partials_size(partials).div_ceil(2));
+    let groups = digest::split_partials(partials, budget);
     // As many groups as summaries — the round condenses nothing, it only
     // spends one request per summary.
     if groups.len() >= partials.len() {

@@ -122,8 +122,9 @@ map-reduce (`summarize.rs`):
   the parts are merged with the shared system prompt.
 - Parts are split by channel. A channel is split only if it alone does not fit
   the budget.
-- If the summaries together still do not fit in one request, they are merged in
-  extra rounds (up to `MAX_REDUCE_STAGES`).
+- If the summaries together are bigger than the part budget (`max_input_chars / 2`),
+  or if the final answer is cut at `max_tokens`, they are merged in extra rounds
+  (up to `MAX_REDUCE_STAGES`) before the final request.
 - Before the final request, the whole prompt is checked (`ensure_fits`). If it
   does not fit, the run fails with a clear error. It does not send a bad request
   and does not drop topics. The cursors do not move, so the posts go into the next
@@ -133,8 +134,9 @@ map-reduce (`summarize.rs`):
 - The input can fit the context window while the answer does not fit `max_tokens`
   (with a thinking model the thinking counts too). Then the one-request path does
   not fail the run: it logs a warning and asks again through map-reduce, with parts
-  of at most half of the input it just sent. A map part whose answer is cut is
-  split in two and asked again; only a part of one post fails the run. A model with a window of a million
+  of at most half of the input it just sent. A map part or a reduce group whose
+  answer is cut is split in two and asked again; only a part of one post (or one
+  summary) fails the run. A model with a window of a million
   tokens needs `max_input_chars` in the config, or the first request is always the
   whole feed.
 - `max_posts_per_channel` is a safety limit. A channel that hits it is removed
