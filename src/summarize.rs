@@ -476,7 +476,13 @@ impl Summarizer {
         let mut input_tokens = None;
         let mut output_tokens = None;
 
-        for (index, batch) in batches.iter().enumerate() {
+        // A part whose answer was cut at `max_tokens` is split in two and asked
+        // again: the parts go in a queue, and the halves take its place. Only a
+        // part of one post fails the run.
+        let mut queue: std::collections::VecDeque<&[Post]> = batches.into_iter().collect();
+        let mut done = 0;
+        while let Some(batch) = queue.pop_front() {
+            let (number, total) = (done + 1, done + 1 + queue.len());
             // A part has fewer channels than the run: we use its count, otherwise
             // the prompt promises the model material that is not in this part.
             let prompt = digest::render_prompt_with(
@@ -489,25 +495,43 @@ impl Summarizer {
                 timezone,
             );
 
-            let summary = self
+            let summary = match self
                 .ask(
-                    &format!("map {}/{}", index + 1, batches.len()),
+                    &format!("map {number}/{total}"),
                     map_system,
                     &prompt,
                     cancel,
                 )
                 .await
-                .with_context(|| {
-                    format!("could not condense part {} of {}", index + 1, batches.len())
-                })?;
+            {
+                Ok(summary) => summary,
+                Err(e) if batch.len() > 1 && format!("{e:#}").contains(CUT_ANSWER) => {
+                    let (first, second) = split_half(batch);
+                    tracing::warn!(
+                        part = number,
+                        posts = batch.len(),
+                        first = first.len(),
+                        second = second.len(),
+                        "the answer for the part did not fit max_tokens, splitting the part in two"
+                    );
+                    queue.push_front(second);
+                    queue.push_front(first);
+                    continue;
+                }
+                Err(e) => {
+                    return Err(e)
+                        .with_context(|| format!("could not condense part {number} of {total}"))
+                }
+            };
 
             tracing::info!(
-                part = index + 1,
-                of = batches.len(),
+                part = number,
+                of = total,
                 posts = batch.len(),
                 topics = summary.digest.topics.len(),
                 "part condensed"
             );
+            done += 1;
             input_tokens = add(input_tokens, summary.input_tokens);
             output_tokens = add(output_tokens, summary.output_tokens);
             partials.push(summary.digest);
@@ -805,6 +829,22 @@ fn ensure_fits(prompt: &str, partials: usize, limits: Limits) -> Result<()> {
 
 /// How many different channels are in a part. Posts come in a row by channel, so
 /// it is enough to count changes of `channel_id`.
+/// Two halves of a part with about the same amount of text. Each half has at
+/// least one post, so the part must have two or more.
+fn split_half(posts: &[Post]) -> (&[Post], &[Post]) {
+    let total: usize = posts.iter().map(|p| p.text.chars().count()).sum();
+    let mut size = 0;
+    let mut middle = 1;
+    for (index, post) in posts.iter().enumerate() {
+        size += post.text.chars().count();
+        if size * 2 >= total {
+            middle = index + 1;
+            break;
+        }
+    }
+    posts.split_at(middle.clamp(1, posts.len() - 1))
+}
+
 fn distinct_channels(posts: &[Post]) -> usize {
     let mut count = 0;
     let mut current = None;
@@ -994,6 +1034,24 @@ fn parse_chat(response: Value, api: &'static str) -> Result<Summary> {
         .and_then(Value::as_str)
         .unwrap_or("");
     if finish_reason == "length" {
+        // Without the numbers we cannot tell a long answer from thinking that
+        // went in circles and used the whole budget.
+        let usage = |field: &str| {
+            response
+                .pointer(&format!("/usage/{field}"))
+                .and_then(Value::as_u64)
+        };
+        let provider = response
+            .get("provider")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        tracing::warn!(
+            %provider,
+            input_tokens = usage("prompt_tokens"),
+            output_tokens = usage("completion_tokens"),
+            reasoning_tokens = usage("completion_tokens_details/reasoning_tokens"),
+            "the answer was cut"
+        );
         bail!("{CUT_ANSWER} — raise max_tokens of the model in the config");
     }
     if finish_reason == "content_filter" {
