@@ -130,7 +130,13 @@ token = ""
 # table, the provider's model list, the provider table, the defaults.
 #   max_tokens           — the longest answer, in tokens
 #   max_input_chars      — above this many characters the posts are condensed in
-#                          parts first (map-reduce): more requests, each one smaller
+#                          parts first (map-reduce): more requests, each one smaller.
+#                          Not set, it comes from the context window of the model.
+#                          A model with a window of a million tokens then gets the
+#                          whole feed in one request, and one digest of everything
+#                          can be too long to write: set it by hand (400000 is a
+#                          good start). If the answer is cut anyway, the service
+#                          splits the input and asks again by itself
 #   request_timeout_secs — how long to wait for one answer (default 600)
 #   effort               — anthropic: low | medium | high | xhigh | max;
 #                          openai: none | minimal | low | medium | high

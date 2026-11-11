@@ -130,6 +130,12 @@ map-reduce (`summarize.rs`):
   run.
 - Post links must survive the map step. Otherwise the final step has nothing to
   put in `sources`, and everything fails the check.
+- The input can fit the context window while the answer does not fit `max_tokens`
+  (with a thinking model the thinking counts too). Then the one-request path does
+  not fail the run: it logs a warning and asks again through map-reduce, with parts
+  of at most half of the input it just sent. A model with a window of a million
+  tokens needs `max_input_chars` in the config, or the first request is always the
+  whole feed.
 - `max_posts_per_channel` is a safety limit. A channel that hits it is removed
   from the run completely, and its cursor does not move.
 
