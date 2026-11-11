@@ -12,7 +12,7 @@ use it is in [README.md](README.md).
 
 | File | What it does |
 |---|---|
-| `src/main.rs` | CLI (`login` / `preview` / `run --dry-run` / `serve`), scheduler, signals |
+| `src/main.rs` | CLI (`login` / `preview` [--dump] / `run --dry-run` / `serve`), scheduler, signals |
 | `src/config.rs` | `config.toml` (all settings and secrets), themes, validation |
 | `src/db.rs` | SQLite: channels with cursors per theme, journal of runs and delivered parts |
 | `src/run.rs` | a trigger over the themes, one full run of a theme (collect, summarize, publish), the lock, recovery of undelivered runs |
@@ -41,6 +41,7 @@ use it is in [README.md](README.md).
 - `Copy-Item config.example.toml config.toml` — create a local config in PowerShell.
 - `cargo run -- --config config.toml login` — log in to the Telegram account.
 - `cargo run -- --config config.toml preview` — see the collected posts, no Anthropic call.
+- `cargo run -- --config config.toml preview --theme dev --dump` — same, and write `out/posts-dev.md` (raw posts via `format_posts`, no LLM, cursors untouched). Optional `--out path.md`.
 - `cargo run -- --config config.toml run --dry-run` — make `out/digest.html` with Anthropic, post nothing.
 - `cargo run -- --config config.toml serve` — run the scheduler and the command listener.
 - `docker compose run --rm -it tg-digest login`, then `docker compose up -d --build` — the normal deploy.
