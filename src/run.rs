@@ -895,17 +895,24 @@ impl Runner {
             None => otherwise.to_string(),
         };
 
+        // The words of the API itself: "Key limit exceeded (weekly limit) … $1.01 of
+        // $1.00 used" tells the owner what to do better than our guess.
+        let says = match &api_error.message {
+            Some(message) => format!("\n\n{api} says: {message}"),
+            None => String::new(),
+        };
+
         match api_error.kind {
             ApiErrorKind::Limit => format!(
-                "⚠️ The {api} limit is used up, the digest is not built.\n{KEPT}\n\n{}",
+                "⚠️ The {api} limit is used up, the digest is not built.\n{KEPT}{says}\n\n{}",
                 switch("Wait for the limit to reset, or add a model to fallback in the config.")
             ),
             ApiErrorKind::Unavailable => format!(
-                "⚠️ {api} is overloaded and did not answer, the digest is not built.\n{KEPT}\n\n{}",
+                "⚠️ {api} is overloaded and did not answer, the digest is not built.\n{KEPT}{says}\n\n{}",
                 switch("Send /run later to try again, or switch the model with /model.")
             ),
             ApiErrorKind::Auth => format!(
-                "⚠️ {api} did not accept the API key, the digest is not built.\n{KEPT}\n\n\
+                "⚠️ {api} did not accept the API key, the digest is not built.\n{KEPT}{says}\n\n\
                  Check providers.{}.api_key in config.toml.",
                 current.split('/').next().unwrap_or("")
             ),

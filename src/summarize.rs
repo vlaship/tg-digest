@@ -28,6 +28,9 @@ pub struct ApiError {
     pub kind: ApiErrorKind,
     /// The API answer, cut short: for the log and the database.
     pub details: String,
+    /// The error text of the API (`error.message`), if it has one: it goes to the
+    /// owner as it is.
+    pub message: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,6 +105,18 @@ fn is_limit(status: reqwest::StatusCode, text: &str) -> bool {
     status.as_u16() == 429
         || text.contains("RESOURCE_EXHAUSTED")
         || text.contains("credit balance is too low")
+        // OpenRouter: a spending limit on the key is a 403, but the key is fine.
+        || text.contains("Key limit exceeded")
+        || text.contains("openrouter_key_limit")
+}
+
+/// The text of the error from the API answer (`error.message`), the same place in
+/// all four APIs. The owner gets it as it is: "Key limit exceeded (weekly limit)
+/// … $1.01 of $1.00 used" says more than any text of ours.
+fn api_message(text: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(text).ok()?;
+    let message = value.pointer("/error/message")?.as_str()?.trim();
+    (!message.is_empty()).then(|| message.chars().take(500).collect())
 }
 
 /// A 429 for a used-up daily quota, not a short rate limit: Gemini names the
@@ -765,7 +780,14 @@ impl Summarizer {
             if let Some(kind) = kind {
                 let short: String = text.chars().take(300).collect();
                 let details = format!("{status}: {short}");
-                return Err(ApiError { api, kind, details }.into());
+                let message = api_message(&text);
+                return Err(ApiError {
+                    api,
+                    kind,
+                    details,
+                    message,
+                }
+                .into());
             }
             bail!("the {api} API returned {status}: {text}");
         }
@@ -1011,6 +1033,7 @@ fn parse_chat(response: Value, api: &'static str) -> Result<Summary> {
         let code = error.get("code").and_then(Value::as_u64).unwrap_or(0);
         let kind = match code {
             429 => Some(ApiErrorKind::Limit),
+            403 if message.contains("Key limit exceeded") => Some(ApiErrorKind::Limit),
             401 | 403 => Some(ApiErrorKind::Auth),
             500..=599 => Some(ApiErrorKind::Unavailable),
             _ => None,
@@ -1020,6 +1043,7 @@ fn parse_chat(response: Value, api: &'static str) -> Result<Summary> {
                 api,
                 kind,
                 details: format!("{code}: {message}"),
+                message: Some(message.chars().take(500).collect()),
             }
             .into());
         }
