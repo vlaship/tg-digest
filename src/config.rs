@@ -8,6 +8,7 @@ use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::str::FromStr;
 
 use crate::models::Entry;
 
@@ -66,7 +67,10 @@ impl Default for Bot {
 
 #[derive(Debug, Deserialize)]
 pub struct Schedule {
-    pub cron: String,
+    /// Old key: cron now lives on each `[[themes]]` block. Kept only to give a
+    /// clear error when an old config still has it.
+    #[serde(default)]
+    cron: Option<String>,
     #[serde(default = "default_timezone")]
     pub timezone: String,
     #[serde(default)]
@@ -303,6 +307,8 @@ pub struct ThemeConfig {
     pub title: String,
     /// System prompt of the theme.
     pub system: String,
+    /// Cron for this theme (5 fields). Needed.
+    pub cron: String,
     /// Where the digest of this theme goes: `"bot"` or `"@channel"`. Not set:
     /// `telegram.destination`.
     #[serde(default)]
@@ -315,6 +321,8 @@ pub struct ThemeConfig {
 pub struct Theme {
     pub tag: String,
     pub prompts: Prompts,
+    /// Cron expression for this theme.
+    pub cron: String,
     /// `"bot"` (or `"me"`, for old configs), or `"@channel"`.
     pub destination: String,
 }
@@ -386,6 +394,7 @@ impl Config {
                     map_system: self.prompts.map_system.clone(),
                     digest_title: t.title.clone(),
                 },
+                cron: t.cron.clone(),
                 destination: t
                     .destination
                     .clone()
@@ -567,6 +576,12 @@ impl Config {
                 self.schedule.timezone
             );
         }
+        if self.schedule.cron.is_some() {
+            bail!(
+                "schedule.cron is not used any more: set `cron` on each [[themes]] block \
+                 (see config.example.toml)"
+            );
+        }
         if self.prompts.system.is_some() || self.prompts.digest_title.is_some() {
             bail!(
                 "prompts.system and prompts.digest_title are not used any more: move them \
@@ -576,7 +591,7 @@ impl Config {
         if self.themes.is_empty() {
             bail!(
                 "there is no [[themes]] block: at least one theme is needed, with `tag`, \
-                 `title` and `system` (see config.example.toml)"
+                 `title`, `system` and `cron` (see config.example.toml)"
             );
         }
         for (key, name) in [
@@ -612,6 +627,17 @@ impl Config {
                 bail!(
                     "theme {:?}: `system` and `title` must not be empty",
                     theme.tag
+                );
+            }
+            if theme.cron.trim().is_empty() {
+                bail!("theme {:?}: `cron` must not be empty", theme.tag);
+            }
+            // Same check as `Scheduler::new`: refuse a bad cron at load, not at midnight.
+            if let Err(e) = croner::Cron::from_str(&theme.cron) {
+                bail!(
+                    "theme {:?}: invalid cron expression {:?}: {e}",
+                    theme.tag,
+                    theme.cron
                 );
             }
         }

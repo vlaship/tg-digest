@@ -82,7 +82,7 @@ Commands:
 /help — this help
 
 A theme is its tag from the config, one word. A channel can be in several themes:
-each theme reads it on its own.";
+each theme reads it on its own. Each theme has its own cron in [[themes]].";
 
 /// Run the updates loop until the shutdown signal comes.
 pub async fn listen(
@@ -586,7 +586,9 @@ async fn status(runner: &Arc<Runner>) -> Result<String> {
         };
         any = true;
         if themes.len() > 1 {
-            out.push_str(&format!("\n\n— {} —", theme.tag));
+            out.push_str(&format!("\n\n— {} —\ncron {}", theme.tag, theme.cron));
+        } else {
+            out.push_str(&format!("\ncron {}", theme.cron));
         }
         out.push_str(&run_status(runner, &run).await?);
     }

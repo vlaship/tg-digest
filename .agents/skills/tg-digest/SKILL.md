@@ -106,10 +106,9 @@ and `/abandon` are allowed.
 ## Debugging the schedule
 
 There is no point in testing with the real cron — you would wait a day. For a
-short time use:
+short time set each theme's `cron` in `[[themes]]` to:
 
 ```toml
-[schedule]
 cron = "*/2 * * * *"
 ```
 

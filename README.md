@@ -11,7 +11,8 @@ and posts the digest back to Telegram on a schedule.
 - **Bot.** You talk to your own Telegram bot: you write commands to it, and it
   sends you the replies, the digests and the notifications. It can also post the
   digest to your channel. Only your account may give it commands.
-- **Schedule.** A cron expression in the config. You do not need a separate OS
+- **Schedule.** Each theme has its own cron in the config. Time zone and
+  catch-up flags live under `[schedule]`. You do not need a separate OS
   scheduler.
 - **Channel list.** Stored in the database. You add and remove channels with
   commands to the bot (`/add`, `/rm`), and control the service there too
@@ -161,23 +162,25 @@ every run, so a renamed channel keeps correct links.
 
 ### Themes
 
-A theme is its own digest: its own channels, system prompt, title and, if you
-want, its own destination. The config needs at least one theme. You describe
-themes as `[[themes]]` blocks (see `config.example.toml`: `world` for general news and `dev` for
-programming channels, which also drops adverts for courses):
+A theme is its own digest: its own channels, system prompt, title, cron and, if
+you want, its own destination. The config needs at least one theme. You describe
+themes as `[[themes]]` blocks (see `config.example.toml`: `world` for general
+news and `dev` for programming channels, which also drops adverts for courses):
 
 ```toml
 [[themes]]
 tag         = "dev"
 title       = "💻 Digest DEV {{date}} {{time}}"
+cron        = "0 18 * * *"        # needed: this theme's schedule
 destination = "@my_dev_channel"   # optional, else [telegram].destination
 system      = """..."""
 ```
 
-On each schedule slot the themes run one after another, in the order of the
-blocks, and each one posts its own digest. They do not depend on each other: a
-channel can be in several themes (each theme keeps its own cursor for it, so its
-news is in each digest), and an error in one theme does not stop the others.
+Each theme fires on its own cron. When two themes share a slot they run one
+after another, in the order of the blocks, and each one posts its own digest.
+They do not depend on each other: a channel can be in several themes (each theme
+keeps its own cursor for it, so its news is in each digest), and an error in one
+theme does not stop the others.
 
 The tag names the theme in commands: `/add dev @channel`, `/run dev`. `/add`
 without a tag uses the first theme. Channels from before themes go to the first

@@ -32,11 +32,9 @@ fallback = ["openrouter/google/gemma-4-31b-it:free", "anthropic/claude-haiku-5-5
 
 # ------------------------------------------------------------------ schedule --
 [schedule]
-# Standard 5-field cron: minute hour day month weekday
-cron = "0 9 * * *"          # every day at 09:00; "0 7,13,17,21 * * *" is four times a day
-
-# IANA time zone name. The cron is calculated in it, and the date in the digest
-# title uses it. Without it "09:00" means UTC.
+# IANA time zone name. Every theme cron is calculated in it, and the date in the
+# digest title uses it. Without it "09:00" means UTC.
+# Each theme has its own `cron` in [[themes]] (no shared schedule.cron).
 timezone = "America/New_York"
 
 # If a slot was missed (the container was stopped, the computer was asleep),
@@ -211,9 +209,9 @@ Collected {{post_count}} posts from {{channel_count}} channels.
 # ------------------------------------------------------------------- themes --
 # At least one theme is needed.
 # A theme is its own digest: its own channels, its own system prompt, its own
-# title. The themes run one after another, in the order of the blocks here, on the
-# same schedule. They know nothing about each other: a channel can be in several
-# themes, and then its news is in each of those digests.
+# title and its own cron. Themes know nothing about each other: a channel can be
+# in several themes, and then its news is in each of those digests. When two
+# themes share a slot they run one after another, in the order here.
 #
 #   tag         — one word of small letters, digits, _ or -. It names the theme
 #                 in commands: /add dev @channel, /run dev, /list.
@@ -221,6 +219,7 @@ Collected {{post_count}} posts from {{channel_count}} channels.
 #   title       — the title of the digest, needed. {{date}} and {{time}} are in
 #                 the time zone from [schedule]
 #   system      — the system prompt of the theme, needed
+#   cron        — 5-field cron for this theme, needed (minute hour day month weekday)
 #   destination — where this digest goes: "bot" or "@channel". Not set: the
 #                 destination from [telegram].
 #
@@ -230,6 +229,7 @@ Collected {{post_count}} posts from {{channel_count}} channels.
 [[themes]]
 tag   = "world"
 title = "📰 Digest World News {{date}} {{time}}"
+cron  = "0 9 * * *"             # every day at 09:00; "0 7,13,17,21 * * *" is four times a day
 # destination = "@my_world_channel"
 system = """
 You are the editor of a daily news digest made from Telegram channels.
@@ -261,6 +261,7 @@ Rules:
 [[themes]]
 tag   = "dev"
 title = "💻 Digest DEV {{date}} {{time}}"
+cron  = "0 18 * * *"            # this theme only, at 18:00
 # destination = "@my_dev_channel"
 system = """
 You are the editor of a digest for software developers. It is made from Telegram

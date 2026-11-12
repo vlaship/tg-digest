@@ -1,4 +1,5 @@
-//! Scheduler on croner: the cron expression and the time zone come from `[schedule]`.
+//! Scheduler on croner: one theme cron expression and the shared time zone from
+//! `[schedule]`.
 
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
