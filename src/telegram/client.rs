@@ -10,9 +10,13 @@
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use std::collections::{BTreeMap, HashMap};
+use std::fs::{File, OpenOptions};
 use std::future::Future;
+use std::io::{Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures_util::StreamExt;
@@ -46,6 +50,146 @@ pub struct Session {
 /// Connect the personal account: it reads the channels.
 pub async fn connect(cfg: &Config) -> Result<Session> {
     open(&cfg.telegram.app.session_file, cfg.telegram.app.api_id).await
+}
+
+/// How often `serve` rewrites the session lock while it holds `tg.session`.
+const SESSION_LOCK_REFRESH: Duration = Duration::from_secs(20);
+/// A lock file older than this is a process that died without deleting it.
+const SESSION_LOCK_STALE: Duration = Duration::from_secs(90);
+
+/// Held by `serve` for the whole process. Dropping it removes the lock file.
+pub struct SessionHold {
+    path: PathBuf,
+    stop: Arc<AtomicBool>,
+    file: Arc<Mutex<Option<File>>>,
+    refresh: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for SessionHold {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        self.refresh.abort();
+        if let Ok(mut guard) = self.file.lock() {
+            // Close the file before deleting it. Windows cannot delete an open file.
+            *guard = None;
+        }
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// The daemon marks the personal-account session as in use, and keeps the mark
+/// fresh until it exits. `preview` and `run --dry-run` refuse to connect while
+/// the mark is fresh: Telegram allows one connection for that key, and a second
+/// one comes back as `AUTH_KEY_DUPLICATED`.
+pub fn hold_session(session_file: &str) -> Result<SessionHold> {
+    let path = session_lock_path(session_file);
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("could not create {}", parent.display()))?;
+        }
+    }
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .read(true)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("could not open {}", path.display()))?;
+    if try_lock_file(&file)? {
+        return Err(session_busy(session_file));
+    }
+    write_stamp(&mut file)?;
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let shared = Arc::new(Mutex::new(Some(file)));
+    let stop_task = Arc::clone(&stop);
+    let file_task = Arc::clone(&shared);
+    let refresh = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(SESSION_LOCK_REFRESH).await;
+            if stop_task.load(Ordering::SeqCst) {
+                break;
+            }
+            let mut guard = file_task.lock().unwrap_or_else(|e| e.into_inner());
+            if stop_task.load(Ordering::SeqCst) {
+                break;
+            }
+            if let Some(open) = guard.as_mut() {
+                let _ = write_stamp(open);
+            }
+        }
+    });
+    Ok(SessionHold {
+        path,
+        stop,
+        file: shared,
+        refresh,
+    })
+}
+
+/// `preview` and `run --dry-run` call this before they open `tg.session`.
+pub fn ensure_session_free(session_file: &str) -> Result<()> {
+    let path = session_lock_path(session_file);
+    if lock_is_fresh(&path) {
+        return Err(session_busy(session_file));
+    }
+    // Same machine: the daemon holds an exclusive lock, even when the file
+    // time has not been refreshed yet.
+    if let Ok(file) = OpenOptions::new().read(true).open(&path) {
+        if try_lock_file(&file)? {
+            return Err(session_busy(session_file));
+        }
+    }
+    Ok(())
+}
+
+fn session_lock_path(session_file: &str) -> PathBuf {
+    PathBuf::from(format!("{session_file}.lock"))
+}
+
+fn session_busy(session_file: &str) -> anyhow::Error {
+    anyhow!(
+        "the daemon is already using this Telegram session ({session_file}). \
+         Stop it before preview or run --dry-run. A second connection gets \
+         AUTH_KEY_DUPLICATED and the login is dead until you run login again. \
+         After a kill, wait two minutes or delete {session_file}.lock"
+    )
+}
+
+/// `true` when the exclusive lock is already taken.
+fn try_lock_file(file: &File) -> Result<bool> {
+    match file.try_lock() {
+        Ok(()) => Ok(false),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(true),
+        Err(std::fs::TryLockError::Error(e)) => Err(e).context("could not check the session lock"),
+    }
+}
+
+fn lock_is_fresh(path: &Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    let Ok(modified) = meta.modified() else {
+        return true;
+    };
+    match modified.elapsed() {
+        Ok(age) => age < SESSION_LOCK_STALE,
+        // A time in the future still means someone wrote the file just now.
+        Err(_) => true,
+    }
+}
+
+fn write_stamp(file: &mut File) -> Result<()> {
+    file.set_len(0)
+        .context("could not update the session lock")?;
+    file.seek(SeekFrom::Start(0))
+        .context("could not update the session lock")?;
+    file.write_all(b"serve\n")
+        .context("could not update the session lock")?;
+    file.sync_all()
+        .context("could not update the session lock")?;
+    Ok(())
 }
 
 /// Open a session file, connect to Telegram and start the background task of the

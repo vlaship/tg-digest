@@ -1,5 +1,5 @@
-//! tg-digest — reads Telegram channels, summarizes them with Claude and posts
-//! a digest back to Telegram on the cron schedule from the config.
+//! tg-digest — reads Telegram channels, summarizes them with the model from the
+//! config and posts a digest back to Telegram on each theme's cron schedule.
 //!
 //! The normal mode is `serve` in a container: the scheduler and the bot that listens
 //! for commands live in one process, channels and cursors in the
@@ -53,7 +53,7 @@ pub fn version() -> String {
 }
 
 #[derive(Parser)]
-#[command(name = "tg-digest", about = "Digest of Telegram channels with Claude")]
+#[command(name = "tg-digest", about = "Digest of Telegram channels")]
 struct Cli {
     /// Path to the config
     #[arg(long, short, default_value = "/data/config.toml", global = true)]
@@ -336,6 +336,9 @@ async fn adopt_old_channels(db: &Db, cfg: &Config) -> Result<()> {
 /// Common setup for the debug commands: database, client, login check.
 /// They do not need a shutdown token — the process runs once.
 async fn prepare(cfg: Arc<Config>) -> Result<Arc<Runner>> {
+    // The daemon already holds this session. Opening it again kills the login
+    // (AUTH_KEY_DUPLICATED). Refuse before any other work.
+    telegram::client::ensure_session_free(&cfg.telegram.app.session_file)?;
     let db = Arc::new(Db::open(&cfg.db_file).await?.preview_copy().await?);
     adopt_old_channels(&db, &cfg).await?;
     let session = telegram::client::connect(&cfg).await?;
@@ -373,6 +376,10 @@ async fn serve(cfg: Arc<Config>) -> Result<()> {
             "runs that stopped during collection are closed"
         );
     }
+
+    // Mark the session in use before connect, so preview and run --dry-run
+    // refuse instead of opening a second connection.
+    let _session_hold = telegram::client::hold_session(&cfg.telegram.app.session_file)?;
 
     // The personal account reads the channels; it is also the owner of the bot.
     let telegram::client::Session {

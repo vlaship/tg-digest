@@ -240,7 +240,9 @@ async fn handle(runner: &Arc<Runner>, text: &str) -> Result<String> {
     match command_name(text) {
         "/help" => Ok(HELP.into()),
         "/start" => Ok(HELP.into()),
-        "/model" => model(runner, arg).await,
+        // A switch during a run would be saved inside the run's transaction and
+        // lost on rollback. The same refusal as the other state changes.
+        "/model" => guarded(runner, model(runner, arg)).await,
         "/models" => models(runner, arg).await,
         "/fallback" => fallback(runner).await,
         "/list" => list(runner).await,
@@ -507,6 +509,9 @@ async fn models(runner: &Arc<Runner>, arg: &str) -> Result<String> {
 /// The owner agrees to the fallback model after an error notice: switch to the
 /// next model in the `fallback` list and build the digest at once.
 async fn fallback(runner: &Arc<Runner>) -> Result<String> {
+    let Some(guard) = runner.try_lock() else {
+        return Ok(Outcome::Busy(runner.running_id().await?).to_string());
+    };
     let current = runner.model().await;
     let Some(fallback) = runner.next_fallback().await else {
         return Ok("there is no other model in fallback in the config".into());
@@ -514,7 +519,7 @@ async fn fallback(runner: &Arc<Runner>) -> Result<String> {
     if let Err(e) = runner.set_model(&fallback).await {
         return Ok(format!("cannot switch to {fallback}: {e:#}"));
     }
-    let outcome = runner.trigger(TRIGGER_MANUAL, None).await?;
+    let outcome = runner.trigger_locked(guard, TRIGGER_MANUAL, None).await?;
     Ok(format!(
         "model: {fallback} (was {current}). /model {current} switches back.\n\n{outcome}"
     ))

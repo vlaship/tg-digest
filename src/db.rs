@@ -10,10 +10,11 @@
 //! `runs.cursors` and do not affect selection — a failed publish does not "eat"
 //! posts that nobody saw.
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
 use libsql::{params, Connection};
 use std::collections::BTreeMap;
+use tokio::sync::Mutex;
 
 /// The run is going: posts are being collected, there is no model answer yet.
 pub const STATUS_COLLECTING: &str = "collecting";
@@ -32,8 +33,9 @@ pub const STATUS_ERROR: &str = "error";
 const CHANNEL_COLUMNS: &str =
     "id, access_hash, username, title, enabled, last_msg_id, last_error, theme";
 
-/// The full schema. It is created on the first start. The only migration is the
-/// `theme` column (`migrate_themes`); after any other schema change start with a
+/// The full schema. It is created on the first start. On every later start,
+/// `ensure_columns` adds any column that is missing (`ALTER TABLE`). SQLite
+/// cannot change a primary key or a column type in place: that still needs a
 /// new database.
 ///
 /// A channel row belongs to one theme. The same channel can be in several themes:
@@ -71,7 +73,7 @@ CREATE TABLE IF NOT EXISTS runs (
     -- short topics of the digest (JSON list of strings), so the next run can skip
     -- stories that were already sent
     digest_topics     TEXT,
-    -- the theme of the run; new columns go last, `row_to_run` reads by position
+    -- the theme of the run. `row_to_run` reads by name, so column order does not matter
     theme             TEXT NOT NULL DEFAULT ''
 );
 -- photos: how many photos a part has. The files are in the photos folder
@@ -195,15 +197,47 @@ pub struct Destination {
     pub access_hash: i64,
 }
 
-/// One connection per process. Only the run and the commands write to the database,
-/// and they work under one lock (`run::Runner`), so two transactions never
-/// overlap; read-only commands (`/list`, `/status`) go without the lock,
-/// and that is enough for them.
+/// One connection per process. Every use takes `conn` for the whole call, and a
+/// transaction (`save_summary`, `complete_run`) keeps it until commit. A command
+/// then cannot join that transaction, and two statements cannot fail with
+/// "database is locked". Commands that change state also take the run lock.
 pub struct Db {
-    conn: Connection,
+    conn: Mutex<Connection>,
 }
 
+/// Columns that may be missing on a database created by an older build.
+/// Each one is nullable or has a default, so `ALTER TABLE` can add it.
+/// `channels.theme` is not here: it is part of the primary key, and
+/// `prepare_themes` moves the old table instead.
+const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
+    ("channels", "username", "TEXT"),
+    ("channels", "last_error", "TEXT"),
+    ("channels", "enabled", "INTEGER NOT NULL DEFAULT 1"),
+    ("channels", "last_msg_id", "INTEGER NOT NULL DEFAULT 0"),
+    ("runs", "finished_at", "TEXT"),
+    ("runs", "posts", "INTEGER"),
+    ("runs", "topics", "INTEGER"),
+    ("runs", "input_tokens", "INTEGER"),
+    ("runs", "output_tokens", "INTEGER"),
+    ("runs", "error", "TEXT"),
+    ("runs", "cursors", "TEXT"),
+    ("runs", "first_send_at", "TEXT"),
+    ("runs", "dest_label", "TEXT"),
+    ("runs", "dest_peer_id", "INTEGER"),
+    ("runs", "dest_access_hash", "INTEGER"),
+    ("runs", "stale_notified_at", "TEXT"),
+    ("runs", "digest_topics", "TEXT"),
+    ("runs", "theme", "TEXT NOT NULL DEFAULT ''"),
+    ("run_chunks", "delivered_at", "TEXT"),
+    ("run_chunks", "sent_msg_id", "INTEGER"),
+    ("run_chunks", "photos", "INTEGER NOT NULL DEFAULT 0"),
+];
+
 impl Db {
+    async fn lock(&self) -> tokio::sync::MutexGuard<'_, Connection> {
+        Mutex::lock(&self.conn).await
+    }
+
     pub async fn open(path: &str) -> Result<Self> {
         let conn = libsql::Builder::new_local(path)
             .build()
@@ -212,79 +246,15 @@ impl Db {
             .connect()
             .with_context(|| format!("could not connect to the database {path}"))?;
 
-        let db = Self { conn };
-        db.prepare_themes().await?;
-        db.conn
-            .execute_batch(SCHEMA)
+        // No other task has this connection yet, so the setup does not take the mutex.
+        prepare_themes(&conn).await?;
+        conn.execute_batch(SCHEMA)
             .await
             .context("could not create the database schema")?;
-        db.copy_old_channels().await?;
-        Ok(db)
-    }
-
-    /// A database from before themes, step one (before the schema): the old
-    /// `channels` table is put aside, because the theme is now a part of its key,
-    /// and `runs` gets the `theme` column. The old rows have an empty theme until
-    /// `adopt_theme` (called by `adopt_old_channels` in `main.rs`) gives them one.
-    async fn prepare_themes(&self) -> Result<()> {
-        if self.has_table("channels").await? && !self.has_column("channels", "theme").await? {
-            tracing::info!("database from before themes: moving the channels");
-            self.conn
-                .execute("ALTER TABLE channels RENAME TO channels_old", ())
-                .await?;
-        }
-        if self.has_table("runs").await? && !self.has_column("runs", "theme").await? {
-            self.conn
-                .execute(
-                    "ALTER TABLE runs ADD COLUMN theme TEXT NOT NULL DEFAULT ''",
-                    (),
-                )
-                .await?;
-        }
-        Ok(())
-    }
-
-    /// Step two (after the schema): the rows go into the new `channels` table.
-    async fn copy_old_channels(&self) -> Result<()> {
-        if !self.has_table("channels_old").await? {
-            return Ok(());
-        }
-        let tx = self.conn.transaction().await?;
-        tx.execute(
-            "INSERT OR IGNORE INTO channels
-               (id, access_hash, username, title, enabled, last_msg_id, last_error, added_at)
-             SELECT id, access_hash, username, title, enabled, last_msg_id, last_error, added_at
-             FROM channels_old",
-            (),
-        )
-        .await?;
-        tx.execute("DROP TABLE channels_old", ()).await?;
-        tx.commit().await?;
-        Ok(())
-    }
-
-    async fn has_table(&self, table: &str) -> Result<bool> {
-        self.any_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
-            params![table],
-        )
-        .await
-    }
-
-    async fn has_column(&self, table: &str, column: &str) -> Result<bool> {
-        self.any_row(
-            "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = ?2",
-            params![table, column],
-        )
-        .await
-    }
-
-    /// Is the count from this `SELECT COUNT(*)` above zero.
-    async fn any_row<P: libsql::params::IntoParams>(&self, sql: &str, params: P) -> Result<bool> {
-        let mut rows = self.conn.query(sql, params).await?;
-        Ok(match rows.next().await? {
-            Some(row) => row.get::<i64>(0)? > 0,
-            None => false,
+        ensure_columns(&conn).await?;
+        copy_old_channels(&conn).await?;
+        Ok(Self {
+            conn: Mutex::new(conn),
         })
     }
 
@@ -292,19 +262,18 @@ impl Db {
     /// these are the rows from before themes; they go to the first theme of the
     /// config. Called on every start; it does nothing when no such rows are left.
     pub async fn adopt_theme(&self, from: &str, theme: &str) -> Result<()> {
-        let channels = self
-            .conn
+        let conn = self.lock().await;
+        let channels = conn
             .execute(
                 "UPDATE OR IGNORE channels SET theme = ?2 WHERE theme = ?1",
                 params![from, theme],
             )
             .await?;
-        self.conn
-            .execute(
-                "UPDATE runs SET theme = ?2 WHERE theme = ?1",
-                params![from, theme],
-            )
-            .await?;
+        conn.execute(
+            "UPDATE runs SET theme = ?2 WHERE theme = ?1",
+            params![from, theme],
+        )
+        .await?;
         if channels > 0 {
             tracing::info!(channels, %from, %theme, "channels moved to the theme");
         }
@@ -319,18 +288,17 @@ impl Db {
     /// topics of the last digest of each theme, so a dry run sees what a real run sees.
     pub async fn preview_copy(&self) -> Result<Self> {
         let copy = Self::open(":memory:").await?;
+        let conn = self.lock().await;
 
-        let mut rows = self
-            .conn
-            .query("SELECT key, value FROM settings", ())
-            .await?;
+        let mut settings = Vec::new();
+        let mut rows = conn.query("SELECT key, value FROM settings", ()).await?;
         while let Some(row) = rows.next().await? {
-            let (key, value): (String, String) = (row.get(0)?, row.get(1)?);
-            copy.set_setting(&key, &value).await?;
+            settings.push((row.get::<String>(0)?, row.get::<String>(1)?));
         }
+        drop(rows);
 
-        let mut rows = self
-            .conn
+        let mut topics = Vec::new();
+        let mut rows = conn
             .query(
                 "SELECT theme, digest_topics, started_at FROM runs r
                  WHERE status = 'ok' AND digest_topics IS NOT NULL
@@ -341,71 +309,94 @@ impl Db {
             )
             .await?;
         while let Some(row) = rows.next().await? {
-            let (theme, topics, started_at): (String, String, String) =
-                (row.get(0)?, row.get(1)?, row.get(2)?);
-            copy.conn
+            topics.push((
+                row.get::<String>(0)?,
+                row.get::<String>(1)?,
+                row.get::<String>(2)?,
+            ));
+        }
+        drop(rows);
+
+        let channels =
+            Self::query_channels(&conn, "1 = 1 ORDER BY theme, title", params![]).await?;
+        drop(conn);
+
+        for (key, value) in &settings {
+            copy.set_setting(key, value).await?;
+        }
+        let copy_conn = copy.lock().await;
+        for (theme, digest_topics, started_at) in topics {
+            copy_conn
                 .execute(
                     "INSERT INTO runs (started_at, status, trigger, digest_topics, theme)
                      VALUES (?1, 'ok', 'copy', ?2, ?3)",
-                    params![started_at, topics, theme],
+                    params![started_at, digest_topics, theme],
                 )
                 .await?;
         }
-
-        for channel in self.channels().await? {
-            copy.conn.execute(
+        for channel in channels {
+            copy_conn.execute(
                 "INSERT INTO channels (id, access_hash, username, title, enabled, last_msg_id, last_error, added_at, theme)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 params![channel.id, channel.access_hash, channel.username, channel.title,
                     channel.enabled as i64, channel.last_msg_id, channel.last_error, Utc::now().to_rfc3339(), channel.theme],
             ).await?;
         }
+        drop(copy_conn);
         Ok(copy)
     }
 
     /// All rows of all themes. A channel that is in two themes is here twice.
     pub async fn channels(&self) -> Result<Vec<Channel>> {
-        self.query_channels("1 = 1 ORDER BY theme, title", params![])
-            .await
+        let conn = self.lock().await;
+        Self::query_channels(&conn, "1 = 1 ORDER BY theme, title", params![]).await
     }
 
     /// The enabled rows of all themes: for work on the channels themselves (names),
     /// not on one theme.
     pub async fn enabled_channels(&self) -> Result<Vec<Channel>> {
-        self.query_channels("enabled = 1 ORDER BY theme, title", params![])
-            .await
+        let conn = self.lock().await;
+        Self::query_channels(&conn, "enabled = 1 ORDER BY theme, title", params![]).await
     }
 
     /// The channels one theme reads.
     pub async fn theme_channels(&self, theme: &str) -> Result<Vec<Channel>> {
-        self.query_channels("enabled = 1 AND theme = ?1 ORDER BY title", params![theme])
-            .await
+        let conn = self.lock().await;
+        Self::query_channels(
+            &conn,
+            "enabled = 1 AND theme = ?1 ORDER BY title",
+            params![theme],
+        )
+        .await
     }
 
     /// The channel itself, from any theme: the id and the access hash are the same
     /// in every row. For a cursor use `theme_channel`.
     pub async fn channel(&self, id: i64) -> Result<Option<Channel>> {
-        Ok(self
-            .query_channels("id = ?1 ORDER BY enabled DESC LIMIT 1", params![id])
-            .await?
-            .pop())
+        let conn = self.lock().await;
+        Ok(
+            Self::query_channels(&conn, "id = ?1 ORDER BY enabled DESC LIMIT 1", params![id])
+                .await?
+                .pop(),
+        )
     }
 
     /// The row of the channel in one theme.
     pub async fn theme_channel(&self, theme: &str, id: i64) -> Result<Option<Channel>> {
-        Ok(self
-            .query_channels("theme = ?1 AND id = ?2", params![theme, id])
-            .await?
-            .pop())
+        let conn = self.lock().await;
+        Ok(
+            Self::query_channels(&conn, "theme = ?1 AND id = ?2", params![theme, id])
+                .await?
+                .pop(),
+        )
     }
 
     async fn query_channels<P: libsql::params::IntoParams>(
-        &self,
+        conn: &Connection,
         filter: &str,
         params: P,
     ) -> Result<Vec<Channel>> {
-        let rows = self
-            .conn
+        let rows = conn
             .prepare(&format!(
                 "SELECT {CHANNEL_COLUMNS} FROM channels WHERE {filter}"
             ))
@@ -426,59 +417,59 @@ impl Db {
         username: Option<&str>,
         title: &str,
     ) -> Result<bool> {
-        let existing = self.theme_channel(theme, id).await?;
+        let conn = self.lock().await;
+        let existing = Self::query_channels(&conn, "theme = ?1 AND id = ?2", params![theme, id])
+            .await?
+            .pop();
 
         match existing {
             None => {
-                self.conn
-                    .execute(
-                        "INSERT INTO channels
+                conn.execute(
+                    "INSERT INTO channels
                            (id, access_hash, username, title, enabled, last_msg_id, added_at, theme)
                          VALUES (?1, ?2, ?3, ?4, 1, 0, ?5, ?6)",
-                        params![
-                            id,
-                            access_hash,
-                            username,
-                            title,
-                            Utc::now().to_rfc3339(),
-                            theme
-                        ],
-                    )
-                    .await?;
+                    params![
+                        id,
+                        access_hash,
+                        username,
+                        title,
+                        Utc::now().to_rfc3339(),
+                        theme
+                    ],
+                )
+                .await?;
                 Ok(true)
             }
             Some(channel) if !channel.enabled => {
-                self.conn
-                    .execute(
-                        "UPDATE channels
+                conn.execute(
+                    "UPDATE channels
                          SET access_hash = ?2, username = ?3, title = ?4,
                              enabled = 1, last_msg_id = 0, last_error = NULL
                          WHERE id = ?1 AND theme = ?5",
-                        params![id, access_hash, username, title, theme],
-                    )
-                    .await?;
+                    params![id, access_hash, username, title, theme],
+                )
+                .await?;
                 Ok(true)
             }
             Some(_) => {
-                self.conn
-                    .execute(
-                        "UPDATE channels SET access_hash = ?2, username = ?3, title = ?4
+                conn.execute(
+                    "UPDATE channels SET access_hash = ?2, username = ?3, title = ?4
                          WHERE id = ?1 AND theme = ?5",
-                        params![id, access_hash, username, title, theme],
-                    )
-                    .await?;
+                    params![id, access_hash, username, title, theme],
+                )
+                .await?;
                 Ok(false)
             }
         }
     }
 
     pub async fn set_channel_error(&self, theme: &str, id: i64, error: Option<&str>) -> Result<()> {
-        self.conn
-            .execute(
-                "UPDATE channels SET last_error = ?2 WHERE id = ?1 AND theme = ?3",
-                params![id, error, theme],
-            )
-            .await?;
+        let conn = self.lock().await;
+        conn.execute(
+            "UPDATE channels SET last_error = ?2 WHERE id = ?1 AND theme = ?3",
+            params![id, error, theme],
+        )
+        .await?;
         Ok(())
     }
 
@@ -493,19 +484,19 @@ impl Db {
         username: Option<&str>,
         title: &str,
     ) -> Result<()> {
-        self.conn
-            .execute(
-                "UPDATE channels SET username = ?2, title = ?3 WHERE id = ?1",
-                params![id, username, title],
-            )
-            .await?;
+        let conn = self.lock().await;
+        conn.execute(
+            "UPDATE channels SET username = ?2, title = ?3 WHERE id = ?1",
+            params![id, username, title],
+        )
+        .await?;
         Ok(())
     }
 
     /// `/rm`: disable a channel. It is not deleted: `/list` still shows it.
     pub async fn disable_channel(&self, theme: &str, id: i64) -> Result<bool> {
-        let affected = self
-            .conn
+        let conn = self.lock().await;
+        let affected = conn
             .execute(
                 "UPDATE channels SET enabled = 0 WHERE id = ?1 AND theme = ?2",
                 params![id, theme],
@@ -517,19 +508,19 @@ impl Db {
     /// Set the cursor exactly: `/add` puts it on the last message, so only posts that
     /// come after adding go into the digest.
     pub async fn set_cursor(&self, theme: &str, id: i64, last_msg_id: i32) -> Result<()> {
-        self.conn
-            .execute(
-                "UPDATE channels SET last_msg_id = ?2 WHERE id = ?1 AND theme = ?3",
-                params![id, last_msg_id, theme],
-            )
-            .await?;
+        let conn = self.lock().await;
+        conn.execute(
+            "UPDATE channels SET last_msg_id = ?2 WHERE id = ?1 AND theme = ?3",
+            params![id, last_msg_id, theme],
+        )
+        .await?;
         Ok(())
     }
 
     /// `/reset`: read the channel again from the `lookback_hours` window.
     pub async fn reset_channel(&self, theme: &str, id: i64) -> Result<bool> {
-        let affected = self
-            .conn
+        let conn = self.lock().await;
+        let affected = conn
             .execute(
                 "UPDATE channels SET last_msg_id = 0, last_error = NULL
                  WHERE id = ?1 AND theme = ?2",
@@ -562,20 +553,20 @@ impl Db {
 
     /// Short topics of a digest, saved with the run (see `last_digest_topics`).
     pub async fn set_digest_topics(&self, run_id: i64, topics: &[String]) -> Result<()> {
-        self.conn
-            .execute(
-                "UPDATE runs SET digest_topics = ?2 WHERE id = ?1",
-                params![run_id, serde_json::to_string(topics)?],
-            )
-            .await?;
+        let conn = self.lock().await;
+        conn.execute(
+            "UPDATE runs SET digest_topics = ?2 WHERE id = ?1",
+            params![run_id, serde_json::to_string(topics)?],
+        )
+        .await?;
         Ok(())
     }
 
     /// Topics of the last delivered digest of the theme: its next run must not
     /// repeat them.
     pub async fn last_digest_topics(&self, theme: &str) -> Result<Vec<String>> {
-        let mut rows = self
-            .conn
+        let conn = self.lock().await;
+        let mut rows = conn
             .query(
                 "SELECT digest_topics FROM runs
                  WHERE status = 'ok' AND digest_topics IS NOT NULL AND theme = ?1
@@ -591,8 +582,8 @@ impl Db {
     }
 
     pub async fn setting(&self, key: &str) -> Result<Option<String>> {
-        let mut rows = self
-            .conn
+        let conn = self.lock().await;
+        let mut rows = conn
             .prepare("SELECT value FROM settings WHERE key = ?1")
             .await?
             .query(params![key])
@@ -604,37 +595,39 @@ impl Db {
     }
 
     pub async fn delete_setting(&self, key: &str) -> Result<()> {
-        self.conn
-            .execute("DELETE FROM settings WHERE key = ?1", params![key])
+        let conn = self.lock().await;
+        conn.execute("DELETE FROM settings WHERE key = ?1", params![key])
             .await?;
         Ok(())
     }
 
     pub async fn set_setting(&self, key: &str, value: &str) -> Result<()> {
-        self.conn
-            .execute(
-                "INSERT INTO settings (key, value) VALUES (?1, ?2)
+        let conn = self.lock().await;
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES (?1, ?2)
                  ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                params![key, value],
-            )
-            .await?;
+            params![key, value],
+        )
+        .await?;
         Ok(())
     }
 
     pub async fn start_run(&self, trigger: &str, theme: &str) -> Result<i64> {
-        self.conn
-            .execute(
-                "INSERT INTO runs (started_at, status, trigger, theme) VALUES (?1, ?2, ?3, ?4)",
-                params![Utc::now().to_rfc3339(), STATUS_COLLECTING, trigger, theme],
-            )
-            .await?;
-        Ok(self.conn.last_insert_rowid())
+        let conn = self.lock().await;
+        conn.execute(
+            "INSERT INTO runs (started_at, status, trigger, theme) VALUES (?1, ?2, ?3, ?4)",
+            params![Utc::now().to_rfc3339(), STATUS_COLLECTING, trigger, theme],
+        )
+        .await?;
+        Ok(conn.last_insert_rowid())
     }
 
     /// The undelivered run of the theme (`summarized` or `publishing`): it blocks a
     /// new collection for this theme.
     pub async fn unfinished_theme_run(&self, theme: &str) -> Result<Option<Run>> {
-        self.query_run(
+        let conn = self.lock().await;
+        Self::query_run(
+            &conn,
             "SELECT * FROM runs WHERE status IN ('summarized','publishing') AND theme = ?1
              ORDER BY id LIMIT 1",
             params![theme],
@@ -644,7 +637,9 @@ impl Db {
 
     /// The oldest undelivered run of any theme.
     pub async fn unfinished_run(&self) -> Result<Option<Run>> {
-        self.query_run(
+        let conn = self.lock().await;
+        Self::query_run(
+            &conn,
             "SELECT * FROM runs WHERE status IN ('summarized','publishing') ORDER BY id LIMIT 1",
             params![],
         )
@@ -652,18 +647,25 @@ impl Db {
     }
 
     pub async fn run(&self, id: i64) -> Result<Option<Run>> {
-        self.query_run("SELECT * FROM runs WHERE id = ?1", params![id])
-            .await
+        let conn = self.lock().await;
+        Self::query_run(&conn, "SELECT * FROM runs WHERE id = ?1", params![id]).await
     }
 
     pub async fn last_run(&self) -> Result<Option<Run>> {
-        self.query_run("SELECT * FROM runs ORDER BY id DESC LIMIT 1", params![])
-            .await
+        let conn = self.lock().await;
+        Self::query_run(
+            &conn,
+            "SELECT * FROM runs ORDER BY id DESC LIMIT 1",
+            params![],
+        )
+        .await
     }
 
     /// The last run of the theme, with any status — for `/status`.
     pub async fn last_theme_run(&self, theme: &str) -> Result<Option<Run>> {
-        self.query_run(
+        let conn = self.lock().await;
+        Self::query_run(
+            &conn,
             "SELECT * FROM runs WHERE theme = ?1 ORDER BY id DESC LIMIT 1",
             params![theme],
         )
@@ -675,7 +677,9 @@ impl Db {
     /// would run the catch-up again.
     /// Per theme: one theme that finished must not hide the slot another theme missed.
     pub async fn last_finished_run(&self, theme: &str) -> Result<Option<Run>> {
-        self.query_run(
+        let conn = self.lock().await;
+        Self::query_run(
+            &conn,
             "SELECT * FROM runs WHERE status IN ('ok','empty') AND theme = ?1
              ORDER BY started_at DESC LIMIT 1",
             params![theme],
@@ -685,7 +689,9 @@ impl Db {
 
     /// The last published digest of the theme — for `/last`.
     pub async fn last_ok_run(&self, theme: &str) -> Result<Option<Run>> {
-        self.query_run(
+        let conn = self.lock().await;
+        Self::query_run(
+            &conn,
             "SELECT * FROM runs WHERE status = 'ok' AND theme = ?1 ORDER BY id DESC LIMIT 1",
             params![theme],
         )
@@ -693,11 +699,11 @@ impl Db {
     }
 
     async fn query_run<P: libsql::params::IntoParams>(
-        &self,
+        conn: &Connection,
         sql: &str,
         params: P,
     ) -> Result<Option<Run>> {
-        let mut rows = self.conn.prepare(sql).await?.query(params).await?;
+        let mut rows = conn.prepare(sql).await?.query(params).await?;
         let Some(row) = rows.next().await? else {
             return Ok(None);
         };
@@ -706,12 +712,12 @@ impl Db {
 
     /// A run stopped before the model answer: nothing is saved, the cursors are safe.
     pub async fn fail_run(&self, id: i64, error: &str) -> Result<()> {
-        self.conn
-            .execute(
-                "UPDATE runs SET status = ?2, error = ?3, finished_at = ?4 WHERE id = ?1",
-                params![id, STATUS_ERROR, error, Utc::now().to_rfc3339()],
-            )
-            .await?;
+        let conn = self.lock().await;
+        conn.execute(
+            "UPDATE runs SET status = ?2, error = ?3, finished_at = ?4 WHERE id = ?1",
+            params![id, STATUS_ERROR, error, Utc::now().to_rfc3339()],
+        )
+        .await?;
         Ok(())
     }
 
@@ -730,7 +736,8 @@ impl Db {
         dest: Destination,
         chunks: &[NewChunk],
     ) -> Result<()> {
-        let tx = self.conn.transaction().await?;
+        let conn = self.lock().await;
+        let tx = conn.transaction().await?;
         tx.execute(
             "UPDATE runs
              SET status = ?2, posts = ?3, topics = ?4, input_tokens = ?5, output_tokens = ?6,
@@ -778,57 +785,57 @@ impl Db {
         posts: usize,
         usage: (Option<u64>, Option<u64>),
     ) -> Result<()> {
-        self.conn
-            .execute(
-                "UPDATE runs SET cursors = ?2, posts = ?3, topics = 0,
+        let conn = self.lock().await;
+        conn.execute(
+            "UPDATE runs SET cursors = ?2, posts = ?3, topics = 0,
                  input_tokens = ?4, output_tokens = ?5 WHERE id = ?1",
-                params![
-                    run_id,
-                    serde_json::to_string(cursors)?,
-                    posts as i64,
-                    usage.0.map(|v| v as i64),
-                    usage.1.map(|v| v as i64)
-                ],
-            )
-            .await?;
+            params![
+                run_id,
+                serde_json::to_string(cursors)?,
+                posts as i64,
+                usage.0.map(|v| v as i64),
+                usage.1.map(|v| v as i64)
+            ],
+        )
+        .await?;
         Ok(())
     }
 
     pub async fn mark_publishing(&self, run_id: i64) -> Result<()> {
-        self.conn
-            .execute(
-                "UPDATE runs SET status = ?2 WHERE id = ?1",
-                params![run_id, STATUS_PUBLISHING],
-            )
-            .await?;
+        let conn = self.lock().await;
+        conn.execute(
+            "UPDATE runs SET status = ?2 WHERE id = ?1",
+            params![run_id, STATUS_PUBLISHING],
+        )
+        .await?;
         Ok(())
     }
 
     /// Time of the first send attempt: the age is counted from it, so it is
     /// written exactly once.
     pub async fn mark_first_send(&self, run_id: i64) -> Result<()> {
-        self.conn
-            .execute(
-                "UPDATE runs SET first_send_at = ?2 WHERE id = ?1 AND first_send_at IS NULL",
-                params![run_id, Utc::now().to_rfc3339()],
-            )
-            .await?;
+        let conn = self.lock().await;
+        conn.execute(
+            "UPDATE runs SET first_send_at = ?2 WHERE id = ?1 AND first_send_at IS NULL",
+            params![run_id, Utc::now().to_rfc3339()],
+        )
+        .await?;
         Ok(())
     }
 
     pub async fn mark_stale_notified(&self, run_id: i64) -> Result<()> {
-        self.conn
-            .execute(
-                "UPDATE runs SET stale_notified_at = ?2 WHERE id = ?1",
-                params![run_id, Utc::now().to_rfc3339()],
-            )
-            .await?;
+        let conn = self.lock().await;
+        conn.execute(
+            "UPDATE runs SET stale_notified_at = ?2 WHERE id = ?1",
+            params![run_id, Utc::now().to_rfc3339()],
+        )
+        .await?;
         Ok(())
     }
 
     pub async fn chunks(&self, run_id: i64) -> Result<Vec<Chunk>> {
-        let mut rows = self
-            .conn
+        let conn = self.lock().await;
+        let mut rows = conn
             .prepare(
                 "SELECT idx, html, random_id, delivered_at, sent_msg_id, photos
                  FROM run_chunks WHERE run_id = ?1 ORDER BY idx",
@@ -859,29 +866,29 @@ impl Db {
         idx: i64,
         sent_msg_id: Option<i32>,
     ) -> Result<()> {
-        self.conn
-            .execute(
-                "UPDATE run_chunks SET delivered_at = ?3, sent_msg_id = ?4
+        let conn = self.lock().await;
+        conn.execute(
+            "UPDATE run_chunks SET delivered_at = ?3, sent_msg_id = ?4
                  WHERE run_id = ?1 AND idx = ?2",
-                params![
-                    run_id,
-                    idx,
-                    Utc::now().to_rfc3339(),
-                    sent_msg_id.map(|v| v as i64)
-                ],
-            )
-            .await?;
+            params![
+                run_id,
+                idx,
+                Utc::now().to_rfc3339(),
+                sent_msg_id.map(|v| v as i64)
+            ],
+        )
+        .await?;
         Ok(())
     }
 
     /// End of the run: status and cursors in one transaction.
     pub async fn complete_run(&self, run_id: i64, status: &str) -> Result<()> {
-        let run = self
-            .run(run_id)
+        let conn = self.lock().await;
+        let run = Self::query_run(&conn, "SELECT * FROM runs WHERE id = ?1", params![run_id])
             .await?
             .with_context(|| format!("run #{run_id} disappeared from the database"))?;
 
-        let tx = self.conn.transaction().await?;
+        let tx = conn.transaction().await?;
         tx.execute(
             "UPDATE runs SET status = ?2, finished_at = ?3, error = NULL WHERE id = ?1",
             params![run_id, status, Utc::now().to_rfc3339()],
@@ -907,20 +914,20 @@ impl Db {
     /// `/abandon`: release the lock, do **not** apply the cursors — the delivered
     /// parts stay in the chat, the posts go into the next digest.
     pub async fn abandon_run(&self, run_id: i64) -> Result<()> {
-        self.conn
-            .execute(
-                "UPDATE runs SET status = ?2, error = 'abandoned', finished_at = ?3 WHERE id = ?1",
-                params![run_id, STATUS_ERROR, Utc::now().to_rfc3339()],
-            )
-            .await?;
+        let conn = self.lock().await;
+        conn.execute(
+            "UPDATE runs SET status = ?2, error = 'abandoned', finished_at = ?3 WHERE id = ?1",
+            params![run_id, STATUS_ERROR, Utc::now().to_rfc3339()],
+        )
+        .await?;
         Ok(())
     }
 
     /// Runs that stopped during collection (failed before the model answer): nothing is
     /// saved, they block nothing, but they must not stay in `collecting`.
     pub async fn close_interrupted_runs(&self) -> Result<usize> {
-        let affected = self
-            .conn
+        let conn = self.lock().await;
+        let affected = conn
             .execute(
                 "UPDATE runs SET status = ?1, error = 'interrupted', finished_at = ?2
                  WHERE status = ?3",
@@ -929,6 +936,99 @@ impl Db {
             .await?;
         Ok(affected as usize)
     }
+}
+
+/// A database from before themes, step one (before the schema): the old
+/// `channels` table is put aside, because the theme is now a part of its key.
+/// The old rows have an empty theme until `adopt_theme` gives them one.
+/// Other missing columns are added later by `ensure_columns`.
+async fn prepare_themes(conn: &Connection) -> Result<()> {
+    if has_table(conn, "channels").await? && !has_column(conn, "channels", "theme").await? {
+        tracing::info!("database from before themes: moving the channels");
+        conn.execute("ALTER TABLE channels RENAME TO channels_old", ())
+            .await?;
+    }
+    Ok(())
+}
+
+/// Add every column from `ADDED_COLUMNS` that an older database does not have.
+/// The same list is applied to `channels_old`, so the copy below can read it.
+async fn ensure_columns(conn: &Connection) -> Result<()> {
+    add_missing(conn, None).await?;
+    if has_table(conn, "channels_old").await? {
+        add_missing(conn, Some("channels_old")).await?;
+    }
+    Ok(())
+}
+
+async fn add_missing(conn: &Connection, only_table: Option<&str>) -> Result<()> {
+    for (table, column, def) in ADDED_COLUMNS {
+        let target = only_table.unwrap_or(table);
+        if only_table.is_some() && *table != "channels" {
+            continue;
+        }
+        if !has_table(conn, target).await? || has_column(conn, target, column).await? {
+            continue;
+        }
+        tracing::info!(table = target, column, "adding a missing column");
+        conn.execute(
+            &format!("ALTER TABLE {target} ADD COLUMN {column} {def}"),
+            (),
+        )
+        .await
+        .with_context(|| format!("could not add {target}.{column}"))?;
+    }
+    Ok(())
+}
+
+/// Step two (after the schema): the rows go into the new `channels` table.
+async fn copy_old_channels(conn: &Connection) -> Result<()> {
+    if !has_table(conn, "channels_old").await? {
+        return Ok(());
+    }
+    let tx = conn.transaction().await?;
+    tx.execute(
+        "INSERT OR IGNORE INTO channels
+           (id, access_hash, username, title, enabled, last_msg_id, last_error, added_at)
+         SELECT id, access_hash, username, title, enabled, last_msg_id, last_error, added_at
+         FROM channels_old",
+        (),
+    )
+    .await?;
+    tx.execute("DROP TABLE channels_old", ()).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+async fn has_table(conn: &Connection, table: &str) -> Result<bool> {
+    any_row(
+        conn,
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+        params![table],
+    )
+    .await
+}
+
+async fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    any_row(
+        conn,
+        "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = ?2",
+        params![table, column],
+    )
+    .await
+}
+
+/// Is the count from this `SELECT COUNT(*)` above zero.
+async fn any_row<P: libsql::params::IntoParams>(
+    conn: &Connection,
+    sql: &str,
+    params: P,
+) -> Result<bool> {
+    let mut rows = conn.query(sql, params).await?;
+    Ok(match rows.next().await? {
+        Some(row) => row.get::<i64>(0)? > 0,
+        None => false,
+    })
 }
 
 /// `-1001234567890` from a Telegram client and `1234567890` from MTProto are the
@@ -958,34 +1058,44 @@ async fn collect_channels(mut rows: libsql::Rows) -> Result<Vec<Channel>> {
     Ok(out)
 }
 
-/// `SELECT *` on `runs` — the column order is set by `SCHEMA`.
+/// `SELECT *` on `runs`. Columns are read by name, so an `ALTER TABLE` that
+/// appended a column does not shift the others.
 fn row_to_run(row: &libsql::Row) -> Result<Run> {
-    let cursors: Option<String> = row.get(10)?;
+    let at = |name| column_index(row, name);
+    let cursors: Option<String> = row.get(at("cursors")?)?;
     Ok(Run {
-        id: row.get(0)?,
-        started_at: parse_time(row.get::<Option<String>>(1)?)?.unwrap_or_else(Utc::now),
-        finished_at: parse_time(row.get::<Option<String>>(2)?)?,
-        status: row.get(3)?,
-        trigger: row.get(4)?,
-        posts: row.get(5)?,
-        topics: row.get(6)?,
-        input_tokens: row.get(7)?,
-        output_tokens: row.get(8)?,
-        error: row.get(9)?,
+        id: row.get(at("id")?)?,
+        started_at: parse_time(row.get(at("started_at")?)?)?.unwrap_or_else(Utc::now),
+        finished_at: parse_time(row.get(at("finished_at")?)?)?,
+        status: row.get(at("status")?)?,
+        trigger: row.get(at("trigger")?)?,
+        posts: row.get(at("posts")?)?,
+        topics: row.get(at("topics")?)?,
+        input_tokens: row.get(at("input_tokens")?)?,
+        output_tokens: row.get(at("output_tokens")?)?,
+        error: row.get(at("error")?)?,
         cursors: match cursors {
             Some(raw) => {
                 serde_json::from_str(&raw).context("run cursors in the database are damaged")?
             }
             None => BTreeMap::new(),
         },
-        first_send_at: parse_time(row.get::<Option<String>>(11)?)?,
-        dest_label: row.get(12)?,
-        dest_peer_id: row.get(13)?,
-        dest_access_hash: row.get(14)?,
-        stale_notified_at: parse_time(row.get::<Option<String>>(15)?)?,
-        // 16 is `digest_topics`, read only by `last_digest_topics`.
-        theme: row.get(17)?,
+        first_send_at: parse_time(row.get(at("first_send_at")?)?)?,
+        dest_label: row.get(at("dest_label")?)?,
+        dest_peer_id: row.get(at("dest_peer_id")?)?,
+        dest_access_hash: row.get(at("dest_access_hash")?)?,
+        stale_notified_at: parse_time(row.get(at("stale_notified_at")?)?)?,
+        theme: row.get(at("theme")?)?,
     })
+}
+
+fn column_index(row: &libsql::Row, name: &str) -> Result<i32> {
+    for i in 0..row.column_count() {
+        if row.column_name(i) == Some(name) {
+            return Ok(i);
+        }
+    }
+    bail!("runs row has no column {name}")
 }
 
 fn parse_time(raw: Option<String>) -> Result<Option<DateTime<Utc>>> {

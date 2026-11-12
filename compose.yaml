@@ -15,6 +15,8 @@ services:
 
     # A small VM runs other services too. If memory grows, only this container is
     # killed and restarted; the host does not hang.
+    # The image starts as root only long enough to give /data to user digest
+    # (uid 1000). The process then runs as that user.
     mem_limit: 128m
     # glibc makes many malloc arenas; in a long-running process they keep memory.
     environment:

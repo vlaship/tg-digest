@@ -1,12 +1,11 @@
 # tg-digest
 
 A Rust 2021 daemon. It reads a list of Telegram channels through MTProto, makes a
-summary of the posts with the Claude Messages API, and posts a digest back to
+summary of the posts with the model from the config, and posts a digest back to
 Telegram on a cron schedule. Normally it runs in a container with `serve`. You
 control it with commands to a Telegram bot, and the bot sends you the digests.
 
-The full design and the order of work are in [docs/PLAN.md](docs/PLAN.md). How to
-use it is in [README.md](README.md).
+How it works and how to use it are in [README.md](README.md).
 
 ## Project structure
 
@@ -170,7 +169,10 @@ decides (`/resume`).
 (nothing is posted), then the daemon with `destination = "bot"` and `/run` to
 the bot. Posting to a real channel is the last step. The CLI has no run
 that posts: only the daemon posts (cron or `/run`). Otherwise two processes on one
-database would post two digests.
+database would post two digests. Do not run `preview` or `run --dry-run` while
+the daemon holds `tg.session`. A second connection gets `AUTH_KEY_DUPLICATED`
+and the login is dead until `login` is run again. Those commands refuse to connect
+when the daemon is already using the session.
 
 ## Build problems we already hit
 
@@ -221,9 +223,9 @@ CI has two workflows:
 - `.github/workflows/docker.yml` — a push to `main` builds and
   publishes one image to `ghcr.io/vlaship/tg-digest`, tagged `latest` and with the
   UTC build time (`20261103-041200`). The same time is built into the binary as the
-  version (`/status`). There are no `v*` tags. On branches and PRs it runs
-  only by hand (Actions → docker → Run workflow); a manual run only builds, unless
-  you tick "publish".
+  version (`/status`). There are no `v*` tags. Pull requests do not run this
+  workflow. On any other branch it runs only by hand (Actions → docker → Run
+  workflow); a manual run only builds, unless you tick "publish".
 
 CI costs money: push only when the owner asks, and test locally first
 (`docker compose up -d --build`).
