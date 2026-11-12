@@ -352,7 +352,6 @@ async fn prepare(cfg: Arc<Config>) -> Result<Arc<Runner>> {
 }
 
 async fn serve(cfg: Arc<Config>) -> Result<()> {
-    let scheduler = Scheduler::new(&cfg.schedule.cron, &cfg.schedule.timezone)?;
     let db = Arc::new(Db::open(&cfg.db_file).await?);
     adopt_old_channels(&db, &cfg).await?;
     // A theme that was removed from the config leaves its channels behind: nothing
@@ -418,9 +417,19 @@ async fn serve(cfg: Arc<Config>) -> Result<()> {
         bot_updates,
         cancel.clone(),
     ));
-    let schedule = Box::pin(schedule_loop(runner, scheduler, cancel));
+    let schedule = Box::pin(schedule_loop(runner, cancel));
 
-    tracing::info!(version = %version(), cron = %cfg.schedule.cron, tz = %cfg.schedule.timezone, "daemon started");
+    let crons: Vec<String> = cfg
+        .themes()
+        .into_iter()
+        .map(|t| format!("{}={}", t.tag, t.cron))
+        .collect();
+    tracing::info!(
+        version = %version(),
+        themes = %crons.join(", "),
+        tz = %cfg.schedule.timezone,
+        "daemon started"
+    );
 
     // Normal shutdown must wait for both loops: either may own a publication.
     finish_service_loops(schedule, listener).await
@@ -434,13 +443,28 @@ async fn finish_service_loops(
     Ok(())
 }
 
-async fn schedule_loop(runner: Arc<Runner>, scheduler: Scheduler, cancel: Cancel) -> Result<()> {
+/// One theme and the cron that drives it.
+fn theme_schedulers(cfg: &Config) -> Result<Vec<(Theme, Scheduler)>> {
+    let tz = &cfg.schedule.timezone;
+    cfg.themes()
+        .into_iter()
+        .map(|theme| {
+            let scheduler = Scheduler::new(&theme.cron, tz)
+                .with_context(|| format!("theme {:?}", theme.tag))?;
+            Ok((theme, scheduler))
+        })
+        .collect()
+}
+
+async fn schedule_loop(runner: Arc<Runner>, cancel: Cancel) -> Result<()> {
+    let schedules = theme_schedulers(&runner.cfg)?;
+
     // First deliver what is undelivered. This does not stop the start checks below:
     // the other themes may still have to run.
     let mut recovered = Vec::new();
-    for theme in runner.cfg.themes() {
+    for (theme, _) in &schedules {
         if runner.db.unfinished_theme_run(&theme.tag).await?.is_some() {
-            recovered.push(theme.tag);
+            recovered.push(theme.tag.clone());
         }
     }
     if !recovered.is_empty() {
@@ -455,13 +479,13 @@ async fn schedule_loop(runner: Arc<Runner>, scheduler: Scheduler, cancel: Cancel
     // pass, so the names are refreshed once and the `/run` tap comes once.
     let mut start = Vec::new();
     let mut trigger = TRIGGER_CATCH_UP;
-    for theme in runner.cfg.themes() {
+    for (theme, scheduler) in &schedules {
         if recovered.contains(&theme.tag) {
             continue;
         }
         if runner.cfg.schedule.run_on_start {
             trigger = TRIGGER_CRON;
-            start.push(theme);
+            start.push(theme.clone());
         } else if runner.cfg.schedule.catch_up {
             // Each theme counts its own last finished run (a recovered run counts too).
             let last_finished = runner
@@ -471,7 +495,7 @@ async fn schedule_loop(runner: Arc<Runner>, scheduler: Scheduler, cancel: Cancel
                 .map(|run| run.started_at);
             if scheduler.missed_since(last_finished, Utc::now())? {
                 tracing::info!(theme = %theme.tag, ?last_finished, "missed slot, catching up");
-                start.push(theme);
+                start.push(theme.clone());
             }
         }
     }
@@ -483,25 +507,66 @@ async fn schedule_loop(runner: Arc<Runner>, scheduler: Scheduler, cancel: Cancel
         finish(&runner, trigger, result).await?;
     }
 
+    // After the start checks, every theme waits for its *next* slot. `last_tick`
+    // is the time we last counted as "handled" for that theme's cron.
+    let mut last_tick: std::collections::HashMap<String, chrono::DateTime<Utc>> = schedules
+        .iter()
+        .map(|(theme, _)| (theme.tag.clone(), Utc::now()))
+        .collect();
+
     loop {
-        let next = scheduler.next_after(Utc::now())?;
+        let now = Utc::now();
+        let mut due = Vec::new();
+        let mut next_wake: Option<chrono::DateTime<Utc>> = None;
+
+        for (theme, scheduler) in &schedules {
+            let last = last_tick.get(&theme.tag).copied().unwrap_or(now);
+            let next = scheduler.next_after(last)?;
+            if next <= now {
+                due.push(theme.clone());
+            } else {
+                next_wake = Some(match next_wake {
+                    Some(wake) => wake.min(next),
+                    None => next,
+                });
+            }
+        }
+
+        if !due.is_empty() {
+            let tags: Vec<&str> = due.iter().map(|t| t.tag.as_str()).collect();
+            tracing::info!(themes = ?tags, "cron slot");
+            fire_themes(&runner, TRIGGER_CRON, &due).await?;
+            let done_at = Utc::now();
+            for theme in &due {
+                last_tick.insert(theme.tag.clone(), done_at);
+            }
+            continue;
+        }
+
+        let Some(next) = next_wake else {
+            bail!("no theme has a next cron slot");
+        };
         tracing::info!(next = %next, "waiting for the next run");
 
         if wait_until(next, &cancel).await == Wake::Interrupted {
             tracing::info!("shutdown signal received, exiting");
             return Ok(());
         }
-
-        fire(&runner, TRIGGER_CRON).await?;
     }
 }
 
-/// One scheduled run. An error in one run must not break the daemon: we tell the
-/// owner and wait for the next slot. Only fatal errors go out — for example, a
-/// revoked session. Otherwise Docker restarts the daemon, `run_on_start` or
-/// `catch_up` starts the same run again, and every restart pays for the model.
-async fn fire(runner: &Runner, trigger: &str) -> Result<()> {
-    finish(runner, trigger, runner.trigger(trigger, None).await).await
+/// One scheduled run for the themes that are due. An error in one run must not
+/// break the daemon: we tell the owner and wait for the next slot. Only fatal
+/// errors go out — for example, a revoked session. Otherwise Docker restarts the
+/// daemon, `run_on_start` or `catch_up` starts the same run again, and every
+/// restart pays for the model.
+async fn fire_themes(runner: &Runner, trigger: &str, themes: &[Theme]) -> Result<()> {
+    finish(
+        runner,
+        trigger,
+        runner.trigger_themes(trigger, themes).await,
+    )
+    .await
 }
 
 async fn finish(runner: &Runner, trigger: &str, result: Result<run::Outcomes>) -> Result<()> {
