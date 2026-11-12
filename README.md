@@ -11,8 +11,9 @@ and posts the digest back to Telegram on a schedule.
 - **Bot.** You talk to your own Telegram bot: you write commands to it, and it
   sends you the replies, the digests and the notifications. It can also post the
   digest to your channel. Only your account may give it commands.
-- **Schedule.** A cron expression per theme (or a shared default in
-  `[schedule]`). You do not need a separate OS scheduler.
+- **Schedule.** Each theme has its own cron in the config. Time zone and
+  catch-up flags live under `[schedule]`. You do not need a separate OS
+  scheduler.
 - **Channel list.** Stored in the database. You add and remove channels with
   commands to the bot (`/add`, `/rm`), and control the service there too
   (`/run`, `/list`, `/status`).
@@ -161,17 +162,16 @@ every run, so a renamed channel keeps correct links.
 
 ### Themes
 
-A theme is its own digest: its own channels, system prompt, title and, if you
-want, its own cron and destination. The config needs at least one theme. You
-describe themes as `[[themes]]` blocks (see `config.example.toml`: `world` for
-general news and `dev` for programming channels, which also drops adverts for
-courses):
+A theme is its own digest: its own channels, system prompt, title, cron and, if
+you want, its own destination. The config needs at least one theme. You describe
+themes as `[[themes]]` blocks (see `config.example.toml`: `world` for general
+news and `dev` for programming channels, which also drops adverts for courses):
 
 ```toml
 [[themes]]
 tag         = "dev"
 title       = "💻 Digest DEV {{date}} {{time}}"
-cron        = "0 18 * * *"        # optional, else [schedule].cron
+cron        = "0 18 * * *"        # needed: this theme's schedule
 destination = "@my_dev_channel"   # optional, else [telegram].destination
 system      = """..."""
 ```

@@ -82,8 +82,7 @@ Commands:
 /help — this help
 
 A theme is its tag from the config, one word. A channel can be in several themes:
-each theme reads it on its own. Each theme can have its own cron in [[themes]];
-without it the theme uses [schedule].cron.";
+each theme reads it on its own. Each theme has its own cron in [[themes]].";
 
 /// Run the updates loop until the shutdown signal comes.
 pub async fn listen(

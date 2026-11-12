@@ -426,7 +426,6 @@ async fn serve(cfg: Arc<Config>) -> Result<()> {
         .collect();
     tracing::info!(
         version = %version(),
-        cron = %cfg.schedule.cron,
         themes = %crons.join(", "),
         tz = %cfg.schedule.timezone,
         "daemon started"
@@ -444,7 +443,7 @@ async fn finish_service_loops(
     Ok(())
 }
 
-/// One theme and the cron that drives it (its own, or `[schedule].cron`).
+/// One theme and the cron that drives it.
 fn theme_schedulers(cfg: &Config) -> Result<Vec<(Theme, Scheduler)>> {
     let tz = &cfg.schedule.timezone;
     cfg.themes()
