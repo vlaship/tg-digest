@@ -77,10 +77,14 @@ impl Drop for SessionHold {
     }
 }
 
-/// The daemon marks the personal-account session as in use, and keeps the mark
-/// fresh until it exits. `preview` and `run --dry-run` refuse to connect while
-/// the mark is fresh: Telegram allows one connection for that key, and a second
-/// one comes back as `AUTH_KEY_DUPLICATED`.
+/// Marks the personal-account session as in use and keeps the stamp fresh until
+/// drop. `login`, `preview` and `run --dry-run` take the same hold for the whole
+/// command. A second process must refuse: Telegram allows one connection for that
+/// key, and another one comes back as `AUTH_KEY_DUPLICATED`.
+///
+/// Across host ↔ Docker the OS file locks (LockFileEx vs flock) are not shared.
+/// Only the stamp mtime crosses the volume, so do not truncate before the lock
+/// check — that would refresh a foreign stamp and hide a live holder.
 pub fn hold_session(session_file: &str) -> Result<SessionHold> {
     let path = session_lock_path(session_file);
     if let Some(parent) = path.parent() {
@@ -89,9 +93,17 @@ pub fn hold_session(session_file: &str) -> Result<SessionHold> {
                 .with_context(|| format!("could not create {}", parent.display()))?;
         }
     }
+    // Host ↔ container: flock and LockFileEx do not see each other. A fresh
+    // stamp means the other side still holds the session.
+    if lock_is_fresh(&path) {
+        return Err(session_busy(session_file));
+    }
+    // truncate(false): write_stamp clears the file after we own the lock. A
+    // truncate(true) here would refresh mtime before the check and hide a
+    // holder on the other side of a host ↔ Docker volume.
     let mut file = OpenOptions::new()
         .create(true)
-        .truncate(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .open(&path)
@@ -128,22 +140,6 @@ pub fn hold_session(session_file: &str) -> Result<SessionHold> {
     })
 }
 
-/// `preview` and `run --dry-run` call this before they open `tg.session`.
-pub fn ensure_session_free(session_file: &str) -> Result<()> {
-    let path = session_lock_path(session_file);
-    if lock_is_fresh(&path) {
-        return Err(session_busy(session_file));
-    }
-    // Same machine: the daemon holds an exclusive lock, even when the file
-    // time has not been refreshed yet.
-    if let Ok(file) = OpenOptions::new().read(true).open(&path) {
-        if try_lock_file(&file)? {
-            return Err(session_busy(session_file));
-        }
-    }
-    Ok(())
-}
-
 fn session_lock_path(session_file: &str) -> PathBuf {
     PathBuf::from(format!("{session_file}.lock"))
 }
@@ -151,7 +147,7 @@ fn session_lock_path(session_file: &str) -> PathBuf {
 fn session_busy(session_file: &str) -> anyhow::Error {
     anyhow!(
         "the daemon is already using this Telegram session ({session_file}). \
-         Stop it before preview or run --dry-run. A second connection gets \
+         Stop it before login, preview or run --dry-run. A second connection gets \
          AUTH_KEY_DUPLICATED and the login is dead until you run login again. \
          After a kill, wait two minutes or delete {session_file}.lock"
     )

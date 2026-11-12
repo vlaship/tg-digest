@@ -85,14 +85,26 @@ pub async fn download(
         let mut data = Vec::new();
         let mut too_big = false;
         let mut stream = client.iter_download(&photo);
-        while let Some(chunk) = stream.next().await.context("could not download a photo")? {
-            if data.len().saturating_add(chunk.len()) > MAX_PHOTO_BYTES {
-                too_big = true;
-                break;
+        let download_err = loop {
+            match stream.next().await {
+                Ok(Some(chunk)) => {
+                    if data.len().saturating_add(chunk.len()) > MAX_PHOTO_BYTES {
+                        too_big = true;
+                        break None;
+                    }
+                    data.extend_from_slice(&chunk);
+                }
+                Ok(None) => break None,
+                Err(e) => break Some(e),
             }
-            data.extend_from_slice(&chunk);
-        }
+        };
         drop(stream);
+        if let Some(e) = download_err {
+            // Earlier photos of this part are already on disk. Drop them so a
+            // retry does not send a short album.
+            remove_part(dir, run_id, idx, saved.count);
+            return Err(e).context("could not download a photo");
+        }
 
         if too_big || data.is_empty() {
             tracing::warn!(
@@ -126,14 +138,22 @@ pub async fn download(
     Ok(saved)
 }
 
-/// Read the photos of one part back, in album order.
-pub fn load(dir: &Path, run_id: i64, idx: usize, count: usize) -> Result<Vec<Vec<u8>>> {
-    (0..count)
-        .map(|pos| {
-            let path = file(dir, run_id, idx, pos);
-            std::fs::read(&path).with_context(|| format!("could not read {}", path.display()))
-        })
-        .collect()
+/// True when every photo file of this part is on disk. Used before send so a
+/// missing folder falls back to text without loading the album into memory.
+pub fn files_ready(dir: &Path, run_id: i64, idx: usize, count: usize) -> Result<()> {
+    for pos in 0..count {
+        let path = file(dir, run_id, idx, pos);
+        if !path.is_file() {
+            anyhow::bail!("photo file missing: {}", path.display());
+        }
+    }
+    Ok(())
+}
+
+/// Read one photo of a part. Call once per upload so the album is not held in RAM.
+pub fn read(dir: &Path, run_id: i64, idx: usize, pos: usize) -> Result<Vec<u8>> {
+    let path = file(dir, run_id, idx, pos);
+    std::fs::read(&path).with_context(|| format!("could not read {}", path.display()))
 }
 
 /// The run is finished: its photos are not needed any more.

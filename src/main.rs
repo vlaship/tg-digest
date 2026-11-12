@@ -112,6 +112,8 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Command::Login { qr } => {
+            // Same hold as serve: a second connection kills the login.
+            let _session_hold = telegram::client::hold_session(&cfg.telegram.app.session_file)?;
             let session = telegram::client::connect(&cfg).await?;
             if qr {
                 telegram::client::login_qr(&session, &cfg).await
@@ -128,7 +130,7 @@ async fn main() -> Result<()> {
                      so each theme is written to out/posts-<tag>.md"
                 );
             }
-            let runner = prepare(cfg.clone()).await?;
+            let (runner, _session_hold) = prepare(cfg.clone()).await?;
             runner.refresh_channels().await?;
             for theme in &themes {
                 preview(&runner, theme, dump, out.clone())
@@ -145,7 +147,7 @@ async fn main() -> Result<()> {
                 );
             }
             let themes = chosen_themes(&cfg, theme.as_deref())?;
-            let runner = prepare(cfg.clone()).await?;
+            let (runner, _session_hold) = prepare(cfg.clone()).await?;
             runner.refresh_channels().await?;
             for theme in &themes {
                 dry_run_once(&runner, theme, themes.len() > 1)
@@ -335,23 +337,22 @@ async fn adopt_old_channels(db: &Db, cfg: &Config) -> Result<()> {
 
 /// Common setup for the debug commands: database, client, login check.
 /// They do not need a shutdown token — the process runs once.
-async fn prepare(cfg: Arc<Config>) -> Result<Arc<Runner>> {
-    // The daemon already holds this session. Opening it again kills the login
-    // (AUTH_KEY_DUPLICATED). Refuse before any other work.
-    telegram::client::ensure_session_free(&cfg.telegram.app.session_file)?;
+/// The session hold must live until the command finishes: without it another
+/// process could open `tg.session` while we are still connected.
+async fn prepare(cfg: Arc<Config>) -> Result<(Arc<Runner>, telegram::client::SessionHold)> {
+    // Take the lock for the whole command before connect. A second connection
+    // kills the login (AUTH_KEY_DUPLICATED).
+    let session_hold = telegram::client::hold_session(&cfg.telegram.app.session_file)?;
     let db = Arc::new(Db::open(&cfg.db_file).await?.preview_copy().await?);
     adopt_old_channels(&db, &cfg).await?;
     let session = telegram::client::connect(&cfg).await?;
     telegram::client::ensure_authorized(&session.client).await?;
 
     // No bot: the debug commands never send anything.
-    Ok(Arc::new(Runner::new(
-        cfg,
-        db,
-        session.client,
-        None,
-        Cancel::never(),
-    )))
+    Ok((
+        Arc::new(Runner::new(cfg, db, session.client, None, Cancel::never())),
+        session_hold,
+    ))
 }
 
 async fn serve(cfg: Arc<Config>) -> Result<()> {

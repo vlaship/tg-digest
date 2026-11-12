@@ -131,18 +131,27 @@ pub fn fits_caption(html: &str) -> bool {
 
 /// One attempt to send a part with photos: one photo, or an album with the caption
 /// on the first photo. Album items get `random_id + position`, the same on every retry.
+/// Each file is read just before upload so the whole album is not held in memory.
+#[allow(clippy::too_many_arguments)]
 pub async fn send_photos(
     client: &Client,
     peer: PeerRef,
     html: &str,
-    photos: &[Vec<u8>],
+    photos_dir: &Path,
+    run_id: i64,
+    idx: usize,
+    count: usize,
     random_id: i64,
 ) -> SendOutcome {
     let (message, entities) = parse_html_message(html);
     let entities = (!entities.is_empty()).then_some(entities);
 
-    let mut uploaded = Vec::with_capacity(photos.len());
-    for (pos, data) in photos.iter().enumerate() {
+    let mut uploaded = Vec::with_capacity(count);
+    for pos in 0..count {
+        let data = match photos::read(photos_dir, run_id, idx, pos) {
+            Ok(data) => data,
+            Err(e) => return SendOutcome::Unclear(format!("photo read failed: {e:#}")),
+        };
         let mut stream = std::io::Cursor::new(data.as_slice());
         match client
             .upload_stream(&mut stream, data.len(), format!("{pos}.jpg"))
@@ -160,6 +169,7 @@ pub async fn send_photos(
             )),
             Err(e) => return SendOutcome::Unclear(format!("photo upload failed: {e}")),
         }
+        drop(data);
     }
 
     if uploaded.len() == 1 {
@@ -301,6 +311,7 @@ pub async fn deliver_pending(
         client,
         db,
         run,
+        photos_dir,
         cancel,
         retry_window,
         first_send_at: run.first_send_at,
@@ -321,20 +332,24 @@ pub async fn deliver_pending(
         }
 
         // Photos that are lost (the folder was deleted by hand) do not hold the digest:
-        // the text goes without them, and a part with only photos is skipped.
-        let photos = match photos::load(photos_dir, run.id, chunk.idx as usize, chunk.photos) {
-            Ok(photos) => photos,
-            Err(e) => {
-                tracing::warn!(run = run.id, part = chunk.idx + 1, error = %format!("{e:#}"), "photos not found, sending the text only");
-                Vec::new()
-            }
+        // the text goes without them, and a part with only photos is skipped. Check
+        // existence only — send_photos reads each file when it uploads.
+        let photo_count = if chunk.photos == 0 {
+            0
+        } else if let Err(e) =
+            photos::files_ready(photos_dir, run.id, chunk.idx as usize, chunk.photos)
+        {
+            tracing::warn!(run = run.id, part = chunk.idx + 1, error = %format!("{e:#}"), "photos not found, sending the text only");
+            0
+        } else {
+            chunk.photos
         };
-        if photos.is_empty() && chunk.html.is_empty() {
+        if photo_count == 0 && chunk.html.is_empty() {
             db.mark_delivered(run.id, chunk.idx, None).await?;
             continue;
         }
 
-        let sent_msg_id = match send.part(peer, chunk, &photos, chunk.random_id).await? {
+        let sent_msg_id = match send.part(peer, chunk, photo_count, chunk.random_id).await? {
             Attempt::Delivered(id) => id,
             Attempt::Stop(reason) => return Ok(Some(reason)),
         };
@@ -377,6 +392,7 @@ struct Sender<'a> {
     client: &'a Client,
     db: &'a Db,
     run: &'a Run,
+    photos_dir: &'a Path,
     cancel: &'a Cancel,
     retry_window: Option<ChronoDuration>,
     first_send_at: Option<DateTime<Utc>>,
@@ -390,7 +406,7 @@ impl Sender<'_> {
         &mut self,
         peer: PeerRef,
         chunk: &Chunk,
-        photos: &[Vec<u8>],
+        photo_count: usize,
         random_id: i64,
     ) -> Result<Attempt> {
         let (run, total) = (self.run, self.total);
@@ -411,10 +427,20 @@ impl Sender<'_> {
             self.db.mark_first_send(run.id).await?;
             self.first_send_at.get_or_insert(Utc::now());
             attempt += 1;
-            let sent = if photos.is_empty() {
+            let sent = if photo_count == 0 {
                 send_chunk(self.client, peer, &chunk.html, random_id).await
             } else {
-                send_photos(self.client, peer, &chunk.html, photos, random_id).await
+                send_photos(
+                    self.client,
+                    peer,
+                    &chunk.html,
+                    self.photos_dir,
+                    run.id,
+                    chunk.idx as usize,
+                    photo_count,
+                    random_id,
+                )
+                .await
             };
             match sent {
                 SendOutcome::Delivered { sent_msg_id } => {

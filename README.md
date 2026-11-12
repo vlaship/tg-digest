@@ -116,8 +116,8 @@ cargo run -- --config config.toml serve          # the daemon: schedule + comman
 
 The CLI has no run that posts. Only the daemon posts: on the schedule or after
 the `/run` command. Otherwise two processes on one database could post two
-digests. Do not run `preview` or `run --dry-run` while the daemon is up. They
-would open the same `tg.session`. Telegram allows one connection for that key.
+digests. Do not run `login`, `preview` or `run --dry-run` while the daemon is up.
+They would open the same `tg.session`. Telegram allows one connection for that key.
 A second one comes back as `AUTH_KEY_DUPLICATED` and the login is dead until
 you run `login` again. Those commands refuse to connect when the daemon already
 holds the session. `preview` and `run --dry-run` use a copy of the database in

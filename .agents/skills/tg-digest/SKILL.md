@@ -19,7 +19,7 @@ journal live in the database (`digest.db`), not in the config and not in
 
 **Only the daemon posts** — on cron or after the `/run` command. The CLI has no
 run that posts, on purpose: two processes on one database would post two digests.
-Do not run `preview` or `run --dry-run` while the daemon is up. They open
+Do not run `login`, `preview` or `run --dry-run` while the daemon is up. They open
 `tg.session`, and a second connection comes back as `AUTH_KEY_DUPLICATED`. The
 login is then dead until `login` is run again. Those commands refuse to connect
 when the daemon already holds the session.
@@ -175,7 +175,7 @@ they target the old API.
 
 **`AUTH_KEY_DUPLICATED`** — a second process opened `tg.session` while the daemon
 was using it. The login is dead. Stop every copy of the service, then run `login`
-again. `preview` and `run --dry-run` refuse while the daemon holds the session.
+again. `login`, `preview` and `run --dry-run` refuse while the daemon holds the session.
 
 **`not logged in to Telegram`** — run `login`.
 

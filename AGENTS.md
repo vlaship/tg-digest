@@ -169,8 +169,8 @@ decides (`/resume`).
 (nothing is posted), then the daemon with `destination = "bot"` and `/run` to
 the bot. Posting to a real channel is the last step. The CLI has no run
 that posts: only the daemon posts (cron or `/run`). Otherwise two processes on one
-database would post two digests. Do not run `preview` or `run --dry-run` while
-the daemon holds `tg.session`. A second connection gets `AUTH_KEY_DUPLICATED`
+database would post two digests. Do not run `login`, `preview` or `run --dry-run`
+while the daemon holds `tg.session`. A second connection gets `AUTH_KEY_DUPLICATED`
 and the login is dead until `login` is run again. Those commands refuse to connect
 when the daemon is already using the session.
 
