@@ -1,5 +1,5 @@
-//! tg-digest — reads Telegram channels, summarizes them with Claude and posts
-//! a digest back to Telegram on the cron schedule from the config.
+//! tg-digest — reads Telegram channels, summarizes them with the model from the
+//! config and posts a digest back to Telegram on each theme's cron schedule.
 //!
 //! The normal mode is `serve` in a container: the scheduler and the bot that listens
 //! for commands live in one process, channels and cursors in the
@@ -53,7 +53,7 @@ pub fn version() -> String {
 }
 
 #[derive(Parser)]
-#[command(name = "tg-digest", about = "Digest of Telegram channels with Claude")]
+#[command(name = "tg-digest", about = "Digest of Telegram channels")]
 struct Cli {
     /// Path to the config
     #[arg(long, short, default_value = "/data/config.toml", global = true)]
@@ -112,6 +112,9 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Command::Login { qr } => {
+            // Same hold as serve: a second connection kills the login.
+            let _session_hold =
+                telegram::client::hold_session(&cfg.telegram.app.session_file).await?;
             let session = telegram::client::connect(&cfg).await?;
             if qr {
                 telegram::client::login_qr(&session, &cfg).await
@@ -128,7 +131,7 @@ async fn main() -> Result<()> {
                      so each theme is written to out/posts-<tag>.md"
                 );
             }
-            let runner = prepare(cfg.clone()).await?;
+            let (runner, _session_hold) = prepare(cfg.clone()).await?;
             runner.refresh_channels().await?;
             for theme in &themes {
                 preview(&runner, theme, dump, out.clone())
@@ -145,7 +148,7 @@ async fn main() -> Result<()> {
                 );
             }
             let themes = chosen_themes(&cfg, theme.as_deref())?;
-            let runner = prepare(cfg.clone()).await?;
+            let (runner, _session_hold) = prepare(cfg.clone()).await?;
             runner.refresh_channels().await?;
             for theme in &themes {
                 dry_run_once(&runner, theme, themes.len() > 1)
@@ -335,20 +338,22 @@ async fn adopt_old_channels(db: &Db, cfg: &Config) -> Result<()> {
 
 /// Common setup for the debug commands: database, client, login check.
 /// They do not need a shutdown token — the process runs once.
-async fn prepare(cfg: Arc<Config>) -> Result<Arc<Runner>> {
+/// The session hold must live until the command finishes: without it another
+/// process could open `tg.session` while we are still connected.
+async fn prepare(cfg: Arc<Config>) -> Result<(Arc<Runner>, telegram::client::SessionHold)> {
+    // Take the lock for the whole command before connect. A second connection
+    // kills the login (AUTH_KEY_DUPLICATED).
+    let session_hold = telegram::client::hold_session(&cfg.telegram.app.session_file).await?;
     let db = Arc::new(Db::open(&cfg.db_file).await?.preview_copy().await?);
     adopt_old_channels(&db, &cfg).await?;
     let session = telegram::client::connect(&cfg).await?;
     telegram::client::ensure_authorized(&session.client).await?;
 
     // No bot: the debug commands never send anything.
-    Ok(Arc::new(Runner::new(
-        cfg,
-        db,
-        session.client,
-        None,
-        Cancel::never(),
-    )))
+    Ok((
+        Arc::new(Runner::new(cfg, db, session.client, None, Cancel::never())),
+        session_hold,
+    ))
 }
 
 async fn serve(cfg: Arc<Config>) -> Result<()> {
@@ -373,6 +378,10 @@ async fn serve(cfg: Arc<Config>) -> Result<()> {
             "runs that stopped during collection are closed"
         );
     }
+
+    // Mark the session in use before connect, so preview and run --dry-run
+    // refuse instead of opening a second connection.
+    let _session_hold = telegram::client::hold_session(&cfg.telegram.app.session_file).await?;
 
     // The personal account reads the channels; it is also the owner of the bot.
     let telegram::client::Session {

@@ -136,7 +136,7 @@ pub struct Telegram {
     #[serde(default = "default_true")]
     pub mark_read: bool,
     /// For how many hours the daemon itself retries an undelivered digest. After this
-    /// window the retry is manual only (`/resume`), see docs/PLAN.md 9.3.
+    /// window the retry is manual only (`/resume`).
     #[serde(default = "default_publish_retry_window_hours")]
     pub publish_retry_window_hours: i64,
 }

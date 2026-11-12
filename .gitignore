@@ -13,6 +13,7 @@ tg.session-journal
 tg.session-wal
 tg.session-shm
 *.session
+*.session.lock
 
 # Container volume: config.toml, tg.session and the database are also here
 /data

@@ -10,9 +10,13 @@
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use std::collections::{BTreeMap, HashMap};
+use std::fs::{File, OpenOptions};
 use std::future::Future;
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures_util::StreamExt;
@@ -46,6 +50,212 @@ pub struct Session {
 /// Connect the personal account: it reads the channels.
 pub async fn connect(cfg: &Config) -> Result<Session> {
     open(&cfg.telegram.app.session_file, cfg.telegram.app.api_id).await
+}
+
+/// How often `serve` rewrites the session lock while it holds `tg.session`.
+const SESSION_LOCK_REFRESH: Duration = Duration::from_secs(20);
+/// A lock file older than this is a process that died without deleting it.
+const SESSION_LOCK_STALE: Duration = Duration::from_secs(90);
+/// How long an old stamp from another machine is watched before it is taken:
+/// longer than one refresh, so a live holder rewrites it in this time.
+const SESSION_LOCK_WATCH: Duration = Duration::from_secs(30);
+
+/// Held by `serve` for the whole process. Dropping it removes the lock file.
+pub struct SessionHold {
+    path: PathBuf,
+    stop: Arc<AtomicBool>,
+    file: Arc<Mutex<Option<File>>>,
+    refresh: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for SessionHold {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        self.refresh.abort();
+        if let Ok(mut guard) = self.file.lock() {
+            // Close the file before deleting it. Windows cannot delete an open file.
+            *guard = None;
+        }
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Marks the personal-account session as in use and keeps the stamp fresh until
+/// drop. `login`, `preview` and `run --dry-run` take the same hold for the whole
+/// command. A second process must refuse: Telegram allows one connection for that
+/// key, and another one comes back as `AUTH_KEY_DUPLICATED`.
+///
+/// Across host ↔ Docker the OS file locks (LockFileEx vs flock) are not shared.
+/// Only the stamp crosses the volume, so do not truncate before the lock
+/// check — that would refresh a foreign stamp and hide a live holder. The two
+/// clocks can also differ, so an old stamp from another machine is watched for
+/// a short time: a live holder rewrites it, a dead one does not.
+pub async fn hold_session(session_file: &str) -> Result<SessionHold> {
+    let path = session_lock_path(session_file);
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("could not create {}", parent.display()))?;
+        }
+    }
+    // Read the state before the open below: creating the file would make it fresh.
+    let existed = path.exists();
+    let fresh = lock_is_fresh(&path);
+    // truncate(false): write_stamp clears the file after we own the lock. A
+    // truncate(true) here would refresh mtime before the check and hide a
+    // holder on the other side of a host ↔ Docker volume.
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("could not open {}", path.display()))?;
+    if try_lock_file(&file)? {
+        return Err(session_busy(session_file));
+    }
+    // We own the OS lock, so no process on this machine holds the session.
+    // Host ↔ container: flock and LockFileEx do not see each other, so a stamp
+    // from another machine can still belong to a live holder.
+    let machine = machine_name();
+    if existed {
+        let before = read_stamp(&mut file);
+        if !machine.is_empty() && before.owner() == machine {
+            // Its OS lock is gone, so the daemon can start again at once.
+            tracing::warn!("the session lock was left by a killed process, taking it");
+        } else if fresh {
+            return Err(session_busy(session_file));
+        } else {
+            // The stamp looks old, but only by our clock. Do not trust the clock:
+            // see if somebody still rewrites the stamp.
+            tracing::info!(
+                wait = ?SESSION_LOCK_WATCH,
+                "an old session lock from another machine, checking that nobody uses it"
+            );
+            tokio::time::sleep(SESSION_LOCK_WATCH).await;
+            if read_stamp(&mut file) != before {
+                return Err(session_busy(session_file));
+            }
+        }
+    }
+    write_stamp(&mut file, &machine)?;
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let shared = Arc::new(Mutex::new(Some(file)));
+    let stop_task = Arc::clone(&stop);
+    let file_task = Arc::clone(&shared);
+    let refresh = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(SESSION_LOCK_REFRESH).await;
+            if stop_task.load(Ordering::SeqCst) {
+                break;
+            }
+            let mut guard = file_task.lock().unwrap_or_else(|e| e.into_inner());
+            if stop_task.load(Ordering::SeqCst) {
+                break;
+            }
+            if let Some(open) = guard.as_mut() {
+                if let Err(e) = write_stamp(open, &machine) {
+                    // Without a fresh stamp the other side of a host ↔ Docker
+                    // volume takes the daemon for dead.
+                    tracing::warn!(error = %format!("{e:#}"), "could not refresh the session lock");
+                }
+            }
+        }
+    });
+    Ok(SessionHold {
+        path,
+        stop,
+        file: shared,
+        refresh,
+    })
+}
+
+fn session_lock_path(session_file: &str) -> PathBuf {
+    PathBuf::from(format!("{session_file}.lock"))
+}
+
+fn session_busy(session_file: &str) -> anyhow::Error {
+    anyhow!(
+        "the daemon is already using this Telegram session ({session_file}). \
+         Stop it before login, preview or run --dry-run. A second connection gets \
+         AUTH_KEY_DUPLICATED and the login is dead until you run login again. \
+         If no process is using it, wait two minutes or delete {session_file}.lock"
+    )
+}
+
+/// `true` when the exclusive lock is already taken.
+fn try_lock_file(file: &File) -> Result<bool> {
+    match file.try_lock() {
+        Ok(()) => Ok(false),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(true),
+        Err(std::fs::TryLockError::Error(e)) => Err(e).context("could not check the session lock"),
+    }
+}
+
+fn lock_is_fresh(path: &Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    let Ok(modified) = meta.modified() else {
+        return true;
+    };
+    match modified.elapsed() {
+        Ok(age) => age < SESSION_LOCK_STALE,
+        // A time in the future still means someone wrote the file just now.
+        Err(_) => true,
+    }
+}
+
+/// The name of this machine, written into the stamp. A container has its own
+/// name, so the host and the container never look like the same machine.
+/// Empty when the name is not known; then a fresh stamp is never taken over.
+fn machine_name() -> String {
+    std::fs::read_to_string("/etc/hostname")
+        .ok()
+        .or_else(|| std::env::var("COMPUTERNAME").ok())
+        .or_else(|| std::env::var("HOSTNAME").ok())
+        .map(|name| name.trim().to_string())
+        .unwrap_or_default()
+}
+
+/// What the lock file holds: the text and the time of the last write.
+#[derive(PartialEq)]
+struct Stamp {
+    text: String,
+    modified: Option<std::time::SystemTime>,
+}
+
+impl Stamp {
+    /// The machine that wrote the stamp: the first line.
+    fn owner(&self) -> &str {
+        self.text.lines().next().unwrap_or("").trim()
+    }
+}
+
+fn read_stamp(file: &mut File) -> Stamp {
+    let mut text = String::new();
+    if file.seek(SeekFrom::Start(0)).is_ok() {
+        let _ = file.read_to_string(&mut text);
+    }
+    Stamp {
+        text,
+        modified: file.metadata().and_then(|meta| meta.modified()).ok(),
+    }
+}
+
+/// The machine name and the writer's time. The time makes every stamp differ
+/// from the one before, also where the file time is not exact.
+fn write_stamp(file: &mut File, machine: &str) -> Result<()> {
+    file.set_len(0)
+        .context("could not update the session lock")?;
+    file.seek(SeekFrom::Start(0))
+        .context("could not update the session lock")?;
+    file.write_all(format!("{machine}\n{}\n", Utc::now().timestamp()).as_bytes())
+        .context("could not update the session lock")?;
+    // No fsync: the stamp only has to be seen by a running process, and it is
+    // written every few seconds for the whole life of the daemon.
+    Ok(())
 }
 
 /// Open a session file, connect to Telegram and start the background task of the

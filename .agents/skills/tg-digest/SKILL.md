@@ -19,6 +19,10 @@ journal live in the database (`digest.db`), not in the config and not in
 
 **Only the daemon posts** — on cron or after the `/run` command. The CLI has no
 run that posts, on purpose: two processes on one database would post two digests.
+Do not run `login`, `preview` or `run --dry-run` while the daemon is up. They open
+`tg.session`, and a second connection comes back as `AUTH_KEY_DUPLICATED`. The
+login is then dead until `login` is run again. Those commands refuse to connect
+when the daemon already holds the session.
 The CLI is kept for debugging: `login`, `preview`, `run --dry-run`.
 
 The default paths point to the container volume (`/data`). So locally every
@@ -99,9 +103,10 @@ after another. The debug commands take `--theme dev`
 (`out/posts-<theme>.md` by default) without an LLM call and without moving
 cursors.
 
-Commands that touch cursors are refused while a run is going — this is not an
-error, it is the lock. When there is an undelivered run, only `/run`, `/resume`
-and `/abandon` are allowed.
+Commands that change state are refused while a run is going — this is not an
+error, it is the lock. That set is `/add`, `/rm`, `/reset`, `/skip`, `/reread`,
+`/last`, `/model` and `/fallback`. When there is an undelivered run, only `/run`,
+`/resume` and `/abandon` are allowed.
 
 ## Debugging the schedule
 
@@ -121,7 +126,7 @@ again — the run must happen at once.
 
 More detailed logs: `RUST_LOG=tg_digest=debug`.
 
-## Recovery scenarios (docs/PLAN.md §9.7)
+## Recovery scenarios
 
 You can check them only live, on real Telegram. The main ones:
 
@@ -167,6 +172,10 @@ crate is pre-1.0, and 0.10 rewrote the connection scheme (`SenderPool` +
 `Client::new(handle)`, `SqliteSession::open`, updates from `pool.updates`). Check
 signatures at <https://docs.rs/grammers-client/0.10.0/>, not in search examples —
 they target the old API.
+
+**`AUTH_KEY_DUPLICATED`** — a second process opened `tg.session` while the daemon
+was using it. The login is dead. Stop every copy of the service, then run `login`
+again. `login`, `preview` and `run --dry-run` refuse while the daemon holds the session.
 
 **`not logged in to Telegram`** — run `login`.
 

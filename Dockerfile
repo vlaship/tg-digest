@@ -3,7 +3,12 @@
 # We do not use Alpine/musl on purpose: libsql compiles SQLite from C, and with
 # musl that causes extra trouble. rustls is already a dependency, so the image
 # does not need OpenSSL — ca-certificates is enough.
-FROM rust:1-bookworm AS build
+#
+# The base images are pinned by digest, the same way Cargo.lock pins crates.
+# The build image is Rust 1.99.1, the same version as rust-toolchain.toml and CI.
+# That file is not copied in: rustup would download rustfmt and clippy for it,
+# and the build needs neither. Change the tag, the digest and the file together.
+FROM rust:1.99.1-bookworm@sha256:e6f2cff35d0f309acf8433b4f05878ed77092602c5065cc81801177da0bb3a9c AS build
 WORKDIR /src
 
 # Copy only the manifests first: the dependency layer survives changes in src/.
@@ -24,18 +29,27 @@ ARG GIT_SHA=""
 # The file time must change, or cargo reuses the stub.
 RUN touch src/main.rs && cargo build --release --locked
 
-FROM debian:bookworm-slim
+FROM debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && echo 'digest:x:1000:1000::/data:/bin/sh' >> /etc/passwd \
+    && echo 'digest:x:1000:' >> /etc/group \
+    && mkdir -p /data \
+    && chown 1000:1000 /data
 
 # All working files are in the volume: config.toml, tg.session, digest.db.
 VOLUME /data
 WORKDIR /data
 
 COPY --from=build /src/target/release/tg-digest /usr/local/bin/tg-digest
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+# The entrypoint starts as root only to pick the user. A mounted volume keeps
+# the host owner, and the process runs as that owner. When /data belongs to
+# root, it is given to user digest (uid 1000).
+RUN chmod 755 /usr/local/bin/docker-entrypoint.sh
 
 # Docker collects the logs, so we write to stdout without buffering.
 ENV RUST_LOG=tg_digest=info,warn
-ENTRYPOINT ["tg-digest"]
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 CMD ["serve"]

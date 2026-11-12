@@ -3,7 +3,7 @@ name = "tg-digest"
 # Not used: the real version is the build time and the commit (BUILD_TIME, GIT_SHA).
 version = "0.0.0"
 edition = "2021"
-description = "Reads a list of Telegram channels, summarizes them with Claude and posts a digest back to Telegram on a schedule"
+description = "Reads a list of Telegram channels, summarizes them with the configured model and posts a digest back to Telegram on a schedule"
 license = "MIT"
 
 [dependencies]
