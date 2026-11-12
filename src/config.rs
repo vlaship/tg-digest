@@ -8,6 +8,7 @@ use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::str::FromStr;
 
 use crate::models::Entry;
 
@@ -66,6 +67,7 @@ impl Default for Bot {
 
 #[derive(Debug, Deserialize)]
 pub struct Schedule {
+    /// Default cron for themes that do not set their own.
     pub cron: String,
     #[serde(default = "default_timezone")]
     pub timezone: String,
@@ -303,6 +305,9 @@ pub struct ThemeConfig {
     pub title: String,
     /// System prompt of the theme.
     pub system: String,
+    /// Cron for this theme (5 fields). Not set: `[schedule].cron`.
+    #[serde(default)]
+    pub cron: Option<String>,
     /// Where the digest of this theme goes: `"bot"` or `"@channel"`. Not set:
     /// `telegram.destination`.
     #[serde(default)]
@@ -315,6 +320,8 @@ pub struct ThemeConfig {
 pub struct Theme {
     pub tag: String,
     pub prompts: Prompts,
+    /// Cron expression for this theme (from the theme or from `[schedule].cron`).
+    pub cron: String,
     /// `"bot"` (or `"me"`, for old configs), or `"@channel"`.
     pub destination: String,
 }
@@ -386,6 +393,7 @@ impl Config {
                     map_system: self.prompts.map_system.clone(),
                     digest_title: t.title.clone(),
                 },
+                cron: t.cron.clone().unwrap_or_else(|| self.schedule.cron.clone()),
                 destination: t
                     .destination
                     .clone()
@@ -566,6 +574,14 @@ impl Config {
                 "schedule.timezone {:?} is unknown, an IANA name like America/New_York is needed",
                 self.schedule.timezone
             );
+        }
+        // Same check as `Scheduler::new`: refuse a bad cron at load, not at midnight.
+        for expression in std::iter::once(self.schedule.cron.as_str())
+            .chain(self.themes.iter().filter_map(|t| t.cron.as_deref()))
+        {
+            if let Err(e) = croner::Cron::from_str(expression) {
+                bail!("invalid cron expression {expression:?}: {e}");
+            }
         }
         if self.prompts.system.is_some() || self.prompts.digest_title.is_some() {
             bail!(

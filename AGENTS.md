@@ -85,10 +85,12 @@ share (`user_template`, `map_system`). On a trigger the themes run one after ano
 like separate instances: each has its own channel rows (`channels` key is
 `(theme, id)`), cursors, runs, last digest topics and `/reread` window. A channel can be in several
 themes, and then its news is in each digest. An error or an undelivered run in
-one theme never blocks another. Shared: the schedule, the model, the lock, the
-sessions. Commands take the tag as the first word (`/add dev @channel`,
-`/run dev`); `/add` without a tag uses the first theme. An old database gets the
-`theme` columns on start, and its rows go to the first theme.
+one theme never blocks another. A theme may set its own `cron`; without it it
+uses `[schedule].cron`. Shared: the time zone, catch-up and start flags, the
+model, the lock, the sessions. Commands take the tag as the first word
+(`/add dev @channel`, `/run dev`); `/add` without a tag uses the first theme. An
+old database gets the `theme` columns on start, and its rows go to the first
+theme.
 
 **Two Telegram clients, two jobs.** The personal account (`[telegram.app]`,
 `tg.session`) only reads: it collects posts, resolves `/add`, refreshes names. A
