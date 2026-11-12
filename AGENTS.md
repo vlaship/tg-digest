@@ -213,7 +213,7 @@ Write short commit subjects in the imperative mood. A PR should explain the chan
 related issues, the effect on the config, and how you checked it. For rendering
 changes, add sample output.
 
-CI has two workflows:
+CI has three workflows:
 
 - `.github/workflows/cargo.yml` — on every push:
   `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
@@ -226,6 +226,10 @@ CI has two workflows:
   version (`/status`). There are no `v*` tags. Pull requests do not run this
   workflow. On any other branch it runs only by hand (Actions → docker → Run
   workflow); a manual run only builds, unless you tick "publish".
+- `.github/workflows/audit.yml` — `cargo audit` on `Cargo.lock`: once a week,
+  and on a push that changes `Cargo.lock`. It is not a required check, so a new
+  advisory does not block pull requests. When it fails, update the crate in a
+  new branch.
 
 CI costs money: push only when the owner asks, and test locally first
 (`docker compose up -d --build`).

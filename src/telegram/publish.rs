@@ -40,6 +40,9 @@ pub enum SendOutcome {
     Delivered { sent_msg_id: Option<i32> },
     /// Timeout, broken connection, error without a code: we save nothing, we retry.
     Unclear(String),
+    /// A photo file could not be read. Nothing was sent, and a retry does not
+    /// help: the part goes as text.
+    PhotosLost(String),
     /// FLOOD_WAIT: how long they ask us to wait.
     Wait(Duration, String),
     /// `CHAT_WRITE_FORBIDDEN`, `PEER_ID_INVALID` and others that a retry does not fix.
@@ -150,7 +153,7 @@ pub async fn send_photos(
     for pos in 0..count {
         let data = match photos::read(photos_dir, run_id, idx, pos) {
             Ok(data) => data,
-            Err(e) => return SendOutcome::Unclear(format!("photo read failed: {e:#}")),
+            Err(e) => return SendOutcome::PhotosLost(format!("{e:#}")),
         };
         let mut stream = std::io::Cursor::new(data.as_slice());
         match client
@@ -406,7 +409,7 @@ impl Sender<'_> {
         &mut self,
         peer: PeerRef,
         chunk: &Chunk,
-        photo_count: usize,
+        mut photo_count: usize,
         random_id: i64,
     ) -> Result<Attempt> {
         let (run, total) = (self.run, self.total);
@@ -464,6 +467,16 @@ impl Sender<'_> {
                         return Ok(Attempt::Stop("stopped by signal".into()));
                     }
                 }
+                SendOutcome::PhotosLost(reason) => {
+                    tracing::warn!(run = run.id, part = chunk.idx + 1, %reason, "photos not read, sending the text only");
+                    if chunk.html.is_empty() {
+                        // A part with only photos: there is nothing left to send.
+                        return Ok(Attempt::Delivered(None));
+                    }
+                    // The same `random_id`: nothing was sent with it yet.
+                    photo_count = 0;
+                    attempt -= 1;
+                }
                 SendOutcome::Unclear(reason) => {
                     if attempt >= MAX_ATTEMPTS {
                         return Ok(Attempt::Stop(give_up(chunk.idx, total, attempt, &reason)));
@@ -507,6 +520,7 @@ pub async fn resend(
             }
             SendOutcome::Rejected(reason)
             | SendOutcome::Unclear(reason)
+            | SendOutcome::PhotosLost(reason)
             | SendOutcome::Wait(_, reason) => {
                 return Err(anyhow!(
                     "could not send part {}/{}: {reason}",

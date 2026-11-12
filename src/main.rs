@@ -113,7 +113,8 @@ async fn main() -> Result<()> {
     match cli.command {
         Command::Login { qr } => {
             // Same hold as serve: a second connection kills the login.
-            let _session_hold = telegram::client::hold_session(&cfg.telegram.app.session_file)?;
+            let _session_hold =
+                telegram::client::hold_session(&cfg.telegram.app.session_file).await?;
             let session = telegram::client::connect(&cfg).await?;
             if qr {
                 telegram::client::login_qr(&session, &cfg).await
@@ -342,7 +343,7 @@ async fn adopt_old_channels(db: &Db, cfg: &Config) -> Result<()> {
 async fn prepare(cfg: Arc<Config>) -> Result<(Arc<Runner>, telegram::client::SessionHold)> {
     // Take the lock for the whole command before connect. A second connection
     // kills the login (AUTH_KEY_DUPLICATED).
-    let session_hold = telegram::client::hold_session(&cfg.telegram.app.session_file)?;
+    let session_hold = telegram::client::hold_session(&cfg.telegram.app.session_file).await?;
     let db = Arc::new(Db::open(&cfg.db_file).await?.preview_copy().await?);
     adopt_old_channels(&db, &cfg).await?;
     let session = telegram::client::connect(&cfg).await?;
@@ -380,7 +381,7 @@ async fn serve(cfg: Arc<Config>) -> Result<()> {
 
     // Mark the session in use before connect, so preview and run --dry-run
     // refuse instead of opening a second connection.
-    let _session_hold = telegram::client::hold_session(&cfg.telegram.app.session_file)?;
+    let _session_hold = telegram::client::hold_session(&cfg.telegram.app.session_file).await?;
 
     // The personal account reads the channels; it is also the owner of the bot.
     let telegram::client::Session {

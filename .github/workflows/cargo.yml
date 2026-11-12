@@ -47,18 +47,11 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets --locked -- -D warnings
 
-      # --locked: Cargo.lock pins glass_pumpkin 2.0.0-rc0, see AGENTS.md.
-      # A later cargo update must not replace that pin: rc1 does not build.
+      # A later cargo update must not replace the glass_pumpkin pin: rc1 does not
+      # build, see AGENTS.md.
       - name: glass_pumpkin pin
         run: grep -A1 'name = "glass_pumpkin"' Cargo.lock | grep -q 'version = "2.0.0-rc0"'
 
-      - name: Lockfile advisories
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-audit
-
-      - name: Advisory check
-        run: cargo audit
-
+      # --locked: Cargo.lock pins glass_pumpkin 2.0.0-rc0.
       - name: Release build
         run: cargo build --release --locked

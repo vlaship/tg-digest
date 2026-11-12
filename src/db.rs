@@ -34,7 +34,9 @@ const CHANNEL_COLUMNS: &str =
     "id, access_hash, username, title, enabled, last_msg_id, last_error, theme";
 
 /// The full schema. It is created on the first start. On every later start,
-/// `ensure_columns` adds any column that is missing (`ALTER TABLE`). SQLite
+/// `ensure_columns` adds any column that is missing (`ALTER TABLE`); it reads
+/// the columns from this text, so there is no second list to keep. A new column
+/// must be nullable or have a default. SQLite
 /// cannot change a primary key or a column type in place: that still needs a
 /// new database.
 ///
@@ -204,34 +206,6 @@ pub struct Destination {
 pub struct Db {
     conn: Mutex<Connection>,
 }
-
-/// Columns that may be missing on a database created by an older build.
-/// Each one is nullable or has a default, so `ALTER TABLE` can add it.
-/// `channels.theme` is not here: it is part of the primary key, and
-/// `prepare_themes` moves the old table instead.
-const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
-    ("channels", "username", "TEXT"),
-    ("channels", "last_error", "TEXT"),
-    ("channels", "enabled", "INTEGER NOT NULL DEFAULT 1"),
-    ("channels", "last_msg_id", "INTEGER NOT NULL DEFAULT 0"),
-    ("runs", "finished_at", "TEXT"),
-    ("runs", "posts", "INTEGER"),
-    ("runs", "topics", "INTEGER"),
-    ("runs", "input_tokens", "INTEGER"),
-    ("runs", "output_tokens", "INTEGER"),
-    ("runs", "error", "TEXT"),
-    ("runs", "cursors", "TEXT"),
-    ("runs", "first_send_at", "TEXT"),
-    ("runs", "dest_label", "TEXT"),
-    ("runs", "dest_peer_id", "INTEGER"),
-    ("runs", "dest_access_hash", "INTEGER"),
-    ("runs", "stale_notified_at", "TEXT"),
-    ("runs", "digest_topics", "TEXT"),
-    ("runs", "theme", "TEXT NOT NULL DEFAULT ''"),
-    ("run_chunks", "delivered_at", "TEXT"),
-    ("run_chunks", "sent_msg_id", "INTEGER"),
-    ("run_chunks", "photos", "INTEGER NOT NULL DEFAULT 0"),
-];
 
 impl Db {
     async fn lock(&self) -> tokio::sync::MutexGuard<'_, Connection> {
@@ -951,32 +925,108 @@ async fn prepare_themes(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// Add every column from `ADDED_COLUMNS` that an older database does not have.
-/// The same list is applied to `channels_old`, so the copy below can read it.
+/// One column of `SCHEMA`, as SQLite itself reports it.
+struct SchemaColumn {
+    name: String,
+    /// The text after the name in `ADD COLUMN`: the type, `NOT NULL`, the default.
+    def: String,
+    /// A part of the primary key. `ALTER TABLE` cannot add it.
+    key: bool,
+    /// `NOT NULL` without a default. `ALTER TABLE` cannot add it to old rows.
+    needs_value: bool,
+}
+
+/// Add every column of `SCHEMA` that an older database does not have. The list is
+/// read from `SCHEMA` itself: it is created in an empty in-memory database and
+/// compared with the real one. So a new column is written in one place only.
+/// The `channels` columns are also added to `channels_old`, so the copy below
+/// can read it.
 async fn ensure_columns(conn: &Connection) -> Result<()> {
-    add_missing(conn, None).await?;
-    if has_table(conn, "channels_old").await? {
-        add_missing(conn, Some("channels_old")).await?;
+    let reference = libsql::Builder::new_local(":memory:")
+        .build()
+        .await
+        .context("could not open the reference schema")?
+        .connect()
+        .context("could not open the reference schema")?;
+    reference
+        .execute_batch(SCHEMA)
+        .await
+        .context("could not create the reference schema")?;
+
+    let mut tables = Vec::new();
+    let mut rows = reference
+        .query(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+            (),
+        )
+        .await?;
+    while let Some(row) = rows.next().await? {
+        tables.push(row.get::<String>(0)?);
+    }
+    drop(rows);
+
+    for table in &tables {
+        let columns = schema_columns(&reference, table).await?;
+        add_missing(conn, table, &columns).await?;
+        if table == "channels" && has_table(conn, "channels_old").await? {
+            add_missing(conn, "channels_old", &columns).await?;
+        }
     }
     Ok(())
 }
 
-async fn add_missing(conn: &Connection, only_table: Option<&str>) -> Result<()> {
-    for (table, column, def) in ADDED_COLUMNS {
-        let target = only_table.unwrap_or(table);
-        if only_table.is_some() && *table != "channels" {
+async fn schema_columns(reference: &Connection, table: &str) -> Result<Vec<SchemaColumn>> {
+    let mut rows = reference
+        .query(
+            "SELECT name, type, \"notnull\", dflt_value, pk FROM pragma_table_info(?1)",
+            params![table],
+        )
+        .await?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next().await? {
+        let not_null = row.get::<i64>(2)? != 0;
+        let default: Option<String> = row.get(3)?;
+        let mut def: String = row.get(1)?;
+        if not_null {
+            def.push_str(" NOT NULL");
+        }
+        if let Some(default) = &default {
+            def.push_str(&format!(" DEFAULT {default}"));
+        }
+        out.push(SchemaColumn {
+            name: row.get(0)?,
+            def,
+            key: row.get::<i64>(4)? != 0,
+            needs_value: not_null && default.is_none(),
+        });
+    }
+    Ok(out)
+}
+
+async fn add_missing(conn: &Connection, table: &str, columns: &[SchemaColumn]) -> Result<()> {
+    for column in columns {
+        // A key column is not added here: `prepare_themes` moves the old
+        // `channels` table for `theme`, and `channels_old` never gets one.
+        if column.key || has_column(conn, table, &column.name).await? {
             continue;
         }
-        if !has_table(conn, target).await? || has_column(conn, target, column).await? {
-            continue;
+        if column.needs_value {
+            bail!(
+                "the database has no column {table}.{}, and it cannot be added to \
+                 the old rows. Start with a new database",
+                column.name
+            );
         }
-        tracing::info!(table = target, column, "adding a missing column");
+        tracing::info!(table, column = %column.name, "adding a missing column");
         conn.execute(
-            &format!("ALTER TABLE {target} ADD COLUMN {column} {def}"),
+            &format!(
+                "ALTER TABLE {table} ADD COLUMN {} {}",
+                column.name, column.def
+            ),
             (),
         )
         .await
-        .with_context(|| format!("could not add {target}.{column}"))?;
+        .with_context(|| format!("could not add {table}.{}", column.name))?;
     }
     Ok(())
 }

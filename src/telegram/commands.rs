@@ -240,8 +240,10 @@ async fn handle(runner: &Arc<Runner>, text: &str) -> Result<String> {
     match command_name(text) {
         "/help" => Ok(HELP.into()),
         "/start" => Ok(HELP.into()),
-        // A switch during a run would be saved inside the run's transaction and
-        // lost on rollback. The same refusal as the other state changes.
+        // Without an argument it only lists the models, so it needs no lock.
+        "/model" if arg.is_empty() => model(runner, arg).await,
+        // A switch during a run would change the model between its requests.
+        // The same refusal as the other state changes.
         "/model" => guarded(runner, model(runner, arg)).await,
         "/models" => models(runner, arg).await,
         "/fallback" => fallback(runner).await,

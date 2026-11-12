@@ -227,8 +227,8 @@ digest.
 full control of the bot. They, `bot.session`, the database and `config.toml` with
 the keys are in `.gitignore` (the `data/` folder). Do not commit them and do not
 copy them anywhere. The bot answers only your account and ignores everyone
-else. The container process runs as user `digest` (uid 1000), which can write
-`/data`. To stop strangers adding the bot to groups, send @BotFather
+else. The container process does not run as root: it runs as the owner of
+the `data/` folder, or as user `digest` (uid 1000) when root owns the folder. To stop strangers adding the bot to groups, send @BotFather
 `/setjoingroups` → Disable.
 
 ## Cost

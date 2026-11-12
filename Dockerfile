@@ -5,14 +5,16 @@
 # does not need OpenSSL — ca-certificates is enough.
 #
 # The base images are pinned by digest, the same way Cargo.lock pins crates.
-# rust-toolchain.toml selects the compiler (the same version as CI).
-FROM rust:1-bookworm@sha256:e6f2cff35d0f309acf8433b4f05878ed77092602c5065cc81801177da0bb3a9c AS build
+# The build image is Rust 1.99.1, the same version as rust-toolchain.toml and CI.
+# That file is not copied in: rustup would download rustfmt and clippy for it,
+# and the build needs neither. Change the tag, the digest and the file together.
+FROM rust:1.99.1-bookworm@sha256:e6f2cff35d0f309acf8433b4f05878ed77092602c5065cc81801177da0bb3a9c AS build
 WORKDIR /src
 
 # Copy only the manifests first: the dependency layer survives changes in src/.
 # Cargo.lock must be copied — it pins glass_pumpkin 2.0.0-rc0,
 # without it the build fails inside grammers-crypto.
-COPY rust-toolchain.toml Cargo.toml Cargo.lock ./
+COPY Cargo.toml Cargo.lock ./
 RUN mkdir src && echo "fn main() {}" > src/main.rs \
     && cargo build --release --locked \
     && rm -rf src
@@ -42,8 +44,9 @@ WORKDIR /data
 
 COPY --from=build /src/target/release/tg-digest /usr/local/bin/tg-digest
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
-# The entrypoint starts as root only to give /data to user digest (uid 1000).
-# A mounted volume keeps the host owner. The process then runs as digest.
+# The entrypoint starts as root only to pick the user. A mounted volume keeps
+# the host owner, and the process runs as that owner. When /data belongs to
+# root, it is given to user digest (uid 1000).
 RUN chmod 755 /usr/local/bin/docker-entrypoint.sh
 
 # Docker collects the logs, so we write to stdout without buffering.
