@@ -7,3 +7,4 @@ tg.session*
 *.db
 docs/
 README.md
+rust-toolchain.toml

@@ -1,0 +1,37 @@
+# Checks Cargo.lock for crates with known security problems.
+#
+# It is not a part of the `check` job in cargo.yml on purpose. A new advisory
+# comes with no code change, and it must not block every open pull request. This
+# job is not a required check: when it fails, update the crate in a new branch.
+name: audit
+
+on:
+  # Once a week, Monday 05:00 UTC.
+  schedule:
+    - cron: "0 5 * * 1"
+  # And when the dependencies change.
+  push:
+    paths:
+      - Cargo.lock
+      - .github/workflows/audit.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: audit-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+
+      - name: Advisory check
+        run: cargo audit

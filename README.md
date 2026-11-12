@@ -1,13 +1,13 @@
 # tg-digest
 
-tg-digest reads a list of Telegram channels, makes a digest from them with Claude,
-and posts the digest back to Telegram on a schedule.
+tg-digest reads a list of Telegram channels, makes a digest from them with the
+model set in the config, and posts the digest back to Telegram on a schedule.
 
 - **Reading.** It uses MTProto with your personal account (`grammers`). So it can
   read any channel you follow, including private channels from an invite link.
-- **Summary.** It uses the Anthropic Messages API. Posts are grouped by topic. If
-  several channels write about the same event, they become one item with a list
-  of sources.
+- **Summary.** It calls the model you set in `model` (Anthropic, Gemini,
+  OpenRouter or OpenAI). Posts are grouped by topic. If several channels write
+  about the same event, they become one item with a list of sources.
 - **Bot.** You talk to your own Telegram bot: you write commands to it, and it
   sends you the replies, the digests and the notifications. It can also post the
   digest to your channel. Only your account may give it commands.
@@ -24,7 +24,7 @@ Everything lives outside the image, in the host folder **`data/`**, which compos
 mounts as `/data`:
 
 - `config.toml` — all settings, including the secrets (API id and hash, phone,
-  Anthropic key);
+  the keys of the model providers);
 - `tg.session` — the Telegram login of your account, created by `login`;
 - `bot.session` — the bot login, created on the first start;
 - `digest.db` — the database.
@@ -62,9 +62,10 @@ CI publishes the image to GitHub Container Registry:
   time (`YYYYMMDD-HHmmss`). The same time is the version in `/status`, so you
   can see which image is running.
 
-Pull requests only build the image, they do not publish it. To build it by hand
-without publishing, run the `docker` workflow from the Actions tab (or
-`gh workflow run docker`); tick "publish" only if you want to push the result.
+A push to `main` builds the image and publishes it. Pull requests do not run
+the docker workflow. On any other branch it runs only when you start it by hand
+(Actions → docker → Run workflow, or `gh workflow run docker`). A manual run
+only builds, unless you tick "publish".
 
 `compose.yaml` uses `latest`, so `docker compose pull` takes the new image.
 For one exact build, put its tag in `image:`.
@@ -107,7 +108,7 @@ the two sessions are files in that folder; their names (`db_file`,
 ```powershell
 cargo run -- --config config.toml login          # one-time login
 cargo run -- --config config.toml login --qr     # login by a QR code, if the code does not come
-cargo run -- --config config.toml preview        # how many posts were collected, no call to Claude
+cargo run -- --config config.toml preview        # how many posts were collected, no model call
 cargo run -- --config config.toml preview --theme dev --dump  # same, and write out/posts-dev.md (raw posts, no LLM)
 cargo run -- --config config.toml run --dry-run  # digest in out/digest.html (out/digest-<tag>.html with several themes), nothing is posted; --theme dev for one theme
 cargo run -- --config config.toml serve          # the daemon: schedule + commands
@@ -115,8 +116,12 @@ cargo run -- --config config.toml serve          # the daemon: schedule + comman
 
 The CLI has no run that posts. Only the daemon posts: on the schedule or after
 the `/run` command. Otherwise two processes on one database could post two
-digests. `preview` and `run --dry-run` use a copy of the database in memory:
-they do not change the saved channels or cursors. `preview --dump` (or
+digests. Do not run `login`, `preview` or `run --dry-run` while the daemon is up.
+They would open the same `tg.session`. Telegram allows one connection for that key.
+A second one comes back as `AUTH_KEY_DUPLICATED` and the login is dead until
+you run `login` again. Those commands refuse to connect when the daemon already
+holds the session. `preview` and `run --dry-run` use a copy of the database in
+memory: they do not change the saved channels or cursors. `preview --dump` (or
 `--out path.md`) writes the collected posts as markdown for offline use; the
 default file is `out/posts-<theme>.md`.
 
@@ -125,8 +130,10 @@ When the daemon starts, it always checks for an undelivered digest, whatever
 waits for `/resume` or `/abandon`. A theme that had an undelivered digest does not
 also get a new run on that start (`run_on_start` or `catch_up`); the other themes
 do. Commands also work during a manual run, but commands that change state (and
-`/last`) are refused at that time. They are not queued. An undelivered digest of
-one theme blocks `/add`, `/rm`, `/reset`, `/skip` and `/reread` only for that theme.
+`/last`) are refused at that time. They are not queued. That set is `/add`,
+`/rm`, `/reset`, `/skip`, `/reread`, `/last`, `/model` and `/fallback`.
+An undelivered digest of one theme blocks `/add`, `/rm`, `/reset`, `/skip` and
+`/reread` only for that theme.
 
 ## Settings
 
@@ -220,12 +227,14 @@ digest.
 full control of the bot. They, `bot.session`, the database and `config.toml` with
 the keys are in `.gitignore` (the `data/` folder). Do not commit them and do not
 copy them anywhere. The bot answers only your account and ignores everyone
-else. To stop strangers adding the bot
-to groups, send @BotFather `/setjoingroups` → Disable.
+else. The container process does not run as root: it runs as the owner of
+the `data/` folder, or as user `digest` (uid 1000) when root owns the folder. To stop strangers adding the bot to groups, send @BotFather
+`/setjoingroups` → Disable.
 
 ## Cost
 
-A rough guide: 20 channels × ~30 posts ≈ 120k input tokens, about **$0.6–0.8**
-per run on `claude-opus-5`. That is about $20 a month with one run a day. You can
-change the model and `effort` in the config without a rebuild. The real usage is
-in `/status` and in the logs.
+One example, not a price for every model: 20 channels × ~30 posts ≈ 120k input
+tokens, about **$0.6–0.8** per run on `claude-opus-5`. That example is about $20
+a month with one run a day. A cheaper model costs less. The real price is whatever
+`model` is set to. You can change the model and `effort` in the config without a
+rebuild. The real usage is in `/status` and in the logs.

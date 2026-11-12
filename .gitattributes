@@ -1,0 +1,2 @@
+# Shell scripts must stay LF: Docker ENTRYPOINT fails on CRLF from a Windows checkout.
+*.sh text eol=lf

@@ -1,8 +1,10 @@
 //! One run: collect → model → publish, and recovery of undelivered runs.
 //!
-//! The single lock for everything that touches cursors and run status also lives
-//! here. It is taken with `try_lock` — nobody waits in a queue: a delayed
-//! `/reset` that fires five minutes later is more surprising than a refusal.
+//! The single lock for everything that changes state also lives here: cursors,
+//! run status, `/model` and `/fallback`. It is taken with `try_lock` — nobody
+//! waits in a queue: a delayed `/reset` that fires five minutes later is more
+//! surprising than a refusal. Database statements use a separate mutex in `Db`,
+//! so a read during an open transaction cannot join that transaction.
 
 use anyhow::{anyhow, Result};
 use chrono::{Duration as ChronoDuration, Utc};
@@ -222,6 +224,18 @@ impl Runner {
     /// channels, cursors and runs. `only` limits the trigger to one theme.
     pub async fn trigger(&self, trigger: &str, only: Option<&Theme>) -> Result<Outcomes> {
         self.pass(trigger, &self.themes(only), true).await
+    }
+
+    /// The same as `trigger` for a caller that already holds the run lock.
+    /// `/fallback` switches the model and then runs, and must not take the lock twice.
+    pub async fn trigger_locked(
+        &self,
+        guard: MutexGuard<'_, ()>,
+        trigger: &str,
+        only: Option<&Theme>,
+    ) -> Result<Outcomes> {
+        let _guard = guard;
+        self.pass_locked(trigger, &self.themes(only), true).await
     }
 
     /// A trigger for a chosen set of themes in ONE pass: the names are refreshed
@@ -740,7 +754,6 @@ impl Runner {
         parts: Vec<digest::Part>,
         posts: &[digest::Post],
     ) -> Vec<NewChunk> {
-        let dir = self.photos_dir();
         let mut journal = Vec::with_capacity(parts.len());
         let mut done = std::collections::HashSet::new();
 
@@ -755,13 +768,10 @@ impl Runner {
                 continue;
             };
 
-            let files = self.topic_photos(&digest.topics[topic], posts).await;
-            if files.is_empty() {
-                journal.push(text);
-                continue;
-            }
-            if let Err(e) = photos::save(&dir, run_id, journal.len(), &files) {
-                tracing::warn!(error = %format!("{e:#}"), "could not save the photos");
+            let saved = self
+                .topic_photos(&digest.topics[topic], posts, run_id, journal.len())
+                .await;
+            if saved.count == 0 {
                 journal.push(text);
                 continue;
             }
@@ -770,21 +780,21 @@ impl Runner {
             let in_caption = one_message && publish::fits_caption(&part.html);
             tracing::info!(
                 topic = %digest.topics[topic].title,
-                photos = files.len(),
-                kb = files.iter().map(Vec::len).sum::<usize>() / 1024,
+                photos = saved.count,
+                kb = saved.bytes / 1024,
                 in_caption,
                 "photos added to the topic"
             );
             if in_caption {
                 journal.push(NewChunk {
-                    photos: files.len(),
+                    photos: saved.count,
                     ..text
                 });
             } else {
                 journal.push(NewChunk {
                     html: String::new(),
                     random_id: rand::random(),
-                    photos: files.len(),
+                    photos: saved.count,
                 });
                 journal.push(text);
             }
@@ -792,16 +802,32 @@ impl Runner {
         journal
     }
 
-    async fn topic_photos(&self, topic: &digest::Topic, posts: &[digest::Post]) -> Vec<Vec<u8>> {
+    async fn topic_photos(
+        &self,
+        topic: &digest::Topic,
+        posts: &[digest::Post],
+        run_id: i64,
+        idx: usize,
+    ) -> photos::SavedPhotos {
         let Some((channel_id, ids)) = digest::pick_photos(topic, posts) else {
             tracing::debug!(topic = %topic.title, "no photos in the sources of the topic");
-            return Vec::new();
+            return photos::SavedPhotos::none();
         };
-        match photos::download(&self.client, &self.db, channel_id, &ids).await {
-            Ok(files) => files,
+        match photos::download(
+            &self.client,
+            &self.db,
+            channel_id,
+            &ids,
+            &self.photos_dir(),
+            run_id,
+            idx,
+        )
+        .await
+        {
+            Ok(saved) => saved,
             Err(e) => {
                 tracing::warn!(error = %format!("{e:#}"), topic = %topic.title, "photos not added");
-                Vec::new()
+                photos::SavedPhotos::none()
             }
         }
     }

@@ -29,7 +29,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: dtolnay/rust-toolchain@stable
+      # The version is rust-toolchain.toml. @stable would move and a new lint
+      # would fail this job with no code change. Keep the ref in step with the file.
+      - uses: dtolnay/rust-toolchain@1.99.1
         with:
           components: rustfmt, clippy
 
@@ -45,6 +47,11 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets --locked -- -D warnings
 
-      # --locked: Cargo.lock pins glass_pumpkin 2.0.0-rc0, see AGENTS.md.
+      # A later cargo update must not replace the glass_pumpkin pin: rc1 does not
+      # build, see AGENTS.md.
+      - name: glass_pumpkin pin
+        run: grep -A1 'name = "glass_pumpkin"' Cargo.lock | grep -q 'version = "2.0.0-rc0"'
+
+      # --locked: Cargo.lock pins glass_pumpkin 2.0.0-rc0.
       - name: Release build
         run: cargo build --release --locked
