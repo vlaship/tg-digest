@@ -47,17 +47,34 @@ impl Digest {
     /// would be lost.
     pub fn defect(&self) -> Option<String> {
         for topic in &self.topics {
-            let title = topic.title.trim();
-            let summary = topic.summary.trim();
-            if title.is_empty() || summary.is_empty() || is_stub(title) || is_stub(summary) {
-                let start: String = summary.chars().take(80).collect();
-                return Some(format!(
-                    "a topic is a stub: title {title:?}, summary {start:?}"
-                ));
+            if let Some(defect) = topic_stub_defect(topic) {
+                return Some(defect);
             }
         }
         None
     }
+
+    /// Drop topics with an empty or placeholder title/summary. A reasoning model
+    /// sometimes fills the schema with one stub item next to real ones; keeping the
+    /// good topics saves the run. Returns how many topics were removed.
+    pub fn strip_stubs(&mut self) -> usize {
+        let before = self.topics.len();
+        self.topics
+            .retain(|topic| topic_stub_defect(topic).is_none());
+        before - self.topics.len()
+    }
+}
+
+fn topic_stub_defect(topic: &Topic) -> Option<String> {
+    let title = topic.title.trim();
+    let summary = topic.summary.trim();
+    if title.is_empty() || summary.is_empty() || is_stub(title) || is_stub(summary) {
+        let start: String = summary.chars().take(80).collect();
+        return Some(format!(
+            "a topic is a stub: title {title:?}, summary {start:?}"
+        ));
+    }
+    None
 }
 
 fn is_stub(text: &str) -> bool {
@@ -118,11 +135,11 @@ pub fn response_schema() -> Value {
                     "properties": {
                         "title": {
                             "type": "string",
-                            "description": "A short headline that names the event, not a category."
+                            "description": "A short headline that names the event, not a category. Must not be empty."
                         },
                         "summary": {
                             "type": "string",
-                            "description": "1-3 sentences with the facts: who, what, where, numbers."
+                            "description": "1-3 sentences with the facts: who, what, where, numbers. Must not be empty."
                         },
                         "sources": {
                             "type": "array",
