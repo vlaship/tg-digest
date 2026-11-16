@@ -138,6 +138,8 @@ token = ""
 #   request_timeout_secs — how long to wait for one answer (default 600)
 #   effort               — anthropic: low | medium | high | xhigh | max;
 #                          openai: none | minimal | low | medium | high
+#                          (openrouter: not sent as a top-level field; a stub
+#                          retry uses reasoning.effort = low by itself)
 #   reasoning            — openrouter only: the model thinks before it answers;
 #                          slower, and the thinking counts in max_tokens.
 #                          A model that always thinks (glm-5.3-flash) gets it on
@@ -166,6 +168,12 @@ api_key = "..."
 # They have low daily limits and can be busy too. Only models with response_format
 # are in the list. If a model has no strict JSON schema (structured_outputs), the
 # service asks for a JSON object and puts the schema in the prompt.
+#
+# DeepSeek V4.1 Flash (and similar thinking models) often spend most of max_tokens
+# on reasoning. The JSON then comes back with empty title/summary stubs. Prefer a
+# model that is strong at structured JSON (Gemini, Anthropic, or a non-thinking
+# OpenRouter id), or set reasoning = false / a higher max_tokens on that model.
+# After a stub answer the service retries once with reasoning.effort = low.
 [providers.openrouter]
 api_key = "sk-or-..."
 # One model has many hosts, and their prices differ up to five times.
@@ -176,6 +184,11 @@ quantizations = ["fp8", "bf16", "fp16"]
 # A big answer from a free model can take minutes: wait longer.
 [providers.openrouter.models."google/gemma-4-31b-it:free"]
 request_timeout_secs = 1200
+
+# Example: a thinking OpenRouter model that needs room for both reasoning and JSON.
+# [providers.openrouter.models."deepseek/deepseek-v4.1-flash"]
+# reasoning = false
+# max_tokens = 16000
 
 # Paid per use, the key is from https://platform.openai.com/api-keys.
 # A ChatGPT subscription (Plus / Pro) gives no API access.
