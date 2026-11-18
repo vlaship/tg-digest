@@ -18,6 +18,7 @@ use grammers_client::peer::Peer;
 use grammers_client::tl;
 use grammers_client::update::Update;
 use grammers_session::updates::UpdatesLike;
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::task::JoinSet;
@@ -67,6 +68,7 @@ const HELP: &str = "\
 Commands:
 /add [theme] @channel | link | id … — add one or more channels (no theme: the first one)
 /rm [theme] @channel | id … — remove channels (several at once, or one /rm per line)
+/refresh [all | id | @channel …] — update channel titles and usernames (no arg: channels without a name)
 /list — themes, channels, cursors, errors
 /reset [theme] id — read the channel again from the lookback_hours window
 /skip [theme] — move the channels to their newest message: older posts are skipped
@@ -268,6 +270,7 @@ async fn handle(runner: &Arc<Runner>, text: &str) -> Result<String> {
         // Futures are lazy: the action does not start until `guarded` lets it through.
         "/add" => guarded(runner, add_many(runner, arg)).await,
         "/rm" => guarded(runner, remove_many(runner, arg)).await,
+        "/refresh" => guarded(runner, refresh(runner, arg)).await,
         "/reset" => guarded(runner, reset(runner, arg)).await,
         "/skip" => guarded(runner, skip(runner, arg)).await,
         // Touches no cursors, but it sends: under the lock, so its parts never mix
@@ -533,6 +536,28 @@ async fn list(runner: &Arc<Runner>) -> Result<String> {
         return Ok("no channels yet: add one with /add @channel".into());
     }
 
+    let tz = runner.timezone();
+    let mut last_dates: HashMap<i64, Option<String>> = HashMap::new();
+    for channel in &channels {
+        if last_dates.contains_key(&channel.id) {
+            continue;
+        }
+        let date = match channels::last_message(&runner.client, channel.into()).await {
+            Ok(Some((_, dt))) => Some(dt.with_timezone(&tz).format("%Y-%m-%d").to_string()),
+            Ok(None) => None,
+            Err(e) if crate::telegram::client::is_fatal(&e) => return Err(e),
+            Err(e) => {
+                tracing::debug!(
+                    error = %format!("{e:#}"),
+                    id = channel.id,
+                    "could not read the last post date"
+                );
+                None
+            }
+        };
+        last_dates.insert(channel.id, date);
+    }
+
     // The themes in the config order, then the tags that only the database has.
     let mut tags: Vec<String> = runner.cfg.themes().into_iter().map(|t| t.tag).collect();
     let known = tags.len();
@@ -561,8 +586,12 @@ async fn list(runner: &Arc<Runner>) -> Result<String> {
             out.push_str(&format!("no channels: /add {tag} @channel\n"));
         }
         for channel in rows {
+            let last_post = last_dates
+                .get(&channel.id)
+                .and_then(|d| d.as_deref())
+                .unwrap_or("—");
             out.push_str(&format!(
-                "{} {} — id {}, {}, cursor {}{}\n",
+                "{} {} — id {}, {}, cursor {}, last post {}{}\n",
                 if channel.enabled { "✅" } else { "⛔" },
                 channel.title,
                 channel.id,
@@ -572,6 +601,7 @@ async fn list(runner: &Arc<Runner>) -> Result<String> {
                     .map(|u| format!("@{u}"))
                     .unwrap_or_else(|| "private".into()),
                 channel.last_msg_id,
+                last_post,
                 channel
                     .last_error
                     .as_ref()
@@ -828,6 +858,94 @@ async fn remove(runner: &Arc<Runner>, tag: Option<&str>, key: &str) -> Result<St
     ))
 }
 
+/// `/refresh [all | id | @channel …]`: read titles and usernames from Telegram again.
+/// Without arguments it checks only channels without a name; `all` checks every channel.
+async fn refresh(runner: &Arc<Runner>, arg: &str) -> Result<String> {
+    let mut not_found = Vec::new();
+    let targets = if arg.is_empty() {
+        let channels = runner.db.channels().await?;
+        if channels.is_empty() {
+            return Ok("no channels yet: add one with /add @channel".into());
+        }
+        let unnamed: Vec<Channel> = channels.into_iter().filter(has_no_name).collect();
+        if unnamed.is_empty() {
+            return Ok("all channels have a name; use /refresh all to check every channel".into());
+        }
+        unnamed
+    } else if arg.eq_ignore_ascii_case("all") {
+        let channels = runner.db.channels().await?;
+        if channels.is_empty() {
+            return Ok("no channels yet: add one with /add @channel".into());
+        }
+        channels
+    } else {
+        let mut found = Vec::new();
+        for line in arg_lines(arg, "/refresh") {
+            for item in split_items(line) {
+                let rows = runner.db.find_channels(username_from(item)).await?;
+                if rows.is_empty() {
+                    not_found.push(item.to_string());
+                } else {
+                    found.extend(rows);
+                }
+            }
+        }
+        found
+    };
+
+    let summary = channels::refresh_list(&runner.client, &runner.db, targets).await?;
+    let mut out = Vec::new();
+
+    if summary.checked > 0 {
+        out.push(format!(
+            "checked {} channel(s), updated {}",
+            summary.checked,
+            summary.updated.len()
+        ));
+    }
+    for u in &summary.updated {
+        out.push(format_updated_channel(u));
+    }
+    for id in &summary.unavailable {
+        out.push(format!("id {id}: could not read from Telegram"));
+    }
+    for item in &not_found {
+        out.push(format!("{item}: not in the database, /list shows the list"));
+    }
+
+    Ok(out.join("\n"))
+}
+
+fn has_no_name(channel: &Channel) -> bool {
+    let title = channel.title.trim();
+    title.is_empty() || title == "no title" || title == channel.id.to_string()
+}
+
+fn format_updated_channel(u: &channels::UpdatedChannel) -> String {
+    let title = if u.old_title != u.new_title {
+        format!("{} -> {}", u.old_title, u.new_title)
+    } else {
+        u.new_title.clone()
+    };
+    let username = if u.old_username != u.new_username {
+        format!(
+            " ({} -> {})",
+            format_username(u.old_username.as_deref()),
+            format_username(u.new_username.as_deref())
+        )
+    } else {
+        String::new()
+    };
+    format!("• id {}: {title}{username}", u.id)
+}
+
+fn format_username(username: Option<&str>) -> String {
+    match username {
+        Some(name) => format!("@{name}"),
+        None => "private".into(),
+    }
+}
+
 /// `/skip [theme]`: move every enabled channel to its newest message, so the next
 /// digest has only posts that come after this. A channel that cannot be read keeps
 /// its cursor.
@@ -1039,7 +1157,15 @@ async fn resolve_new_channel(runner: &Arc<Runner>, arg: &str) -> Result<channels
 fn is_slow(text: &str) -> bool {
     matches!(
         command_name(text),
-        "/run" | "/reread" | "/resume" | "/last" | "/skip" | "/add" | "/fallback"
+        "/run"
+            | "/reread"
+            | "/resume"
+            | "/last"
+            | "/skip"
+            | "/add"
+            | "/refresh"
+            | "/list"
+            | "/fallback"
     )
 }
 

@@ -5,11 +5,13 @@
 //! titles and usernames again before every run.
 
 use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
 use grammers_client::client::Client;
 use grammers_client::peer::Peer;
 use grammers_client::tl;
 use grammers_session::types::PeerKind;
 use std::collections::{BTreeMap, HashMap};
+use std::time::Duration;
 
 use crate::db::{Channel, Db};
 use crate::telegram::client::peer_ref;
@@ -55,6 +57,22 @@ pub async fn find_in_dialogs(client: &Client, id: i64) -> Result<Option<ChannelP
     Ok(None)
 }
 
+/// What changed for one channel after a name refresh.
+pub struct UpdatedChannel {
+    pub id: i64,
+    pub old_title: String,
+    pub new_title: String,
+    pub old_username: Option<String>,
+    pub new_username: Option<String>,
+}
+
+/// Result of refreshing titles and usernames for a list of channels.
+pub struct RefreshSummary {
+    pub checked: usize,
+    pub updated: Vec<UpdatedChannel>,
+    pub unavailable: Vec<i64>,
+}
+
 /// Update titles and usernames of the enabled channels without changing the list.
 ///
 /// Called before every run: otherwise a channel that was renamed or made private
@@ -62,8 +80,22 @@ pub async fn find_in_dialogs(client: &Client, id: i64) -> Result<Option<ChannelP
 /// channels where something changed.
 pub async fn refresh_names(client: &Client, db: &Db) -> Result<usize> {
     let channels = db.enabled_channels().await?;
+    let summary = refresh_list(client, db, channels).await?;
+    Ok(summary.updated.len())
+}
+
+/// Update titles and usernames for the given channels without changing the list.
+pub async fn refresh_list(
+    client: &Client,
+    db: &Db,
+    channels: Vec<Channel>,
+) -> Result<RefreshSummary> {
     if channels.is_empty() {
-        return Ok(0);
+        return Ok(RefreshSummary {
+            checked: 0,
+            updated: Vec::new(),
+            unavailable: Vec::new(),
+        });
     }
 
     // A channel that is in several themes has a row in each: ask about it once.
@@ -73,10 +105,12 @@ pub async fn refresh_names(client: &Client, db: &Db) -> Result<usize> {
     let peers: Vec<ChannelPeer> = channels.iter().map(ChannelPeer::from).collect();
     let fresh = describe_all(client, &peers).await?;
 
-    let mut changed = 0;
+    let mut updated = Vec::new();
+    let mut unavailable = Vec::new();
     for channel in &channels {
         // The channel is not in the answer — it is not available; we keep the name from the database.
         let Some((username, title)) = fresh.get(&channel.id) else {
+            unavailable.push(channel.id);
             continue;
         };
         if channel.username == *username && channel.title == *title {
@@ -85,13 +119,23 @@ pub async fn refresh_names(client: &Client, db: &Db) -> Result<usize> {
         log_rename(channel, username);
         db.update_channel_names(channel.id, username.as_deref(), title)
             .await?;
-        changed += 1;
+        updated.push(UpdatedChannel {
+            id: channel.id,
+            old_title: channel.title.clone(),
+            new_title: title.clone(),
+            old_username: channel.username.clone(),
+            new_username: username.clone(),
+        });
     }
 
-    if changed > 0 {
-        tracing::info!(changed, "channel titles updated");
+    if !updated.is_empty() {
+        tracing::info!(changed = updated.len(), "channel titles updated");
     }
-    Ok(changed)
+    Ok(RefreshSummary {
+        checked: channels.len(),
+        updated,
+        unavailable,
+    })
 }
 
 fn log_rename(channel: &Channel, username: &Option<String>) {
@@ -105,10 +149,13 @@ fn log_rename(channel: &Channel, username: &Option<String>) {
     }
 }
 
-/// How many channels Telegram returns in one `channels.getChannels`.
-const CHANNELS_PER_REQUEST: usize = 100;
+/// How many channels Telegram is asked for in one `channels.getChannels` batch.
+const REFRESH_BATCH_SIZE: usize = 20;
 
-/// Titles and usernames of many channels in one request (per hundred channels).
+/// Pause between `channels.getChannels` batches to avoid flood limits.
+const REFRESH_BATCH_PAUSE: Duration = Duration::from_secs(1);
+
+/// Titles and usernames of many channels in small batches with a pause between them.
 ///
 /// Channels that Telegram did not return are not in the map — the caller
 /// decides what to use instead.
@@ -118,7 +165,10 @@ async fn describe_all(
 ) -> Result<HashMap<i64, (Option<String>, String)>> {
     let mut out = HashMap::new();
 
-    for batch in peers.chunks(CHANNELS_PER_REQUEST) {
+    for (i, batch) in peers.chunks(REFRESH_BATCH_SIZE).enumerate() {
+        if i > 0 {
+            tokio::time::sleep(REFRESH_BATCH_PAUSE).await;
+        }
         let id: Vec<tl::enums::InputChannel> = batch
             .iter()
             .map(|peer| {
@@ -216,15 +266,23 @@ pub async fn mark_read(client: &Client, db: &Db, cursors: &BTreeMap<i64, i32>) {
     }
 }
 
-/// Id of the newest message in the channel, `None` if the channel has no messages.
-pub async fn last_message_id(client: &Client, peer: ChannelPeer) -> Result<Option<i32>> {
+/// Id and date of the newest message in the channel, `None` if the channel has no messages.
+pub async fn last_message(
+    client: &Client,
+    peer: ChannelPeer,
+) -> Result<Option<(i32, DateTime<Utc>)>> {
     let reference = peer_ref(peer.id, peer.access_hash)?;
     let mut messages = client.iter_messages(reference).limit(1);
     let last = messages
         .next()
         .await
         .with_context(|| format!("could not read the last message of channel id {}", peer.id))?;
-    Ok(last.map(|m| m.id()))
+    Ok(last.map(|m| (m.id(), m.date())))
+}
+
+/// Id of the newest message in the channel, `None` if the channel has no messages.
+pub async fn last_message_id(client: &Client, peer: ChannelPeer) -> Result<Option<i32>> {
+    Ok(last_message(client, peer).await?.map(|(id, _)| id))
 }
 
 /// The read mark of the personal account in the channel: id of the last post it read.
