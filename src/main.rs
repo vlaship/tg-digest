@@ -527,6 +527,8 @@ async fn schedule_loop(runner: Arc<Runner>, cancel: Cancel) -> Result<()> {
         let now = Utc::now();
         let mut due = Vec::new();
         let mut next_wake: Option<chrono::DateTime<Utc>> = None;
+        // The themes of the next slot, only for the log.
+        let mut next_themes: Vec<&str> = Vec::new();
 
         for (theme, scheduler) in &schedules {
             let last = last_tick.get(&theme.tag).copied().unwrap_or(now);
@@ -534,10 +536,14 @@ async fn schedule_loop(runner: Arc<Runner>, cancel: Cancel) -> Result<()> {
             if next <= now {
                 due.push(theme.clone());
             } else {
-                next_wake = Some(match next_wake {
-                    Some(wake) => wake.min(next),
-                    None => next,
-                });
+                match next_wake {
+                    Some(wake) if wake < next => {}
+                    Some(wake) if wake == next => next_themes.push(theme.tag.as_str()),
+                    _ => {
+                        next_wake = Some(next);
+                        next_themes = vec![theme.tag.as_str()];
+                    }
+                }
             }
         }
 
@@ -555,7 +561,7 @@ async fn schedule_loop(runner: Arc<Runner>, cancel: Cancel) -> Result<()> {
         let Some(next) = next_wake else {
             bail!("no theme has a next cron slot");
         };
-        tracing::info!(next = %next, "waiting for the next run");
+        tracing::info!(next = %next, themes = ?next_themes, "waiting for the next run");
 
         if wait_until(next, &cancel).await == Wake::Interrupted {
             tracing::info!("shutdown signal received, exiting");
