@@ -291,6 +291,8 @@ pub struct ModelSpec {
     /// OpenRouter: the model can think. Then `reasoning = false` is sent as
     /// `enabled: false`: some models think by default.
     pub can_reason: bool,
+    /// OpenRouter: reasoning cannot be turned off (`enabled: false` gives 400).
+    pub reasoning_mandatory: bool,
     pub sort: Option<String>,
     pub ignore: Vec<String>,
     pub quantizations: Vec<String>,
@@ -510,6 +512,7 @@ impl Config {
                 || (m.reasoning.or(p.reasoning).unwrap_or(false)
                     && entry.and_then(|e| e.reasoning).unwrap_or(true)),
             can_reason: entry.and_then(|e| e.reasoning).unwrap_or(false),
+            reasoning_mandatory: entry.is_some_and(|e| e.reasoning_mandatory),
             // `sort = ""` means "not set", not a value for OpenRouter.
             sort: m
                 .sort

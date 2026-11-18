@@ -336,16 +336,16 @@ impl Backend {
                 // often groups the news better. Some models think by default, so "off"
                 // is sent too, but only to a model that can think: otherwise
                 // `require_parameters` finds no host.
-                // After a stub answer we ask with `effort: low` instead of "off": a
-                // model that always thinks rejects "off". Low effort stays on.
-                // When reasoning used almost all output tokens, `max_tokens` is
-                // higher too, so the JSON has room after the thinking.
-                if m.reasoning || (low_reasoning && m.can_reason) {
-                    if low_reasoning {
+                // After a stub answer we turn reasoning off when the model allows it,
+                // or ask with `effort: low` when reasoning is mandatory.
+                if low_reasoning && m.can_reason {
+                    if m.reasoning_mandatory {
                         body["reasoning"] = json!({ "enabled": true, "effort": "low" });
                     } else {
-                        body["reasoning"] = json!({ "enabled": true });
+                        body["reasoning"] = json!({ "enabled": false });
                     }
+                } else if m.reasoning {
+                    body["reasoning"] = json!({ "enabled": true });
                 } else if m.can_reason {
                     body["reasoning"] = json!({ "enabled": false });
                 }
