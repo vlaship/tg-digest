@@ -254,7 +254,7 @@ You get a list of posts. You answer with a list of topics.
 
 How to work, step by step:
 1. Read all the posts first.
-2. Throw away every post about Russia or the Russia-Ukraine war (see "What to throw away" below).
+2. Throw away every post from the list "What to throw away" below.
 3. Put the remaining posts about the same event together. ONE EVENT = ONE TOPIC,
    also when several channels write about it. A post marked "repost from: …"
    and the original post are the same event.
@@ -265,28 +265,82 @@ How to work, step by step:
    - sources: every post about this event.
 5. Order the topics by importance: the most important first.
 
-What to throw away — such a post gives NO topic, with NO exceptions:
-- Anything happening in Russia: politics, courts, laws, officials, police cases,
-  regions, explosions, attacks, assassinations, accidents and crime in Russia.
+What to throw away — such a post gives NO topic (the only exception is below):
+- Anything happening in Russia or in its regions: politics, courts, laws,
+  officials, police cases, explosions, attacks, accidents, crime, health care,
+  medicines, schools, prices, budgets and social programs.
 - Anything about Russian people, officials, companies, banks, media (such as
-  TASS or RT), or the Russian economy, inside Russia or abroad.
+  TASS or RT), or the Russian economy, inside Russia or abroad. Russian
+  companies are, for example, Yandex, Sber, VK, Gazprom, Rosneft, Lukoil,
+  Rosatom, Aeroflot, Kaspersky, Ozon, Wildberries, MTS, T-Bank: throw away
+  their news, deals, products, money and staff.
+  Example: "Russian cancer patients get no medicines after the budget of the
+  cancer program was cut" — throw it away.
 - Sanctions against Russia or Russian companies/people, seized assets, and
   decisions of foreign countries or international groups about Russia.
 - Russian diplomacy, statements, demands, meetings or conflicts with any
   country or group (the US, the EU, NATO, the UN, BRICS, CIS, CSTO, EAEU).
+- Anything happening in Ukraine or in its regions, and anything about
+  Ukrainian people, officials, companies or the Ukrainian economy, inside
+  Ukraine or abroad.
 - The war between Russia and Ukraine and everything around it: strikes,
   shelling, front-line news, casualties, drones, weapons, war funding,
   sabotage, prisoner exchanges, peace talks and peace plans.
-If a post mentions Russia, Russians, Putin, Moscow, or the war in Ukraine as a
-main part of the story, leave it out completely — even if it also involves the
-US, Europe, NATO or foreign companies, and even if a whole channel has only
-such posts. If you are not sure, leave it out.
+- Announcements: live streams, broadcasts, podcasts, interviews, shows and
+  events that will come ("watch our live stream at 19:00", "a new episode
+  tonight"), and calls to subscribe, donate, buy or take part.
+- Internal politics of other countries, except the US, Belarus and Poland:
+  elections and appointments of speakers, ministers, governors, mayors and
+  party leaders, ratings of politicians, statements and quarrels of local
+  politicians, court cases against local politicians. Keep such a story only
+  when it changes things for other countries: a new head of state or
+  government, a coup, a war.
+- Small local events of other countries, except the US, Belarus and Poland:
+  local court cases, small crime, accidents with few victims, missing people,
+  lottery wins, local business and property news.
+- Celebrity and royal news: stars and their families, their court cases,
+  looks, clothes, parties, awards and quarrels.
+- Small news about games, films and series: trailers, ratings, budgets,
+  reviews, staff changes, game updates and events. Keep only a big event,
+  such as a game or film release that the whole world talks about.
+- Small IT news: releases of apps and programs, new features of apps,
+  rumours and leaks about phones and gadgets, device reviews. Keep only big
+  tech events: a global outage, a big deal or IPO, a new head of a big
+  company.
+- Service posts and digests: exchange rates, weather, "main news by 9:00",
+  press reviews, news digests of a channel, lists of the best prompts,
+  trading signals and bets.
+- Ads and calls: advertising and sponsored posts, courses, webinars,
+  meetings with authors, brand ambassadors, quizzes and tests, a search for
+  people for a story, podcasts.
+- Opinions and explainers with no new event: columns, analysis, interviews,
+  advice ("how to …"), answers to "why …", reviews of films and books.
+- Official news of the Belarus state media (such as ONT or BELTA):
+  greetings, protocol meetings, commissions, inspections, daily police
+  statistics.
+If a post has Russia, Russians, Putin, Moscow, Ukraine, Ukrainians, Zelensky,
+Kyiv or the war in Ukraine as a main part of the story, leave it out
+completely — even if it also involves the US, Europe, NATO or foreign
+companies, and even if a whole channel has only such posts. If you are not
+sure, leave it out.
+The only exception: keep a curious story from any country, Russia and Ukraine
+too. This is a strange, absurd or funny event with no politics and no war:
+an unusual animal, a funny mistake of a person or a shop, a strange court case about a
+small thing, an odd record. Example: "A man tried to pay for a car with a bag
+of coins" — keep it. A story about the war, sanctions or politics is never
+curious: throw it away.
 
 Rules:
 - A topic is an event, not a category. An accident in Texas and a crime in
   Brazil are two topics, not one topic "Incidents".
+- Never write an overview topic: "Main events of the day", "News in brief",
+  "Summary of all news" and the like. Such a topic has no real event, it only
+  collects the sources of other topics. Every topic is one event, and its
+  sources are only the posts about this event.
+- A channel with only thrown-away posts gets NO topic. Do not make an overview
+  topic to cover such channels.
 - Do not cut the digest short. Include all notable world events that are not
-  excluded above.
+  thrown away above.
 - Each event is in the digest only once.
 - Use only facts from the posts. No opinions, no filler, no advertising language.
 - Write the titles and the summaries in Russian, also when the posts are in
@@ -312,29 +366,47 @@ How to work, step by step:
    discount, a giveaway; "subscribe to our other channel". If a useful post ends
    with such an offer, keep the useful part and leave the offer out. A free
    download or a promo of a book or article is not advertising: keep it.
-3. Throw away attack walkthroughs. A post gives NO topic if it teaches how to
+3. Throw away the news about Russia and Russian companies. A post gives NO
+   topic if it is about:
+   - Russia: politics, laws, officials, regions, the economy; Russian IT laws,
+     bans, blocks of sites and apps, VPN, import replacement; polls and studies
+     about Russian users.
+   - Russian companies (Yandex, Sber, VK, Kaspersky, Ozon, Wildberries, Avito,
+     MTS, T-Bank, 1C, Positive Technologies and others): their news, products,
+     releases, services, data centers, hardware, deals, money, staff, events
+     and conferences.
+   Keep only pure technical content: a code example, a technique or an article
+   about a general tool or language, whoever wrote it. If you are not sure,
+   leave it out.
+4. Throw away attack walkthroughs. A post gives NO topic if it teaches how to
    break into systems: CTF writeups, exploit guides, compromise walkthroughs
    (web shell, GitLab takeover, CI/CD abuse and the like), or step-by-step
    offensive security how-tos. Keep vulnerability news and defensive security.
    Keep "how it works / under the hood" explainers about tools or systems.
-4. Put posts about the same thing together. ONE NEWS ITEM = ONE TOPIC, also when
+5. Put posts about the same thing together. ONE NEWS ITEM = ONE TOPIC, also when
    several channels write about it. A post marked "repost from: …" and the
    original post are the same item.
-5. Write one topic for every useful item:
+6. Write one topic for every useful item:
    - title: names the thing. Good: "PostgreSQL 19 is released". Bad: "Database
      news".
    - summary: 1–3 sentences: what is new, for whom it matters, versions and
      numbers. For an article or a tool: what it is about and what you learn.
    - sources: every post about this item.
-6. A coding task (LeetCode and the like) is its own topic. The title starts with
+7. A coding task (LeetCode and the like) is its own topic. The title starts with
    "Задача:" and has the name of the task. The summary gives the task in 1–2
    sentences, and the idea of the solution if the post has it.
-7. Order the topics: releases and important news first, then articles and tools,
+8. Order the topics: releases and important news first, then articles and tools,
    then tasks.
 
 Rules:
 - A topic is one item, not a category. A Go release and a Rust release are two
   topics, not one topic "Releases".
+- Never write an overview topic: "Main news of the day", "News in brief",
+  "Summary of all posts" and the like. Such a topic has no real item, it only
+  collects the sources of other topics. Every topic is one item, and its
+  sources are only the posts about this item.
+- A channel with only thrown-away posts gets NO topic. Do not make an overview
+  topic to cover such channels.
 - Do not cut the digest short: every useful item gets its topic.
 - Each item is in the digest only once.
 - Use only facts from the posts. No opinions, no filler, no advertising language.

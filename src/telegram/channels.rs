@@ -6,6 +6,7 @@
 
 use anyhow::{Context, Result};
 use grammers_client::client::Client;
+use grammers_client::peer::Peer;
 use grammers_client::tl;
 use grammers_session::types::PeerKind;
 use std::collections::{BTreeMap, HashMap};
@@ -150,10 +151,33 @@ async fn describe_all(
 /// `(id, username, title)` of a channel — an unavailable channel may have no name.
 fn channel_names(chat: &tl::enums::Chat) -> Option<(i64, Option<String>, String)> {
     match chat {
-        tl::enums::Chat::Channel(c) => Some((c.id, c.username.clone(), c.title.clone())),
+        tl::enums::Chat::Channel(c) => Some((c.id, active_username(c), c.title.clone())),
         tl::enums::Chat::ChannelForbidden(c) => Some((c.id, None, c.title.clone())),
         _ => None,
     }
+}
+
+/// The `@username` of a channel, or its first active name from `usernames`
+/// (Telegram puts bought names only there, and leaves `username` empty).
+fn active_username(channel: &tl::types::Channel) -> Option<String> {
+    channel
+        .username
+        .as_deref()
+        .filter(|u| !u.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            channel
+                .usernames
+                .as_deref()
+                .into_iter()
+                .flatten()
+                .find_map(|u| match u {
+                    tl::enums::Username::Username(u) if u.active && !u.username.is_empty() => {
+                        Some(u.username.clone())
+                    }
+                    _ => None,
+                })
+        })
 }
 
 /// Mark posts as read in Telegram, up to each channel's cursor, for the personal account.
@@ -242,8 +266,9 @@ pub async fn describe(client: &Client, peer: ChannelPeer) -> Result<(Option<Stri
         .await
         .with_context(|| format!("could not get data of channel id {}", peer.id))?;
 
-    Ok((
-        resolved.username().map(str::to_string),
-        resolved.name().unwrap_or("no title").to_string(),
-    ))
+    let username = match &resolved {
+        Peer::Channel(c) => active_username(&c.raw),
+        _ => resolved.username().map(str::to_string),
+    };
+    Ok((username, resolved.name().unwrap_or("no title").to_string()))
 }
