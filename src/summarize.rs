@@ -8,7 +8,7 @@ use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use chrono_tz::Tz;
 use serde_json::{json, Value};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
 use crate::cancel::Cancel;
@@ -19,6 +19,10 @@ pub const ANTHROPIC_VERSION: &str = "2023-06-01";
 const MAX_ATTEMPTS: u32 = 4;
 /// How many times we ask the model when its answer is broken (`Digest::defect`).
 const MAX_BROKEN_ANSWERS: u32 = 2;
+/// Extra answer tokens on a stub retry. Low effort alone still returned a stub
+/// when reasoning was almost the whole output: about 1700 reasoning tokens and
+/// one empty topic. 16000 is enough for a long digest after that thinking.
+const STUB_ANSWER_TOKENS: u64 = 16_000;
 
 /// A model API error the owner can act on. It is a separate type, so the bot can
 /// say in plain words what happened and what to do, not send a JSON dump.
@@ -167,8 +171,7 @@ In sources use only the https://t.me/... links from the material, copied exactly
 Every topic needs a non-empty title and a non-empty summary. \
 Answer with the JSON only.";
 
-/// Added on a second ask when the first answer had only stubs: leave room for the
-/// JSON instead of burning the whole `max_tokens` on thinking.
+/// Added on a second ask when the first answer had only stubs.
 const STUB_REPAIR: &str = "Your previous answer had empty title or summary fields. \
 Fill every title and every summary with real text. Empty strings are not allowed.";
 
@@ -233,9 +236,12 @@ pub struct Summarizer {
     /// (`structured_outputs`), so we ask for `json_object` and put the schema in the
     /// system prompt. Found out on the first request and kept for the whole run.
     json_object: AtomicBool,
-    /// OpenRouter only: after a stub answer, ask again with `reasoning.effort = low`
-    /// so thinking does not eat the whole `max_tokens` budget. Kept for the run.
+    /// OpenRouter only: after a stub answer, ask again with `reasoning.effort = low`.
+    /// Reasoning stays on. Kept for the run.
     low_reasoning: AtomicBool,
+    /// OpenRouter only: `max_tokens` for that retry when reasoning used almost all
+    /// output tokens. `0` means the configured limit. Kept for the run.
+    retry_max_tokens: AtomicU32,
 }
 
 /// OpenRouter says this when no host of the model supports a parameter we sent.
@@ -255,14 +261,23 @@ impl Backend {
     }
 
     /// `json_object` / `low_reasoning`: only for OpenRouter, see `Summarizer`.
-    fn body(&self, system: &str, user: &str, json_object: bool, low_reasoning: bool) -> Value {
+    /// `max_tokens` is the configured limit, or a higher one after a stub answer
+    /// whose reasoning used almost all output tokens.
+    fn body(
+        &self,
+        system: &str,
+        user: &str,
+        json_object: bool,
+        low_reasoning: bool,
+        max_tokens: u32,
+    ) -> Value {
         let m = &self.0;
         match m.kind {
             // thinking is on by default on claude-opus-5 — we do not pass the parameter.
             // temperature and budget_tokens return 400 on this model.
             ProviderKind::Anthropic => json!({
                 "model": m.id,
-                "max_tokens": m.max_tokens,
+                "max_tokens": max_tokens,
                 "output_config": {
                     "effort": m.effort,
                     "format": { "type": "json_schema", "schema": digest::response_schema() }
@@ -274,7 +289,7 @@ impl Backend {
                 "systemInstruction": { "parts": [{ "text": system }] },
                 "contents": [{ "role": "user", "parts": [{ "text": user }] }],
                 "generationConfig": {
-                    "maxOutputTokens": m.max_tokens,
+                    "maxOutputTokens": max_tokens,
                     "responseMimeType": "application/json",
                     "responseJsonSchema": digest::response_schema()
                 }
@@ -297,7 +312,7 @@ impl Backend {
                 // support `response_format`, otherwise the answer may be free text.
                 let mut body = json!({
                     "model": m.id,
-                    "max_tokens": m.max_tokens,
+                    "max_tokens": max_tokens,
                     "messages": [
                         { "role": "system", "content": system },
                         { "role": "user", "content": user }
@@ -322,8 +337,9 @@ impl Backend {
                 // is sent too, but only to a model that can think: otherwise
                 // `require_parameters` finds no host.
                 // After a stub answer we ask with `effort: low` instead of "off": a
-                // model that always thinks rejects "off", and low still leaves room
-                // for the JSON when reasoning was eating the whole budget.
+                // model that always thinks rejects "off". Low effort stays on.
+                // When reasoning used almost all output tokens, `max_tokens` is
+                // higher too, so the JSON has room after the thinking.
                 if m.reasoning || (low_reasoning && m.can_reason) {
                     if low_reasoning {
                         body["reasoning"] = json!({ "enabled": true, "effort": "low" });
@@ -341,7 +357,7 @@ impl Backend {
             ProviderKind::OpenAI => {
                 let mut body = json!({
                     "model": m.id,
-                    "max_completion_tokens": m.max_tokens,
+                    "max_completion_tokens": max_tokens,
                     "messages": [
                         { "role": "system", "content": system },
                         { "role": "user", "content": user }
@@ -391,6 +407,9 @@ pub struct Summary {
     pub digest: Digest,
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
+    /// Reasoning tokens inside `output_tokens`, when the API sends them.
+    /// Used to decide the stub retry. Not stored.
+    pub reasoning_tokens: Option<u64>,
 }
 
 impl Summarizer {
@@ -408,6 +427,7 @@ impl Summarizer {
             // OpenRouter: a model without a strict JSON schema gets a JSON object at once.
             json_object: AtomicBool::new(!model.json_schema),
             low_reasoning: AtomicBool::new(false),
+            retry_max_tokens: AtomicU32::new(0),
         })
     }
 
@@ -744,15 +764,24 @@ impl Summarizer {
     /// `reduce 1: 2/4`, `final`).
     async fn ask(&self, step: &str, system: &str, user: &str, cancel: &Cancel) -> Result<Summary> {
         // A broken answer (see `Digest::defect`) is asked again once. The second
-        // ask adds a repair line and, on OpenRouter, lowers reasoning effort so
-        // thinking does not leave empty title/summary fields. If that is broken
-        // too, the run fails and the cursors do not move.
+        // ask adds a repair line. On OpenRouter, reasoning stays on at low
+        // effort. When reasoning used almost all output tokens, `max_tokens`
+        // goes up too, so the JSON has room. If that answer is broken too, the
+        // run fails and the cursors do not move.
         let mut attempt = 1;
         loop {
             let user_prompt = if attempt > 1 {
                 format!("{user}\n\n{STUB_REPAIR}")
             } else {
                 user.to_string()
+            };
+            let json_object = self.json_object.load(Ordering::Relaxed);
+            let low_reasoning = self.low_reasoning.load(Ordering::Relaxed);
+            let retry_max = self.retry_max_tokens.load(Ordering::Relaxed);
+            let max_tokens = if retry_max == 0 {
+                self.backend.0.max_tokens
+            } else {
+                retry_max
             };
             tracing::info!(
                 step,
@@ -761,13 +790,13 @@ impl Summarizer {
                 system_chars = system.chars().count(),
                 user_chars = user_prompt.chars().count(),
                 attempt,
+                max_tokens,
+                low_reasoning,
                 "asking the model, this can take a few minutes"
             );
-            let json_object = self.json_object.load(Ordering::Relaxed);
-            let low_reasoning = self.low_reasoning.load(Ordering::Relaxed);
-            let body = self
-                .backend
-                .body(system, &user_prompt, json_object, low_reasoning);
+            let body =
+                self.backend
+                    .body(system, &user_prompt, json_object, low_reasoning, max_tokens);
             let started = std::time::Instant::now();
             let result = tokio::select! {
                 _ = cancel.cancelled() => bail!("model request stopped by the shutdown signal"),
@@ -794,6 +823,10 @@ impl Summarizer {
                 seconds = started.elapsed().as_secs(),
                 "the model answered"
             );
+            // Set when every topic was a stub and reasoning was almost the whole
+            // output. The retry then raises `max_tokens`. A broken JSON answer has
+            // no usage here, so it only lowers effort.
+            let mut reasoning_ate = None;
             let defect = match self.backend.parse(response) {
                 Ok(mut summary) => {
                     let before = summary.digest.topics.len();
@@ -812,6 +845,13 @@ impl Summarizer {
                         // A real empty list: quiet day, not a stub.
                         return Ok(summary);
                     }
+                    if let (Some(reasoning), Some(output)) =
+                        (summary.reasoning_tokens, summary.output_tokens)
+                    {
+                        if reasoning_ate_output(reasoning, output) {
+                            reasoning_ate = Some((reasoning, output));
+                        }
+                    }
                     format!("all {before} topic(s) were stubs")
                 }
                 // Not a digest at all: the same as a stub, one more try.
@@ -823,13 +863,26 @@ impl Summarizer {
             if attempt >= MAX_BROKEN_ANSWERS {
                 bail!("the model answer is broken again ({defect}), nothing is posted");
             }
-            // OpenRouter: leave more of max_tokens for the JSON on the next ask.
+            // OpenRouter: keep reasoning on, at low effort. When thinking used
+            // almost all output tokens, also raise `max_tokens` for the JSON.
             if self.backend.0.kind == ProviderKind::OpenRouter && self.backend.0.can_reason {
-                tracing::warn!(
-                    model = %self.model,
-                    "stub answer with a thinking model, asking again with low reasoning effort"
-                );
                 self.low_reasoning.store(true, Ordering::Relaxed);
+                if let Some((reasoning, output)) = reasoning_ate {
+                    let max_tokens = raised_max_tokens(self.backend.0.max_tokens, reasoning);
+                    self.retry_max_tokens.store(max_tokens, Ordering::Relaxed);
+                    tracing::warn!(
+                        model = %self.model,
+                        reasoning_tokens = reasoning,
+                        output_tokens = output,
+                        max_tokens,
+                        "stub answer: reasoning used almost all output tokens, asking again with low effort and a higher max_tokens"
+                    );
+                } else {
+                    tracing::warn!(
+                        model = %self.model,
+                        "stub answer with a thinking model, asking again with low reasoning effort"
+                    );
+                }
             }
             tracing::warn!(%defect, attempt, "the model answer is broken, asking again");
             attempt += 1;
@@ -955,6 +1008,7 @@ fn keep_partials(
         digest: Digest { topics },
         input_tokens,
         output_tokens,
+        reasoning_tokens: None,
     }
 }
 
@@ -1058,6 +1112,27 @@ fn overload_backoff(attempt: u32) -> Duration {
     Duration::from_secs(15 * 2u64.pow(attempt - 1))
 }
 
+/// Reasoning was at least 80% of the output tokens. The JSON then has almost
+/// no room, and the model fills the schema with empty fields.
+fn reasoning_ate_output(reasoning: u64, output: u64) -> bool {
+    output > 0 && reasoning.saturating_mul(10) >= output.saturating_mul(8)
+}
+
+/// `max_tokens` for the stub retry when reasoning used almost all output tokens.
+///
+/// The new limit is the configured limit plus `STUB_ANSWER_TOKENS`. It is also
+/// at least the reasoning tokens plus that same room, so the JSON still fits
+/// when thinking was already longer than the configured limit. It stays at most
+/// twice the configured limit when that is enough for the JSON.
+fn raised_max_tokens(configured: u32, reasoning_tokens: u64) -> u32 {
+    let configured = u64::from(configured);
+    let with_room = configured.saturating_add(STUB_ANSWER_TOKENS);
+    let after_reasoning = reasoning_tokens.saturating_add(STUB_ANSWER_TOKENS);
+    let raised = with_room.max(after_reasoning);
+    let cap = configured.saturating_mul(2).max(after_reasoning);
+    u32::try_from(raised.min(cap)).unwrap_or(u32::MAX)
+}
+
 /// We check `stop_reason` BEFORE reading `content`: on a refusal the model answers
 /// HTTP 200 with `stop_reason: "refusal"` and empty content.
 fn parse_summary(response: Value) -> Result<Summary> {
@@ -1112,6 +1187,7 @@ fn parse_summary(response: Value) -> Result<Summary> {
         digest,
         input_tokens: usage("input_tokens"),
         output_tokens: usage("output_tokens"),
+        reasoning_tokens: None,
     })
 }
 
@@ -1178,6 +1254,7 @@ fn parse_gemini(response: Value) -> Result<Summary> {
         digest,
         input_tokens: usage("promptTokenCount"),
         output_tokens,
+        reasoning_tokens: usage("thoughtsTokenCount"),
     })
 }
 
@@ -1290,12 +1367,12 @@ fn parse_chat(response: Value, api: &'static str) -> Result<Summary> {
     let model = response.get("model").and_then(Value::as_str).unwrap_or("");
     let output_tokens = usage("completion_tokens");
     let reasoning_tokens = usage("completion_tokens_details/reasoning_tokens");
-    // A thinking model can spend almost all of max_tokens on reasoning and still
-    // return schema-shaped JSON with empty title/summary. The next ask lowers
-    // reasoning effort; this log makes the cause obvious.
+    // A thinking model can spend almost all of the output on reasoning and still
+    // return schema-shaped JSON with empty title/summary. The next ask keeps
+    // reasoning on, lowers effort, and raises max_tokens.
     if digest.defect().is_some() {
         if let (Some(reasoning), Some(output)) = (reasoning_tokens, output_tokens) {
-            if output > 0 && reasoning * 10 >= output * 8 {
+            if reasoning_ate_output(reasoning, output) {
                 tracing::warn!(
                     %model,
                     %provider,
@@ -1321,6 +1398,7 @@ fn parse_chat(response: Value, api: &'static str) -> Result<Summary> {
         digest,
         input_tokens: usage("prompt_tokens"),
         output_tokens: usage("completion_tokens"),
+        reasoning_tokens,
     })
 }
 
