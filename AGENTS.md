@@ -7,6 +7,13 @@ control it with commands to a Telegram bot, and the bot sends you the digests.
 
 How it works and how to use it are in [README.md](README.md).
 
+## Communication Style
+Enforce strict Controlled Technical Language across all responses:
+- **English output:** Adhere to **ASD-STE100 (Simplified Technical English)**.
+- **Russian output:** Adhere to **УТР (Упрощенный технический русский)** per **ГОСТ Р 58049-2017** («Перевод эксплуатационной документации на изделия авиационной техники с/на иностранные языки»).
+
+**Strict constraints:** Use active voice, imperative mood for steps, and direct word order. Limit sentences to 20 words maximum. Maintain a 1:1 term-to-meaning ratio (zero synonyms). Eliminate nominalizations (отглагольные существительные), participial phrases (причастные/деепричастные обороты), and conversational filler.
+
 ## Project structure
 
 | File | What it does |
