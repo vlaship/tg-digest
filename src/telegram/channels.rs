@@ -102,51 +102,79 @@ pub async fn refresh_list(
     let mut seen = std::collections::HashSet::new();
     let channels: Vec<Channel> = channels.into_iter().filter(|c| seen.insert(c.id)).collect();
 
-    let peers: Vec<ChannelPeer> = channels.iter().map(ChannelPeer::from).collect();
-    let fresh = describe_all(client, &peers).await?;
+    let total = channels.len();
+    let total_batches = total.div_ceil(REFRESH_BATCH_SIZE);
+    tracing::info!(
+        channels = total,
+        batches = total_batches,
+        "refreshing channel names"
+    );
 
     let mut updated = Vec::new();
     let mut unavailable = Vec::new();
-    for channel in &channels {
-        // The channel is not in the answer — it is not available; we keep the name from the database.
-        let Some((username, title)) = fresh.get(&channel.id) else {
-            unavailable.push(channel.id);
-            continue;
-        };
-        if channel.username == *username && channel.title == *title {
-            continue;
+    for (i, batch) in channels.chunks(REFRESH_BATCH_SIZE).enumerate() {
+        if i > 0 {
+            tokio::time::sleep(REFRESH_BATCH_PAUSE).await;
         }
-        log_rename(channel, username);
-        db.update_channel_names(channel.id, username.as_deref(), title)
-            .await?;
-        updated.push(UpdatedChannel {
-            id: channel.id,
-            old_title: channel.title.clone(),
-            new_title: title.clone(),
-            old_username: channel.username.clone(),
-            new_username: username.clone(),
-        });
+        tracing::info!(
+            batch = i + 1,
+            batches = total_batches,
+            channels = batch.len(),
+            "reading channel batch"
+        );
+        let peers: Vec<ChannelPeer> = batch.iter().map(ChannelPeer::from).collect();
+        let fresh = describe_batch(client, &peers).await?;
+
+        for channel in batch {
+            // The channel is not in the answer — it is not available; we keep the name from the database.
+            let Some((username, title)) = fresh.get(&channel.id) else {
+                tracing::warn!(
+                    id = channel.id,
+                    channel = %channel.label(),
+                    "channel not returned by Telegram"
+                );
+                unavailable.push(channel.id);
+                continue;
+            };
+            if channel.username == *username && channel.title == *title {
+                tracing::info!(
+                    id = channel.id,
+                    channel = %channel.label(),
+                    "channel checked: no changes"
+                );
+                continue;
+            }
+            tracing::info!(
+                id = channel.id,
+                old_title = %channel.title,
+                new_title = %title,
+                old_username = ?channel.username,
+                new_username = ?username,
+                "channel updated"
+            );
+            db.update_channel_names(channel.id, username.as_deref(), title)
+                .await?;
+            updated.push(UpdatedChannel {
+                id: channel.id,
+                old_title: channel.title.clone(),
+                new_title: title.clone(),
+                old_username: channel.username.clone(),
+                new_username: username.clone(),
+            });
+        }
     }
 
-    if !updated.is_empty() {
-        tracing::info!(changed = updated.len(), "channel titles updated");
-    }
+    tracing::info!(
+        checked = total,
+        updated = updated.len(),
+        unavailable = unavailable.len(),
+        "channel refresh finished"
+    );
     Ok(RefreshSummary {
-        checked: channels.len(),
+        checked: total,
         updated,
         unavailable,
     })
-}
-
-fn log_rename(channel: &Channel, username: &Option<String>) {
-    if channel.username != *username {
-        tracing::info!(
-            id = channel.id,
-            was = ?channel.username,
-            now = ?username,
-            "channel username changed — digest links recalculated"
-        );
-    }
 }
 
 /// How many channels Telegram is asked for in one `channels.getChannels` batch.
@@ -155,46 +183,39 @@ const REFRESH_BATCH_SIZE: usize = 20;
 /// Pause between `channels.getChannels` batches to avoid flood limits.
 const REFRESH_BATCH_PAUSE: Duration = Duration::from_secs(1);
 
-/// Titles and usernames of many channels in small batches with a pause between them.
+/// Titles and usernames of one batch of channels.
 ///
 /// Channels that Telegram did not return are not in the map — the caller
 /// decides what to use instead.
-async fn describe_all(
+async fn describe_batch(
     client: &Client,
     peers: &[ChannelPeer],
 ) -> Result<HashMap<i64, (Option<String>, String)>> {
-    let mut out = HashMap::new();
-
-    for (i, batch) in peers.chunks(REFRESH_BATCH_SIZE).enumerate() {
-        if i > 0 {
-            tokio::time::sleep(REFRESH_BATCH_PAUSE).await;
-        }
-        let id: Vec<tl::enums::InputChannel> = batch
-            .iter()
-            .map(|peer| {
-                tl::enums::InputChannel::Channel(tl::types::InputChannel {
-                    channel_id: peer.id,
-                    access_hash: peer.access_hash,
-                })
+    let id: Vec<tl::enums::InputChannel> = peers
+        .iter()
+        .map(|peer| {
+            tl::enums::InputChannel::Channel(tl::types::InputChannel {
+                channel_id: peer.id,
+                access_hash: peer.access_hash,
             })
-            .collect();
+        })
+        .collect();
 
-        let chats = match client
-            .invoke(&tl::functions::channels::GetChannels { id })
-            .await
-            .context("could not get data of the channels")?
-        {
-            tl::enums::messages::Chats::Chats(chats) => chats.chats,
-            tl::enums::messages::Chats::Slice(slice) => slice.chats,
-        };
+    let chats = match client
+        .invoke(&tl::functions::channels::GetChannels { id })
+        .await
+        .context("could not get data of the channels")?
+    {
+        tl::enums::messages::Chats::Chats(chats) => chats.chats,
+        tl::enums::messages::Chats::Slice(slice) => slice.chats,
+    };
 
-        for chat in chats {
-            if let Some((id, username, title)) = channel_names(&chat) {
-                out.insert(id, (username, title));
-            }
+    let mut out = HashMap::new();
+    for chat in chats {
+        if let Some((id, username, title)) = channel_names(&chat) {
+            out.insert(id, (username, title));
         }
     }
-
     Ok(out)
 }
 
