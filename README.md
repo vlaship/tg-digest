@@ -202,7 +202,7 @@ that is not in the config as "not read".
 | `/add @channel`, `/add t.me/name`, `/add t.me/+link`, `/add id` | add the channel; the digest starts from your read mark if you follow it, else only posts after adding go into it. Several channels at once: `/add @a @b @c` (spaces, commas or new lines; a new line may start with `/add` again). With a theme: `/add dev @a @b`; without one the first theme is used |
 | `/rm @channel` · `/rm id` | turn the channel off (`@name`, `t.me/name` or id). Several at once: `/rm @a @b`, or one `/rm` per line in one message. `/rm dev @channel` when the channel is in several themes |
 | `/refresh [all \| id \| @channel …]` | update channel titles and usernames from Telegram (no arguments: channels without a name; `all`: all channels in batches) |
-| `/list` | channels by theme, one message per theme: id, username, on/off, cursor, last post date, last error |
+| `/list [details]` | channels by theme, one message per theme: id, username, on/off, last error (`details`: also cursor and last post date) |
 | `/reset id` | read the channel again from the `lookback_hours` window (`/reset dev id` for one theme) |
 | `/skip` | move all channels to their newest message: older posts are skipped (`/skip dev` for one theme) |
 | `/run` | run all themes now (or deliver an undelivered digest); `/run dev` runs one theme. After a digest in the chat the bot sends `/run` to tap |

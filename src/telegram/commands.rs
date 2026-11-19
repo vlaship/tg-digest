@@ -69,7 +69,7 @@ Commands:
 /add [theme] @channel | link | id … — add one or more channels (no theme: the first one)
 /rm [theme] @channel | id … — remove channels (several at once, or one /rm per line)
 /refresh [all | id | @channel …] — update channel titles and usernames (no arg: channels without a name)
-/list — themes, channels, cursors, errors
+/list [details] — themes and channels (details: also cursors and last post dates)
 /reset [theme] id — read the channel again from the lookback_hours window
 /skip [theme] — move the channels to their newest message: older posts are skipped
 /run [theme] — run now (or deliver an undelivered digest)
@@ -249,7 +249,7 @@ async fn handle(runner: &Arc<Runner>, text: &str) -> Result<String> {
         "/model" => guarded(runner, model(runner, arg)).await,
         "/models" => models(runner, arg).await,
         "/fallback" => fallback(runner).await,
-        "/list" => list(runner).await,
+        "/list" => list(runner, arg).await,
         "/status" => status(runner).await,
         "/run" => match only_theme(runner, arg) {
             Ok(theme) => Ok(runner
@@ -530,32 +530,42 @@ async fn fallback(runner: &Arc<Runner>) -> Result<String> {
     ))
 }
 
-async fn list(runner: &Arc<Runner>) -> Result<String> {
+async fn list(runner: &Arc<Runner>, arg: &str) -> Result<String> {
+    let details = if arg.is_empty() {
+        false
+    } else if arg.eq_ignore_ascii_case("details") {
+        true
+    } else {
+        return Ok("use /list or /list details".into());
+    };
+
     let channels = runner.db.channels().await?;
     if channels.is_empty() {
         return Ok("no channels yet: add one with /add @channel".into());
     }
 
-    let tz = runner.timezone();
     let mut last_dates: HashMap<i64, Option<String>> = HashMap::new();
-    for channel in &channels {
-        if last_dates.contains_key(&channel.id) {
-            continue;
-        }
-        let date = match channels::last_message(&runner.client, channel.into()).await {
-            Ok(Some((_, dt))) => Some(dt.with_timezone(&tz).format("%Y-%m-%d").to_string()),
-            Ok(None) => None,
-            Err(e) if crate::telegram::client::is_fatal(&e) => return Err(e),
-            Err(e) => {
-                tracing::debug!(
-                    error = %format!("{e:#}"),
-                    id = channel.id,
-                    "could not read the last post date"
-                );
-                None
+    if details {
+        let tz = runner.timezone();
+        for channel in &channels {
+            if last_dates.contains_key(&channel.id) {
+                continue;
             }
-        };
-        last_dates.insert(channel.id, date);
+            let date = match channels::last_message(&runner.client, channel.into()).await {
+                Ok(Some((_, dt))) => Some(dt.with_timezone(&tz).format("%Y-%m-%d").to_string()),
+                Ok(None) => None,
+                Err(e) if crate::telegram::client::is_fatal(&e) => return Err(e),
+                Err(e) => {
+                    tracing::debug!(
+                        error = %format!("{e:#}"),
+                        id = channel.id,
+                        "could not read the last post date"
+                    );
+                    None
+                }
+            };
+            last_dates.insert(channel.id, date);
+        }
     }
 
     // The themes in the config order, then the tags that only the database has.
@@ -586,28 +596,28 @@ async fn list(runner: &Arc<Runner>) -> Result<String> {
             out.push_str(&format!("no channels: /add {tag} @channel\n"));
         }
         for channel in rows {
-            let last_post = last_dates
-                .get(&channel.id)
-                .and_then(|d| d.as_deref())
-                .unwrap_or("—");
-            out.push_str(&format!(
-                "{} {} — id {}, {}, cursor {}, last post {}{}\n",
-                if channel.enabled { "✅" } else { "⛔" },
-                channel.title,
-                channel.id,
-                channel
-                    .username
-                    .as_ref()
-                    .map(|u| format!("@{u}"))
-                    .unwrap_or_else(|| "private".into()),
-                channel.last_msg_id,
-                last_post,
-                channel
-                    .last_error
-                    .as_ref()
-                    .map(|e| format!("\n   error: {e}"))
-                    .unwrap_or_default(),
-            ));
+            let mark = if channel.enabled { "✅" } else { "⛔" };
+            let username = format_username(channel.username.as_deref());
+            let error = channel
+                .last_error
+                .as_ref()
+                .map(|e| format!("\n   error: {e}"))
+                .unwrap_or_default();
+            if details {
+                let last_post = last_dates
+                    .get(&channel.id)
+                    .and_then(|d| d.as_deref())
+                    .unwrap_or("—");
+                out.push_str(&format!(
+                    "{mark} {} — id {}, {username}, cursor {}, last post {last_post}{error}\n",
+                    channel.title, channel.id, channel.last_msg_id,
+                ));
+            } else {
+                out.push_str(&format!(
+                    "{mark} {} — id {}, {username}{error}\n",
+                    channel.title, channel.id,
+                ));
+            }
         }
     }
     Ok(out)
@@ -1155,18 +1165,15 @@ async fn resolve_new_channel(runner: &Arc<Runner>, arg: &str) -> Result<channels
 /// Commands that can take a long time: they read channels, call the model or send a
 /// digest. The bot answers them with a "working on it" note first.
 fn is_slow(text: &str) -> bool {
-    matches!(
-        command_name(text),
-        "/run"
-            | "/reread"
-            | "/resume"
-            | "/last"
-            | "/skip"
-            | "/add"
-            | "/refresh"
-            | "/list"
-            | "/fallback"
-    )
+    match command_name(text) {
+        "/run" | "/reread" | "/resume" | "/last" | "/skip" | "/add" | "/refresh" | "/fallback" => {
+            true
+        }
+        "/list" => text
+            .split_once(char::is_whitespace)
+            .is_some_and(|(_, arg)| arg.trim().eq_ignore_ascii_case("details")),
+        _ => false,
+    }
 }
 
 /// The command without its argument and without the bot name that Telegram may
