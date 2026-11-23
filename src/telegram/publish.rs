@@ -199,7 +199,7 @@ pub async fn send_photos(
             allow_paid_stars: None,
             suggested_post: None,
         };
-        return outcome(client.invoke(&request).await);
+        return photo_outcome(client.invoke(&request).await);
     }
 
     // An album takes only photos that are already on the server: each one goes
@@ -219,7 +219,7 @@ pub async fn send_photos(
             Ok(other) => {
                 return SendOutcome::Rejected(format!("unexpected upload answer: {other:?}"))
             }
-            Err(e) => return outcome(Err(e)),
+            Err(e) => return photo_outcome(Err(e)),
         };
         let (message, entities) = if pos == 0 {
             (message.clone(), entities.clone())
@@ -263,7 +263,30 @@ pub async fn send_photos(
         effect: None,
         allow_paid_stars: None,
     };
-    outcome(client.invoke(&request).await)
+    photo_outcome(client.invoke(&request).await)
+}
+
+/// Errors that say Telegram does not accept a photo file. Telegram sent nothing
+/// with this `random_id`, so the part can go as text without a duplicate.
+const BAD_PHOTO_ERRORS: &[&str] = &[
+    "IMAGE_PROCESS_FAILED",
+    "PHOTO_INVALID_DIMENSIONS",
+    "PHOTO_SAVE_FILE_INVALID",
+    "PHOTO_EXT_INVALID",
+    "PHOTO_CROP_SIZE_SMALL",
+    "PHOTO_CROP_FILE_MISSING",
+    "MEDIA_INVALID",
+    "MEDIA_EMPTY",
+];
+
+/// Like `outcome`, but a bad photo is `PhotosLost`: the part goes as text.
+fn photo_outcome(result: Result<tl::enums::Updates, InvocationError>) -> SendOutcome {
+    if let Err(InvocationError::Rpc(rpc)) = &result {
+        if BAD_PHOTO_ERRORS.iter().any(|name| rpc.is(name)) {
+            return SendOutcome::PhotosLost(format!("Telegram refused the photo: {}", rpc.name));
+        }
+    }
+    outcome(result)
 }
 
 /// What an answer of Telegram to a send means for the delivery.
