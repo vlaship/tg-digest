@@ -19,7 +19,7 @@ use crate::config::{Config, Prompts, Theme};
 use crate::db::{self, Db, NewChunk, Run};
 use crate::digest::{self, RenderOptions};
 use crate::models::Catalog;
-use crate::summarize::{ApiError, ApiErrorKind, Summarizer};
+use crate::summarize::{ApiError, ApiErrorKind, Summarizer, MIN_POSTS_FOR_CHECK, MIN_TOPICS};
 use crate::telegram::bot::Bot;
 use crate::telegram::{channels, client as tg, photos, publish};
 
@@ -664,7 +664,7 @@ impl Runner {
         // cursors stay, so the posts go into the next run.
         // It goes through `fail` like any other run error: a plain `Err` here would
         // leave the run in `collecting` and stop the daemon on a cron trigger.
-        if collected.posts.len() >= MIN_POSTS_FOR_CHECK && digest.topics.len() < 2 {
+        if collected.posts.len() >= MIN_POSTS_FOR_CHECK && digest.topics.len() < MIN_TOPICS {
             let error = anyhow!(
                 "the model gave {} topic(s) for {} posts (output tokens: {}). \
                  The answer looks broken, so nothing is posted. Try again or switch \
@@ -970,8 +970,6 @@ pub fn theme_span(tag: &str) -> tracing::Span {
 
 /// How much of each old topic goes into the prompt: enough to know the story.
 const PREVIOUS_TOPIC_CHARS: usize = 300;
-/// From this many posts, an answer with fewer than two topics is taken as broken.
-const MIN_POSTS_FOR_CHECK: usize = 30;
 
 /// "Title — start of the text" of one topic, for the next run.
 fn short_topic(title: &str, summary: &str) -> String {
