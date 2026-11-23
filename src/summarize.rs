@@ -19,6 +19,18 @@ pub const ANTHROPIC_VERSION: &str = "2023-06-01";
 const MAX_ATTEMPTS: u32 = 4;
 /// How many times we ask the model when its answer is broken (`Digest::defect`).
 const MAX_BROKEN_ANSWERS: u32 = 2;
+/// From this many posts, an answer with fewer than `MIN_TOPICS` topics is taken as broken.
+pub const MIN_POSTS_FOR_CHECK: usize = 30;
+pub const MIN_TOPICS: usize = 2;
+
+/// The fewest topics a good answer has for this many posts.
+fn min_topics_for(posts: usize) -> usize {
+    if posts >= MIN_POSTS_FOR_CHECK {
+        MIN_TOPICS
+    } else {
+        0
+    }
+}
 /// Extra answer tokens on a stub retry. Low effort alone still returned a stub
 /// when reasoning was almost the whole output: about 1700 reasoning tokens and
 /// one empty topic. 16000 is enough for a long digest after that thinking.
@@ -175,6 +187,10 @@ Answer with the JSON only.";
 /// Added on a second ask when the first answer had only stubs.
 const STUB_REPAIR: &str = "Your previous answer had empty title or summary fields. \
 Fill every title and every summary with real text. Empty strings are not allowed.";
+
+/// Added on a second ask when the first answer had too few topics for the posts.
+const TOO_FEW_REPAIR: &str = "Your previous answer had too few topics for this many posts. \
+Cover every distinct story with its own topic. Do not merge the whole input into one topic.";
 
 /// The prompts with `RULES` added to the system prompt and to the map step one,
 /// and `REMINDER` added to the end of the user prompt.
@@ -465,7 +481,13 @@ impl Summarizer {
         let mut batch = self.limits.batch;
         if chars <= self.limits.input {
             match self
-                .ask("digest", &prompts.system, &user_prompt, cancel)
+                .ask(
+                    "digest",
+                    &prompts.system,
+                    &user_prompt,
+                    min_topics_for(posts.len()),
+                    cancel,
+                )
                 .await
             {
                 Ok(summary) => return Ok(summary),
@@ -553,6 +575,7 @@ impl Summarizer {
                     &format!("map {number}/{total}"),
                     map_system,
                     &prompt,
+                    0,
                     cancel,
                 )
                 .await
@@ -618,7 +641,13 @@ impl Summarizer {
                     ReduceStep::Ready => {
                         ensure_fits(&reduce_prompt, partials.len(), self.limits)?;
                         match self
-                            .ask("final", &prompts.system, &reduce_prompt, cancel)
+                            .ask(
+                                "final",
+                                &prompts.system,
+                                &reduce_prompt,
+                                min_topics_for(posts.len()),
+                                cancel,
+                            )
                             .await
                         {
                             Ok(mut summary) => {
@@ -661,7 +690,13 @@ impl Summarizer {
                         }
                         ensure_fits(&reduce_prompt, partials.len(), self.limits)?;
                         match self
-                            .ask("final", &prompts.system, &reduce_prompt, cancel)
+                            .ask(
+                                "final",
+                                &prompts.system,
+                                &reduce_prompt,
+                                min_topics_for(posts.len()),
+                                cancel,
+                            )
                             .await
                         {
                             Ok(mut summary) => {
@@ -718,6 +753,7 @@ impl Summarizer {
                         &format!("reduce {stage}: {number}/{total}"),
                         map_system,
                         &prompt,
+                        0,
                         cancel,
                     )
                     .await
@@ -763,16 +799,26 @@ impl Summarizer {
     /// covers that.
     /// `step` only goes to the log: which request this is (`digest`, `map 3/15`,
     /// `reduce 1: 2/4`, `final`).
-    async fn ask(&self, step: &str, system: &str, user: &str, cancel: &Cancel) -> Result<Summary> {
+    /// `min_topics`: fewer topics than this is a broken answer too (`0`: no check).
+    /// After the last try the short answer is returned as it is, and the run decides.
+    async fn ask(
+        &self,
+        step: &str,
+        system: &str,
+        user: &str,
+        min_topics: usize,
+        cancel: &Cancel,
+    ) -> Result<Summary> {
         // A broken answer (see `Digest::defect`) is asked again once. The second
         // ask adds a repair line. On OpenRouter, reasoning stays on at low
         // effort. When reasoning used almost all output tokens, `max_tokens`
         // goes up too, so the JSON has room. If that answer is broken too, the
         // run fails and the cursors do not move.
         let mut attempt = 1;
+        let mut repair = STUB_REPAIR;
         loop {
             let user_prompt = if attempt > 1 {
-                format!("{user}\n\n{STUB_REPAIR}")
+                format!("{user}\n\n{repair}")
             } else {
                 user.to_string()
             };
@@ -828,6 +874,7 @@ impl Summarizer {
             // output. The retry then raises `max_tokens`. A broken JSON answer has
             // no usage here, so it only lowers effort.
             let mut reasoning_ate = None;
+            let mut too_few = false;
             let defect = match self.backend.parse(response) {
                 Ok(mut summary) => {
                     let before = summary.digest.topics.len();
@@ -840,20 +887,27 @@ impl Summarizer {
                         );
                     }
                     if !summary.digest.is_empty() {
-                        return Ok(summary);
-                    }
-                    if before == 0 {
-                        // A real empty list: quiet day, not a stub.
-                        return Ok(summary);
-                    }
-                    if let (Some(reasoning), Some(output)) =
-                        (summary.reasoning_tokens, summary.output_tokens)
-                    {
-                        if reasoning_ate_output(reasoning, output) {
-                            reasoning_ate = Some((reasoning, output));
+                        let kept = summary.digest.topics.len();
+                        if kept >= min_topics || attempt >= MAX_BROKEN_ANSWERS {
+                            return Ok(summary);
                         }
+                        too_few = true;
+                        format!("only {kept} topic(s), at least {min_topics} are expected")
+                    } else {
+                        // Every topic was a stub (or there were none, see below).
+                        if before == 0 {
+                            // A real empty list: quiet day, not a stub.
+                            return Ok(summary);
+                        }
+                        if let (Some(reasoning), Some(output)) =
+                            (summary.reasoning_tokens, summary.output_tokens)
+                        {
+                            if reasoning_ate_output(reasoning, output) {
+                                reasoning_ate = Some((reasoning, output));
+                            }
+                        }
+                        format!("all {before} topic(s) were stubs")
                     }
-                    format!("all {before} topic(s) were stubs")
                 }
                 // Not a digest at all: the same as a stub, one more try.
                 Err(e) => match e.downcast_ref::<BrokenAnswer>() {
@@ -861,6 +915,7 @@ impl Summarizer {
                     _ => return Err(e),
                 },
             };
+            repair = if too_few { TOO_FEW_REPAIR } else { STUB_REPAIR };
             if attempt >= MAX_BROKEN_ANSWERS {
                 bail!("the model answer is broken again ({defect}), nothing is posted");
             }
