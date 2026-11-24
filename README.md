@@ -6,8 +6,9 @@ model set in the config, and posts the digest back to Telegram on a schedule.
 - **Reading.** It uses MTProto with your personal account (`grammers`). So it can
   read any channel you follow, including private channels from an invite link.
 - **Summary.** It calls the model you set in `model` (Anthropic, Gemini,
-  OpenRouter or OpenAI). Posts are grouped by topic. If several channels write
-  about the same event, they become one item with a list of sources.
+  OpenRouter, OpenAI, or an agent CLI by subscription). Posts are grouped by
+  topic. If several channels write about the same event, they become one item
+  with a list of sources.
 - **Bot.** You talk to your own Telegram bot: you write commands to it, and it
   sends you the replies, the digests and the notifications. It can also post the
   digest to your channel. Only your account may give it commands.
@@ -74,9 +75,42 @@ Two short forms are in the `Makefile`:
 
 - `make update` — `docker compose pull`, `up -d`, then follow the logs;
 - `make restart` — restart the container (it reads `data/config.toml` again),
-  then follow the logs.
+  then follow the logs;
+- `make update-agents` — install or update agent CLIs into `data/` (Node tools
+  under `data/tools`, other installers under `data/.local/bin`).
 
 `Ctrl+C` stops following the logs, the container keeps running.
+
+### Agent CLI provider (`cli`)
+
+Use a subscription CLI instead of a paid API key. Set `model = "cli/<preset>"`
+or `cli/<preset>/<model>` and uncomment a preset under `[providers.cli.presets]`
+in `config.toml` (see `config.example.toml`). The image has Node.js; the CLIs
+themselves live in the volume:
+
+```powershell
+docker compose run --rm tg-digest agents install claude
+docker compose run --rm -it tg-digest exec claude setup-token
+```
+
+Put the token into the preset `env` when the CLI needs it (for example
+`CLAUDE_CODE_OAUTH_TOKEN`). Other CLIs store login files under `/data`. Those
+files give access to the subscription — keep them private like `tg.session`.
+
+Every enabled preset must turn off all tools (file read, shell, network, MCP).
+A read-only mode is not enough: a channel post can ask the agent to read
+`/data/tg.session`. Presets that cannot do that stay commented with a WARNING.
+Before publish, the service also refuses a digest that contains a secret from
+`config.toml`.
+
+Compose sets `mem_limit: 1g` because Node CLIs share the container. Without
+`cli` models, 128m is enough. `opencode` with `--standalone` starts its own
+server per request; map-reduce can use more memory and grows
+`/data/.local/share/opencode/opencode.db` (sessions are archived, not deleted).
+
+On Windows, a local `run --dry-run` that times out or is cancelled may leave
+child CLI processes; the supported path is the Linux container (process group
+kill).
 
 Stopping (`docker stop`) is safe. Collecting posts and the model request stop at
 once. The current part of the digest is sent to the end. Anything not delivered
@@ -149,7 +183,8 @@ Fill in `config.toml`:
    list; a `[providers.<provider>.models."<model id>"]` table only changes them by hand.
    Providers: `anthropic`, `gemini` (key from <https://aistudio.google.com/apikey>),
    `openrouter` (key from <https://openrouter.ai/keys>), `openai` (key from
-   <https://platform.openai.com/api-keys>; a ChatGPT subscription gives no API access).
+   <https://platform.openai.com/api-keys>; a ChatGPT subscription gives no API access),
+   or `cli` (agent CLI by subscription — see "Agent CLI provider" above).
 
 `telegram.destination = "bot"` (the default) sends the digests to the chat with
 the bot. To post to your channel instead, set `"@your_channel"` and make the bot

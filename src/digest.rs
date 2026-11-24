@@ -172,6 +172,40 @@ pub fn response_schema() -> Value {
 /// and the link check drops the address if the model copies it.
 pub const ANSWER_SHAPE: &str = r#"{"topics":[{"title":"Headline of the event","summary":"What happened, in 1-3 sentences.","sources":[{"channel":"Channel name","url":"https://t.me/channel/123"}]}]}"#;
 
+/// Schema text put into a prompt when the model has no strict JSON schema flag
+/// (OpenRouter `json_object`, and every `cli` request).
+pub fn schema_in_prompt() -> String {
+    format!(
+        "Answer with JSON only, no other text. \
+         The JSON must match this JSON schema:\n{}\n\n\
+         The shape of the answer (the values here are not real):\n{}",
+        response_schema(),
+        ANSWER_SHAPE
+    )
+}
+
+/// True when the digest text (titles, summaries, source fields) contains any of
+/// the secrets. Returns the secret index; the secret itself is not logged.
+pub fn find_secret(digest: &Digest, secrets: &[String]) -> Option<usize> {
+    if secrets.is_empty() {
+        return None;
+    }
+    for topic in &digest.topics {
+        for (i, secret) in secrets.iter().enumerate() {
+            if topic.title.contains(secret)
+                || topic.summary.contains(secret)
+                || topic
+                    .sources
+                    .iter()
+                    .any(|s| s.channel.contains(secret) || s.url.contains(secret))
+            {
+                return Some(i);
+            }
+        }
+    }
+    None
+}
+
 /// We drop from the answer everything that was not in the input posts.
 ///
 /// The prompt says "do not make up URLs", but a request is not a check. This is also
@@ -706,4 +740,38 @@ pub(crate) fn escape(s: &str) -> String {
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
+}
+
+#[cfg(test)]
+mod secret_tests {
+    use super::*;
+
+    #[test]
+    fn find_secret_in_summary() {
+        let digest = Digest {
+            topics: vec![Topic {
+                title: "News".into(),
+                summary: "token 123456:ABCDEFGHIJKLMNOPQRST leaked".into(),
+                sources: vec![],
+            }],
+        };
+        let secrets = vec!["123456:ABCDEFGHIJKLMNOPQRST".into()];
+        assert_eq!(find_secret(&digest, &secrets), Some(0));
+    }
+
+    #[test]
+    fn find_secret_misses_clean_digest() {
+        let digest = Digest {
+            topics: vec![Topic {
+                title: "News".into(),
+                summary: "nothing secret here".into(),
+                sources: vec![Source {
+                    channel: "Chan".into(),
+                    url: "https://t.me/c/1".into(),
+                }],
+            }],
+        };
+        let secrets = vec!["123456:ABCDEFGHIJKLMNOPQRST".into()];
+        assert_eq!(find_secret(&digest, &secrets), None);
+    }
 }

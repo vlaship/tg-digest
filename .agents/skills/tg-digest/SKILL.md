@@ -39,12 +39,14 @@ Working config: `config.toml` (not `config.example.toml`). If it is missing, cop
 the example and name the fields the owner must fill in: `telegram.app.api_id`,
 `telegram.app.api_hash`, `telegram.app.phone`, `telegram.bot.token` (from
 @BotFather), and `api_key` of each provider in `[providers]` that `model` or
-`fallback` uses. Channels are not in the config: the owner adds them with `/add` in
-the chat with the bot. The owner must send the bot `/start` once, or the bot
-cannot write to them.
+`fallback` uses (except `cli`, which has no key). For `cli/<preset>`, install the
+CLI with `agents install` and log in with `exec` (see README). Channels are not
+in the config: the owner adds them with `/add` in the chat with the bot. The
+owner must send the bot `/start` once, or the bot cannot write to them.
 
-**Never print the content of `config.toml`, `tg.session`, `bot.session` or `digest.db`
-to a log or a reply** — they hold keys, account access and digest texts.
+**Never print the content of `config.toml`, `tg.session`, `bot.session`, CLI login
+files under `data/`, or `digest.db` to a log or a reply** — they hold keys,
+account access, subscription access and digest texts.
 
 ## Order for checking changes
 

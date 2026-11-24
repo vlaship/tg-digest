@@ -31,8 +31,9 @@ Enforce strict Controlled Technical Language across all responses:
 | `src/telegram/bot.rs` | the bot: login with the token, the chat with the owner, notifications |
 | `src/telegram/commands.rs` | commands to the bot (`/add`, `/rm`, `/run`, `/status`, …), only from the owner |
 | `src/models.rs` | the model catalog: each provider's model list and limits from its API, kept in `settings` |
-| `src/summarize.rs` | HTTP calls to the model API (Anthropic, Gemini, OpenRouter or OpenAI, `[providers]`), map-reduce |
-| `src/digest.rs` | JSON schema of the answer, link checks, Telegram-HTML rendering, splitting |
+| `src/summarize.rs` | model calls (HTTP APIs or `cli` agent presets), map-reduce |
+| `src/digest.rs` | JSON schema of the answer, link checks, secret scan, Telegram-HTML rendering, splitting |
+| `scripts/agents.sh` | install/update agent CLIs into the `/data` volume (`agents` entrypoint) |
 | `Dockerfile`, `compose.yaml` | image and run; all state is in the `/data` volume |
 
 - `config.example.toml` is the config template.
@@ -71,7 +72,9 @@ words.
 
 **Secrets.** `config.toml` and `tg.session` are in `.gitignore` and must stay
 there. `tg.session` gives full access to the Telegram account — it is not "just a
-cache". Only `config.example.toml` goes into the repository. All settings, the
+cache". CLI login files under `/data` (for example `.claude`, `.codex`,
+`.local/share/opencode`) give access to the subscription; keep them out of git
+the same way. Only `config.example.toml` goes into the repository. All settings, the
 secrets too, come only from `config.toml` (in a container: `data/config.toml`,
 mounted as `/data`); there are no environment overrides. When you add a setting,
 add it to the example too. When you add a module, add it to the table above.
@@ -115,7 +118,15 @@ takes `handle`, updates come from `pool.updates`. The session is
 <https://docs.rs/grammers-client/0.10.0/>. Do not trust memory or examples from
 search — almost all of them use the old API.
 
-**Model providers.** `[providers.<provider>]` has the key and shared settings. No model id is written in the code, and models do not have to be in the config: the limits (input, output, strict JSON schema) come from the provider's model list (`models.rs`, read once a day, kept in `settings`). `[providers.<provider>.models."<model id>"]` only changes a setting by hand; the order is model table, model list, provider table, defaults. A model the provider does not have is refused at `/model`, not found as a 404 in a run. A provider is `anthropic`, `gemini`, `openrouter` or `openai`. OpenAI uses the chat format of OpenRouter, but with `max_completion_tokens`, a strict schema, and `reasoning_effort` only when `effort` is set. `model` and `fallback` name models as `provider/model id` (only the first `/` splits, OpenRouter ids have their own). When the model is overloaded (5xx after the retries) or its limit is used up, the bot tells the owner in plain words and offers `/fallback` (the next model in `fallback`). A `/run` gets this text as the reply, not as a second message. Nothing switches by itself. The choice is kept in the `settings` table (`/model`), so the config value is only the default.
+**Model providers.** `[providers.<provider>]` has the key and shared settings. No model id is written in the code, and models do not have to be in the config: the limits (input, output, strict JSON schema) come from the provider's model list (`models.rs`, read once a day, kept in `settings`). `[providers.<provider>.models."<model id>"]` only changes a setting by hand; the order is model table, model list, provider table, defaults. A model the provider does not have is refused at `/model`, not found as a 404 in a run. A provider is `anthropic`, `gemini`, `openrouter`, `openai` or `cli`. OpenAI uses the chat format of OpenRouter, but with `max_completion_tokens`, a strict schema, and `reasoning_effort` only when `effort` is set. `model` and `fallback` name models as `provider/model id` (only the first `/` splits, OpenRouter ids have their own). When the model is overloaded (5xx after the retries) or its limit is used up, the bot tells the owner in plain words and offers `/fallback` (the next model in `fallback`). A `/run` gets this text as the reply, not as a second message. Nothing switches by itself. The choice is kept in the `settings` table (`/model`), so the config value is only the default.
+
+The `cli` provider is the exception. It runs an agent CLI by subscription
+(`[providers.cli.presets.<preset>]`, model `cli/<preset>/<model>`). It has
+no key and no model list from an API: the preset gives the command and the
+limits, and `allowed_models` (if set) is the list for `/model`. Every
+enabled preset must turn off all tools of the CLI, MCP tools too; a
+read-only mode is not enough. A CLI that cannot do this stays commented
+out in `config.example.toml`, with a WARNING.
 
 **Anthropic API.** The model id comes from the config as it is. Do not add a date
 suffix. On `claude-opus-5` thinking is on by default — do not send `thinking`,

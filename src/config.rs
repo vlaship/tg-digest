@@ -7,7 +7,7 @@
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use crate::models::Entry;
@@ -256,7 +256,7 @@ pub enum CliOutput {
 }
 
 /// One CLI preset: the command, how to read the answer, and the limits.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct CliPreset {
     pub command: Vec<String>,
     /// Appended only when the model key names a CLI model (`cli/<preset>/<model>`).
@@ -308,6 +308,8 @@ pub struct CliPreset {
 pub struct CliCall {
     pub preset: String,
     pub model: Option<String>,
+    /// Full preset: the command and how to read the answer.
+    pub config: CliPreset,
 }
 
 /// Split the rest of a `cli/<rest>` key into preset and optional model.
@@ -347,7 +349,7 @@ pub struct Model {
 }
 
 /// Settings that a model can have, or take from its provider.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Clone, Deserialize)]
 pub struct ModelSettings {
     pub max_tokens: Option<u32>,
     /// Above this the input is condensed in parts (map-reduce).
@@ -542,9 +544,10 @@ impl Config {
         if provider_name == "cli" {
             let (preset, model) = split_cli_key(rest);
             let provider = &self.providers["cli"];
-            let preset_cfg = provider.presets.get(preset).with_context(|| {
-                format!("there is no [providers.cli.presets.{preset}]")
-            })?;
+            let preset_cfg = provider
+                .presets
+                .get(preset)
+                .with_context(|| format!("there is no [providers.cli.presets.{preset}]"))?;
             if let Some(model) = model {
                 if preset_cfg.model_args.is_empty() {
                     bail!(
@@ -605,6 +608,7 @@ impl Config {
             let call = CliCall {
                 preset: preset_name,
                 model: cli_model,
+                config: preset.clone(),
             };
             return Ok(ModelSpec {
                 key: key.to_string(),
@@ -725,24 +729,21 @@ impl Config {
     /// model tables, and for each CLI preset `cli/<preset>` plus each
     /// `allowed_models` entry.
     pub fn model_keys(&self) -> Vec<String> {
-        let tables = self.providers.iter().flat_map(|(provider, p)| {
-            p.models.keys().map(move |m| format!("{provider}/{m}"))
-        });
-        let cli_keys = self
+        let tables = self
             .providers
-            .get("cli")
-            .into_iter()
-            .flat_map(|p| {
-                p.presets.iter().flat_map(|(name, preset)| {
-                    let base = format!("cli/{name}");
-                    let models = preset
-                        .allowed_models
-                        .iter()
-                        .flatten()
-                        .map(move |m| format!("cli/{name}/{m}"));
-                    std::iter::once(base).chain(models)
-                })
-            });
+            .iter()
+            .flat_map(|(provider, p)| p.models.keys().map(move |m| format!("{provider}/{m}")));
+        let cli_keys = self.providers.get("cli").into_iter().flat_map(|p| {
+            p.presets.iter().flat_map(|(name, preset)| {
+                let base = format!("cli/{name}");
+                let models = preset
+                    .allowed_models
+                    .iter()
+                    .flatten()
+                    .map(move |m| format!("cli/{name}/{m}"));
+                std::iter::once(base).chain(models)
+            })
+        });
         let mut keys: Vec<String> = Vec::new();
         for key in std::iter::once(self.model.clone())
             .chain(self.fallback.iter().cloned())
@@ -786,6 +787,11 @@ impl Config {
         }
         let (preset, _) = split_cli_key(rest);
         self.providers.get("cli")?.presets.get(preset)
+    }
+
+    /// Path of the agents lock file inside `data_dir`.
+    pub fn agents_lock_path(&self) -> PathBuf {
+        Path::new(&self.data_dir).join("agents.lock")
     }
 
     /// We catch empty required fields here, not on the first network call:
@@ -999,13 +1005,12 @@ fn validate_cli_presets(cli: &Provider) -> Result<()> {
                 }
             }
         }
-        if preset.output == CliOutput::Events {
-            if preset.event_type.is_none()
+        if preset.output == CliOutput::Events
+            && (preset.event_type.is_none()
                 || preset.answer_event.is_none()
-                || preset.answer.is_none()
-            {
-                bail!("{path}: output = \"events\" needs event_type, answer_event and answer");
-            }
+                || preset.answer.is_none())
+        {
+            bail!("{path}: output = \"events\" needs event_type, answer_event and answer");
         }
         if preset.usage_event.is_some()
             && preset.input_tokens.is_none()
@@ -1243,7 +1248,10 @@ env = { SHORT = "tiny", LONG = "sixteen-chars-ok" }
         )
         .unwrap();
         let secrets = cfg.secrets();
-        assert!(secrets.iter().any(|s| s == "sixteen-chars-ok"), "{secrets:?}");
+        assert!(
+            secrets.iter().any(|s| s == "sixteen-chars-ok"),
+            "{secrets:?}"
+        );
         assert!(!secrets.iter().any(|s| s == "tiny"));
         assert!(secrets.iter().any(|s| s == "123456:ABCDEFGHIJKLMNOPQRST"));
     }

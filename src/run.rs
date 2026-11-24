@@ -626,7 +626,7 @@ impl Runner {
             .catalog
             .spec(&self.model().await)
             .await
-            .and_then(|model| Summarizer::new(&model))
+            .and_then(|model| Summarizer::new(&model, self.cfg.data_dir.as_str()))
         {
             Ok(s) => s,
             Err(e) => return self.fail(run_id, trigger, theme, e).await,
@@ -649,6 +649,16 @@ impl Runner {
 
         let mut digest = summary.digest;
         digest::drop_foreign_sources(&mut digest, &collected.posts);
+        if digest::find_secret(&digest, &self.cfg.secrets()).is_some() {
+            return self
+                .fail(
+                    run_id,
+                    trigger,
+                    theme,
+                    anyhow!("the answer contains a secret from config.toml; nothing is posted"),
+                )
+                .await;
+        }
 
         let chunks = digest::render_parts(
             &digest,
@@ -910,7 +920,7 @@ impl Runner {
             return format!("⚠️ The digest is not built: {short}\n{KEPT}");
         };
 
-        let api = api_error.api;
+        let api = api_error.api.as_ref();
         let current = self.model().await;
         let fallback = self.next_fallback().await;
         let switch = |otherwise: &str| match &fallback {
@@ -937,6 +947,21 @@ impl Runner {
                 "⚠️ {api} is overloaded and did not answer, the digest is not built.\n{KEPT}{says}\n\n{}",
                 switch("Send /run later to try again, or switch the model with /model.")
             ),
+            ApiErrorKind::Auth if api_error.provider == crate::config::ProviderKind::Cli => {
+                let preset = current
+                    .strip_prefix("cli/")
+                    .and_then(|rest| rest.split('/').next())
+                    .unwrap_or("cli");
+                let how = match &api_error.login {
+                    Some(login) => format!(
+                        "Run: docker compose run --rm -it tg-digest exec {login}"
+                    ),
+                    None => format!("Log in to the CLI {preset} (see README)"),
+                };
+                format!(
+                    "⚠️ The CLI {preset} is not logged in, the digest is not built.\n{KEPT}{says}\n\n{how}"
+                )
+            }
             ApiErrorKind::Auth => format!(
                 "⚠️ {api} did not accept the API key, the digest is not built.\n{KEPT}{says}\n\n\
                  Check providers.{}.api_key in config.toml.",

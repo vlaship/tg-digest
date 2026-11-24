@@ -29,27 +29,41 @@ ARG GIT_SHA=""
 # The file time must change, or cargo reuses the stub.
 RUN touch src/main.rs && cargo build --release --locked
 
+# Node 22 LTS for agent CLIs installed into the volume (not into this image).
+# Bookworm apt still has Node 18 (EOL); CLIs need 20+.
+FROM node:22-bookworm-slim@sha256:e9f565d32859f0cbfb52125eafe8be39390f24dac302dc3cdf566e8ba3ab21ee AS node
+
 FROM debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
+    && apt-get install -y --no-install-recommends ca-certificates curl util-linux \
     && rm -rf /var/lib/apt/lists/* \
     && echo 'digest:x:1000:1000::/data:/bin/sh' >> /etc/passwd \
     && echo 'digest:x:1000:' >> /etc/group \
     && mkdir -p /data \
     && chown 1000:1000 /data
 
-# All working files are in the volume: config.toml, tg.session, digest.db.
+# Node + npm from the official image (not apt). CLIs themselves live in /data.
+COPY --from=node /usr/local/bin/node /usr/local/bin/node
+COPY --from=node /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/npm
+RUN ln -sf ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
+    && ln -sf ../lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx
+
+# All working files are in the volume: config.toml, tg.session, digest.db,
+# and agent CLIs under /data/tools and /data/.local.
 VOLUME /data
 WORKDIR /data
 
 COPY --from=build /src/target/release/tg-digest /usr/local/bin/tg-digest
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+COPY scripts/agents.sh /usr/local/bin/agents
 # The entrypoint starts as root only to pick the user. A mounted volume keeps
 # the host owner, and the process runs as that owner. When /data belongs to
 # root, it is given to user digest (uid 1000).
-RUN chmod 755 /usr/local/bin/docker-entrypoint.sh
+RUN chmod 755 /usr/local/bin/docker-entrypoint.sh /usr/local/bin/agents
 
-# Docker collects the logs, so we write to stdout without buffering.
-ENV RUST_LOG=tg_digest=info,warn
+# HOME=/data so CLI login files land on the volume. PATH puts volume bins first.
+ENV RUST_LOG=tg_digest=info,warn \
+    HOME=/data \
+    PATH=/data/tools/bin:/data/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 CMD ["serve"]
