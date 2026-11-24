@@ -653,6 +653,18 @@ impl Summarizer {
                             Ok(mut summary) => {
                                 summary.input_tokens = add(input_tokens, summary.input_tokens);
                                 summary.output_tokens = add(output_tokens, summary.output_tokens);
+                                if collapsed(&summary, &partials, posts.len()) {
+                                    tracing::warn!(
+                                        topics = summary.digest.topics.len(),
+                                        parts = partials.len(),
+                                        "the final answer has too few topics, keeping the condensed parts as the digest"
+                                    );
+                                    return Ok(keep_partials(
+                                        partials,
+                                        summary.input_tokens,
+                                        summary.output_tokens,
+                                    ));
+                                }
                                 return Ok(summary);
                             }
                             Err(e)
@@ -702,6 +714,18 @@ impl Summarizer {
                             Ok(mut summary) => {
                                 summary.input_tokens = add(input_tokens, summary.input_tokens);
                                 summary.output_tokens = add(output_tokens, summary.output_tokens);
+                                if collapsed(&summary, &partials, posts.len()) {
+                                    tracing::warn!(
+                                        topics = summary.digest.topics.len(),
+                                        parts = partials.len(),
+                                        "the final answer has too few topics, keeping the condensed parts as the digest"
+                                    );
+                                    return Ok(keep_partials(
+                                        partials,
+                                        summary.input_tokens,
+                                        summary.output_tokens,
+                                    ));
+                                }
                                 return Ok(summary);
                             }
                             Err(e)
@@ -1042,6 +1066,15 @@ enum ReduceStep<'a> {
     Compress(Vec<&'a [Digest]>),
     /// Nothing more to split or the rounds are used up: `ensure_fits` decides.
     Stuck,
+}
+
+/// The final answer has far fewer topics than the posts need, but the part
+/// summaries have enough: the model squeezed them into one story. The parts are
+/// better than that answer.
+fn collapsed(summary: &Summary, partials: &[Digest], posts: usize) -> bool {
+    let min = min_topics_for(posts);
+    let parts: usize = partials.iter().map(|d| d.topics.len()).sum();
+    summary.digest.topics.len() < min && parts >= min
 }
 
 /// Join already-condensed part summaries into one digest when the final answer
