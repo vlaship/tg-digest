@@ -158,10 +158,22 @@ pub enum ProviderKind {
     /// OpenAI API (`platform.openai.com`), paid per use. A ChatGPT subscription gives
     /// no API access.
     OpenAI,
+    /// An agent CLI by subscription: no HTTP API key. The command lives in
+    /// `[providers.cli.presets.<preset>]`.
+    Cli,
 }
 
 /// All model providers the service knows, as they are written in the config.
-pub const PROVIDERS: [&str; 4] = ["anthropic", "gemini", "openrouter", "openai"];
+pub const PROVIDERS: [&str; 5] = ["anthropic", "gemini", "openrouter", "openai", "cli"];
+
+/// Flags that auto-approve tools. A preset with any of them is refused at start.
+const DANGEROUS_CLI_FLAGS: &[&str] = &[
+    "--auto",
+    "--yolo",
+    "--force",
+    "--dangerously-skip-permissions",
+    "--dangerously-bypass-approvals-and-sandbox",
+];
 
 impl ProviderKind {
     fn from_name(name: &str) -> Option<Self> {
@@ -170,6 +182,7 @@ impl ProviderKind {
             "gemini" => Some(Self::Gemini),
             "openrouter" => Some(Self::OpenRouter),
             "openai" => Some(Self::OpenAI),
+            "cli" => Some(Self::Cli),
             _ => None,
         }
     }
@@ -181,6 +194,7 @@ impl ProviderKind {
             Self::Gemini => "Gemini",
             Self::OpenRouter => "OpenRouter",
             Self::OpenAI => "OpenAI",
+            Self::Cli => "CLI",
         }
     }
 
@@ -193,6 +207,8 @@ impl ProviderKind {
             }
             Self::OpenRouter => "https://openrouter.ai/api/v1/chat/completions",
             Self::OpenAI => "https://api.openai.com/v1/chat/completions",
+            // Not used: the cli provider has no HTTP API.
+            Self::Cli => "",
         }
     }
 
@@ -200,6 +216,7 @@ impl ProviderKind {
     /// with `effort = "high"` uses the same limit as the answer, and 16000 was cut on
     /// 156k characters of input; only the used tokens are billed. Others: a digest is
     /// never that long, and some OpenRouter hosts reserve the whole `max_tokens`.
+    /// For `cli` the value only feeds map-reduce budget math; it is not passed to the CLI.
     fn default_max_tokens(self) -> u32 {
         match self {
             Self::Anthropic => 64000,
@@ -208,6 +225,8 @@ impl ProviderKind {
     }
 
     /// Many OpenRouter models have a context of 128k tokens or less.
+    /// For `cli`, `validate` requires `max_input_chars` on the preset; this default
+    /// is unused.
     fn default_max_input_chars(self) -> usize {
         match self {
             Self::OpenRouter => 200_000,
@@ -221,7 +240,82 @@ impl ProviderKind {
             Self::Gemini => "https://aistudio.google.com/apikey",
             Self::OpenRouter => "https://openrouter.ai/keys",
             Self::OpenAI => "https://platform.openai.com/api-keys",
+            // `provider_access` for cli does not check a key.
+            Self::Cli => "",
         }
+    }
+}
+
+/// How the CLI writes its answer on stdout.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CliOutput {
+    #[default]
+    Json,
+    Events,
+}
+
+/// One CLI preset: the command, how to read the answer, and the limits.
+#[derive(Debug, Deserialize)]
+pub struct CliPreset {
+    pub command: Vec<String>,
+    /// Appended only when the model key names a CLI model (`cli/<preset>/<model>`).
+    #[serde(default)]
+    pub model_args: Vec<String>,
+    /// Extra argv after `model_args` when the CLI wants a stdin marker (often `"-"`).
+    #[serde(default)]
+    pub stdin_arg: Option<String>,
+    /// When set, `/model` and config checks refuse any other CLI model.
+    #[serde(default)]
+    pub allowed_models: Option<Vec<String>>,
+    #[serde(default)]
+    pub output: CliOutput,
+    /// JSON pointer to the answer (object or string). Not set: the whole stdout.
+    #[serde(default)]
+    pub answer: Option<String>,
+    #[serde(default)]
+    pub error: Option<String>,
+    #[serde(default)]
+    pub error_text: Option<String>,
+    #[serde(default)]
+    pub input_tokens: Option<String>,
+    #[serde(default)]
+    pub output_tokens: Option<String>,
+    #[serde(default)]
+    pub event_type: Option<String>,
+    /// Value matched against `event_type` for answer lines (`events` output).
+    #[serde(default)]
+    pub answer_event: Option<String>,
+    #[serde(default)]
+    pub usage_event: Option<String>,
+    #[serde(default)]
+    pub error_event: Option<String>,
+    /// Login command shown to the owner; never run by the daemon.
+    #[serde(default)]
+    pub login: Option<String>,
+    /// Env vars for the CLI process only.
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    #[serde(flatten)]
+    pub settings: ModelSettings,
+    /// Per-model overrides of the preset settings.
+    #[serde(default)]
+    pub models: BTreeMap<String, ModelSettings>,
+}
+
+/// Which preset (and optional CLI model) a `cli/...` key selected.
+#[derive(Debug, Clone)]
+pub struct CliCall {
+    pub preset: String,
+    pub model: Option<String>,
+}
+
+/// Split the rest of a `cli/<rest>` key into preset and optional model.
+/// Only the first `/` in `rest` splits; further slashes stay in the model id.
+pub fn split_cli_key(rest: &str) -> (&str, Option<&str>) {
+    match rest.split_once('/') {
+        Some((preset, model)) => (preset, Some(model)),
+        None => (rest, None),
     }
 }
 
@@ -236,6 +330,9 @@ pub struct Provider {
     pub settings: ModelSettings,
     #[serde(default)]
     pub models: BTreeMap<String, Model>,
+    /// CLI presets (`[providers.cli.presets.<name>]`). Empty for HTTP providers.
+    #[serde(default)]
+    pub presets: BTreeMap<String, CliPreset>,
 }
 
 /// One model of a provider. Settings not set here come from the provider.
@@ -298,6 +395,8 @@ pub struct ModelSpec {
     pub quantizations: Vec<String>,
     /// The model takes a strict JSON schema. When not, OpenRouter is asked for a JSON object.
     pub json_schema: bool,
+    /// Set only for `cli/<preset>` / `cli/<preset>/<model>`.
+    pub cli: Option<CliCall>,
 }
 
 /// One `[[themes]]` block.
@@ -413,7 +512,7 @@ impl Config {
     }
 
     /// The provider API and its key. Fails with a clear message if the provider is
-    /// unknown, not in the config, or has no key.
+    /// unknown, not in the config, or has no key. For `cli` the key may be empty.
     pub fn provider_access(&self, provider_name: &str) -> Result<(ProviderKind, String)> {
         let kind = ProviderKind::from_name(provider_name).with_context(|| {
             format!("unknown provider {provider_name:?}, it must be one of {PROVIDERS:?}")
@@ -422,7 +521,7 @@ impl Config {
             .providers
             .get(provider_name)
             .with_context(|| format!("there is no [providers.{provider_name}]"))?;
-        if provider.api_key.is_empty() {
+        if kind != ProviderKind::Cli && provider.api_key.is_empty() {
             bail!(
                 "providers.{provider_name}.api_key is not set (get it at {})",
                 kind.key_url()
@@ -433,27 +532,115 @@ impl Config {
 
     /// The provider and the model id in its API for `provider/model`. Only the first
     /// `/` splits: OpenRouter ids have their own (`openrouter/google/gemma-4-31b-it:free`).
+    /// For `cli`, the id is `<preset>` or `<preset>/<model>` as written.
     pub fn model_id(&self, key: &str) -> Result<(String, String)> {
-        let (provider_name, model_name) = key.split_once('/').with_context(|| {
+        let (provider_name, rest) = key.split_once('/').with_context(|| {
             format!("{key:?}: write the model as provider/model, for example anthropic/claude-haiku-5-5")
         })?;
         self.provider_access(provider_name)
             .with_context(|| key.to_string())?;
+        if provider_name == "cli" {
+            let (preset, model) = split_cli_key(rest);
+            let provider = &self.providers["cli"];
+            let preset_cfg = provider.presets.get(preset).with_context(|| {
+                format!("there is no [providers.cli.presets.{preset}]")
+            })?;
+            if let Some(model) = model {
+                if preset_cfg.model_args.is_empty() {
+                    bail!(
+                        "{key:?}: preset {preset:?} has empty model_args, so it cannot take a model"
+                    );
+                }
+                if let Some(allowed) = &preset_cfg.allowed_models {
+                    if !allowed.iter().any(|m| m == model) {
+                        bail!(
+                            "{key:?}: model {model:?} is not in allowed_models of preset {preset}"
+                        );
+                    }
+                }
+            }
+            return Ok((provider_name.to_string(), rest.to_string()));
+        }
         let id = self.providers[provider_name]
             .models
-            .get(model_name)
+            .get(rest)
             .and_then(|m| m.id.clone())
-            .unwrap_or_else(|| model_name.to_string());
+            .unwrap_or_else(|| rest.to_string());
         Ok((provider_name.to_string(), id))
     }
 
     /// A model with all its settings. Each setting comes from the first place that
     /// has it: the model table in the config, the provider list (`entry`, see
     /// `models.rs`), the provider table in the config, the defaults.
+    /// For `cli`: model table in the preset, the preset, `[providers.cli]`, defaults.
+    /// `entry` is always unused for `cli`.
     pub fn model(&self, key: &str, entry: Option<&Entry>) -> Result<ModelSpec> {
         let (provider_name, id) = self.model_id(key)?;
         let (kind, api_key) = self.provider_access(&provider_name)?;
         let provider = &self.providers[&provider_name];
+
+        if kind == ProviderKind::Cli {
+            let (preset_name, cli_model) = {
+                let (p, m) = split_cli_key(&id);
+                (p.to_string(), m.map(str::to_string))
+            };
+            let preset = &provider.presets[&preset_name];
+            let none = ModelSettings::default();
+            let m = cli_model
+                .as_deref()
+                .and_then(|name| preset.models.get(name))
+                .unwrap_or(&none);
+            let pre = &preset.settings;
+            let p = &provider.settings;
+            let max_tokens = m
+                .max_tokens
+                .or(pre.max_tokens)
+                .or(p.max_tokens)
+                .unwrap_or_else(|| kind.default_max_tokens());
+            let max_input_chars = m
+                .max_input_chars
+                .or(pre.max_input_chars)
+                .or(p.max_input_chars)
+                .unwrap_or_else(|| kind.default_max_input_chars());
+            let call = CliCall {
+                preset: preset_name,
+                model: cli_model,
+            };
+            return Ok(ModelSpec {
+                key: key.to_string(),
+                kind,
+                api_key,
+                api_url: String::new(),
+                id,
+                max_tokens,
+                max_input_chars,
+                request_timeout_secs: m
+                    .request_timeout_secs
+                    .or(pre.request_timeout_secs)
+                    .or(p.request_timeout_secs)
+                    .unwrap_or(600),
+                effort: m
+                    .effort
+                    .clone()
+                    .or_else(|| pre.effort.clone())
+                    .or_else(|| p.effort.clone())
+                    .unwrap_or_else(|| "high".into()),
+                effort_set: m
+                    .effort
+                    .clone()
+                    .or_else(|| pre.effort.clone())
+                    .or_else(|| p.effort.clone()),
+                reasoning: false,
+                can_reason: false,
+                reasoning_mandatory: false,
+                sort: None,
+                ignore: Vec::new(),
+                quantizations: Vec::new(),
+                json_schema: true,
+                cli: Some(call),
+            });
+        }
+
         let model_name = &key[provider_name.len() + 1..];
         let none = ModelSettings::default();
         let m = provider
@@ -530,26 +717,75 @@ impl Config {
                 .or_else(|| p.quantizations.clone())
                 .unwrap_or_default(),
             json_schema: entry.and_then(|e| e.json_schema).unwrap_or(true),
+            cli: None,
         })
     }
 
-    /// The models the config names, as `provider/model`: `model`, `fallback` and
-    /// the model tables, each once.
+    /// The models the config names, as `provider/model`: `model`, `fallback`, the
+    /// model tables, and for each CLI preset `cli/<preset>` plus each
+    /// `allowed_models` entry.
     pub fn model_keys(&self) -> Vec<String> {
-        let tables = self
+        let tables = self.providers.iter().flat_map(|(provider, p)| {
+            p.models.keys().map(move |m| format!("{provider}/{m}"))
+        });
+        let cli_keys = self
             .providers
-            .iter()
-            .flat_map(|(provider, p)| p.models.keys().map(move |m| format!("{provider}/{m}")));
+            .get("cli")
+            .into_iter()
+            .flat_map(|p| {
+                p.presets.iter().flat_map(|(name, preset)| {
+                    let base = format!("cli/{name}");
+                    let models = preset
+                        .allowed_models
+                        .iter()
+                        .flatten()
+                        .map(move |m| format!("cli/{name}/{m}"));
+                    std::iter::once(base).chain(models)
+                })
+            });
         let mut keys: Vec<String> = Vec::new();
         for key in std::iter::once(self.model.clone())
             .chain(self.fallback.iter().cloned())
             .chain(tables)
+            .chain(cli_keys)
         {
             if !keys.contains(&key) {
                 keys.push(key);
             }
         }
         keys
+    }
+
+    /// Secrets from the config that must not appear in a digest. Values shorter
+    /// than 16 characters are skipped (too many false matches).
+    pub fn secrets(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut push = |s: &str| {
+            if s.chars().count() >= 16 && !out.iter().any(|x| x == s) {
+                out.push(s.to_string());
+            }
+        };
+        for p in self.providers.values() {
+            push(&p.api_key);
+            for preset in p.presets.values() {
+                for v in preset.env.values() {
+                    push(v);
+                }
+            }
+        }
+        push(&self.telegram.bot.token);
+        push(&self.telegram.app.api_hash);
+        out
+    }
+
+    /// The CLI preset named by a `cli/...` model key, if any.
+    pub fn cli_preset(&self, key: &str) -> Option<&CliPreset> {
+        let (provider, rest) = key.split_once('/')?;
+        if provider != "cli" {
+            return None;
+        }
+        let (preset, _) = split_cli_key(rest);
+        self.providers.get("cli")?.presets.get(preset)
     }
 
     /// We catch empty required fields here, not on the first network call:
@@ -567,8 +803,12 @@ impl Config {
                 bail!("[providers.{name}]: unknown provider, it must be one of {PROVIDERS:?}");
             }
         }
+        if let Some(cli) = self.providers.get("cli") {
+            validate_cli_presets(cli)?;
+        }
         // Only the form and the key here: whether the provider has the model is
-        // checked against its list (`models.rs`).
+        // checked against its list (`models.rs`). For `cli`, `model_id` checks the
+        // preset and `allowed_models`.
         self.model(&self.model, None).context("model")?;
         for key in &self.fallback {
             self.model(key, None).context("fallback")?;
@@ -719,5 +959,292 @@ fn normalize_phone(raw: &str) -> String {
         format!("+{digits}")
     } else {
         digits
+    }
+}
+
+fn validate_cli_presets(cli: &Provider) -> Result<()> {
+    for (name, preset) in &cli.presets {
+        let path = format!("providers.cli.presets.{name}");
+        if preset.command.is_empty() {
+            bail!("{path}: command must not be empty");
+        }
+        if preset.settings.max_input_chars.is_none() {
+            bail!("{path}: max_input_chars must be set on the preset itself");
+        }
+        if preset.settings.request_timeout_secs.is_none() {
+            bail!("{path}: request_timeout_secs must be set on the preset itself");
+        }
+        for (label, value) in [
+            ("answer", &preset.answer),
+            ("error", &preset.error),
+            ("error_text", &preset.error_text),
+            ("input_tokens", &preset.input_tokens),
+            ("output_tokens", &preset.output_tokens),
+            ("event_type", &preset.event_type),
+        ] {
+            if let Some(p) = value {
+                if !is_json_pointer(p) {
+                    bail!("{path}: {label} = {p:?} is not a JSON pointer");
+                }
+            }
+        }
+        for (label, value) in [
+            ("answer_event", &preset.answer_event),
+            ("usage_event", &preset.usage_event),
+            ("error_event", &preset.error_event),
+        ] {
+            if let Some(v) = value {
+                if v.is_empty() {
+                    bail!("{path}: {label} must not be empty");
+                }
+            }
+        }
+        if preset.output == CliOutput::Events {
+            if preset.event_type.is_none()
+                || preset.answer_event.is_none()
+                || preset.answer.is_none()
+            {
+                bail!("{path}: output = \"events\" needs event_type, answer_event and answer");
+            }
+        }
+        if preset.usage_event.is_some()
+            && preset.input_tokens.is_none()
+            && preset.output_tokens.is_none()
+        {
+            bail!("{path}: usage_event needs input_tokens and/or output_tokens");
+        }
+        if preset.error_event.is_some() && preset.error_text.is_none() {
+            bail!("{path}: error_event needs error_text");
+        }
+        for arg in preset.command.iter().chain(preset.model_args.iter()) {
+            if DANGEROUS_CLI_FLAGS.iter().any(|f| arg == f) {
+                bail!("{path}: flag {arg:?} auto-approves tools and is not allowed");
+            }
+        }
+        if preset.model_args.is_empty() {
+            if preset.allowed_models.is_some() {
+                bail!(
+                    "{path}: empty model_args cannot be used with allowed_models \
+                     (there is nowhere to put the model)"
+                );
+            }
+        } else if !preset.model_args.iter().any(|a| a.contains("{model}")) {
+            bail!("{path}: model_args must contain {{model}} when it is not empty");
+        }
+    }
+    Ok(())
+}
+
+/// RFC 6901: empty, or starts with `/`, and `~` only as `~0` / `~1`.
+fn is_json_pointer(s: &str) -> bool {
+    if s.is_empty() {
+        return true;
+    }
+    if !s.starts_with('/') {
+        return false;
+    }
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'~' {
+            if i + 1 >= bytes.len() || !matches!(bytes[i + 1], b'0' | b'1') {
+                return false;
+            }
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn split_cli_key_preset_only() {
+        assert_eq!(split_cli_key("claude"), ("claude", None));
+    }
+
+    #[test]
+    fn split_cli_key_keeps_slashes_in_model() {
+        assert_eq!(
+            split_cli_key("opencode/anthropic/claude-sonnet-5-5"),
+            ("opencode", Some("anthropic/claude-sonnet-5-5"))
+        );
+    }
+
+    #[test]
+    fn answer_event_value_is_not_a_pointer() {
+        // Values like "text" must not be checked as JSON pointers.
+        assert!(!is_json_pointer("text"));
+        assert!(is_json_pointer("/part/text"));
+    }
+
+    fn parse_cli(preset_toml: &str) -> Result<Config> {
+        let raw = format!(
+            r#"
+model = "cli/safe"
+fallback = []
+data_dir = "data"
+[schedule]
+timezone = "UTC"
+[telegram.app]
+api_id = 1
+api_hash = "0123456789abcdef"
+phone = "+10000000000"
+[telegram.bot]
+token = "123456:ABCDEFGHIJKLMNOPQRST"
+[prompts]
+user_template = "posts"
+map_system = "map"
+[[themes]]
+tag = "dev"
+title = "Dev"
+system = "sys"
+cron = "0 9 * * *"
+[providers.cli]
+{preset_toml}
+"#
+        );
+        let mut cfg: Config = toml::from_str(&raw)?;
+        cfg.telegram.app.phone = normalize_phone(&cfg.telegram.app.phone);
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    fn safe_preset() -> &'static str {
+        r#"
+[providers.cli.presets.safe]
+command = ["echo"]
+model_args = ["--model", "{model}"]
+allowed_models = ["opus", "sonnet"]
+answer = "/result"
+max_input_chars = 1000
+request_timeout_secs = 60
+"#
+    }
+
+    #[test]
+    fn cli_preset_loads() {
+        let cfg = parse_cli(safe_preset()).unwrap();
+        let spec = cfg.model("cli/safe/opus", None).unwrap();
+        assert_eq!(spec.kind, ProviderKind::Cli);
+        assert_eq!(spec.max_input_chars, 1000);
+        assert_eq!(spec.cli.as_ref().unwrap().preset, "safe");
+        assert_eq!(spec.cli.as_ref().unwrap().model.as_deref(), Some("opus"));
+    }
+
+    #[test]
+    fn cli_refuses_auto_flag() {
+        let err = parse_cli(
+            r#"
+[providers.cli.presets.safe]
+command = ["echo", "--auto"]
+max_input_chars = 1000
+request_timeout_secs = 60
+"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("--auto"), "{err}");
+    }
+
+    #[test]
+    fn cli_requires_max_input_chars_on_preset() {
+        let err = parse_cli(
+            r#"
+[providers.cli.presets.safe]
+command = ["echo"]
+request_timeout_secs = 60
+"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("max_input_chars"), "{err}");
+    }
+
+    #[test]
+    fn cli_events_needs_event_fields() {
+        let err = parse_cli(
+            r#"
+[providers.cli.presets.safe]
+command = ["echo"]
+output = "events"
+max_input_chars = 1000
+request_timeout_secs = 60
+"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("events"), "{err}");
+    }
+
+    #[test]
+    fn cli_events_accepts_answer_event_value() {
+        parse_cli(
+            r#"
+[providers.cli.presets.safe]
+command = ["echo"]
+output = "events"
+event_type = "/type"
+answer_event = "text"
+answer = "/part/text"
+max_input_chars = 1000
+request_timeout_secs = 60
+"#,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn cli_empty_model_args_with_allowed_models_fails() {
+        let err = parse_cli(
+            r#"
+[providers.cli.presets.safe]
+command = ["echo"]
+allowed_models = ["opus"]
+max_input_chars = 1000
+request_timeout_secs = 60
+"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("model_args"), "{err}");
+    }
+
+    #[test]
+    fn cli_rejects_model_outside_allowed() {
+        let cfg = parse_cli(safe_preset()).unwrap();
+        let err = cfg.model_id("cli/safe/haiku").unwrap_err().to_string();
+        assert!(err.contains("allowed_models"), "{err}");
+    }
+
+    #[test]
+    fn cli_model_keys_list_presets_and_allowed() {
+        let cfg = parse_cli(safe_preset()).unwrap();
+        let keys = cfg.model_keys();
+        assert!(keys.contains(&"cli/safe".into()), "{keys:?}");
+        assert!(keys.contains(&"cli/safe/opus".into()), "{keys:?}");
+        assert!(keys.contains(&"cli/safe/sonnet".into()), "{keys:?}");
+    }
+
+    #[test]
+    fn cli_secrets_skip_short_values() {
+        let cfg = parse_cli(
+            r#"
+[providers.cli.presets.safe]
+command = ["echo"]
+max_input_chars = 1000
+request_timeout_secs = 60
+env = { SHORT = "tiny", LONG = "sixteen-chars-ok" }
+"#,
+        )
+        .unwrap();
+        let secrets = cfg.secrets();
+        assert!(secrets.iter().any(|s| s == "sixteen-chars-ok"), "{secrets:?}");
+        assert!(!secrets.iter().any(|s| s == "tiny"));
+        assert!(secrets.iter().any(|s| s == "123456:ABCDEFGHIJKLMNOPQRST"));
     }
 }
