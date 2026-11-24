@@ -1153,9 +1153,28 @@ impl Summarizer {
         // Drop the work dir only after the process ends (success, error, timeout, cancel).
         drop(work);
 
+        // Non-zero exit: classify from stderr/stdout before JSON parse. A login or
+        // limit failure often has empty or non-JSON stdout; BrokenAnswer would hide it.
+        if !status.success() {
+            let parsed = parse_cli_output(preset, &stdout).unwrap_or(CliParsed {
+                answer: None,
+                error_text: None,
+                input_tokens: None,
+                output_tokens: None,
+            });
+            let from_stdout = parsed.error_text.as_deref().unwrap_or(stdout.trim());
+            return Err(cli_api_error(
+                api,
+                login,
+                from_stdout,
+                &stderr,
+                status.code(),
+            ));
+        }
+
         let parsed = parse_cli_output(preset, &stdout)?;
         if let Some(err_text) = &parsed.error_text {
-            if !status.success() || parsed.answer.is_none() {
+            if parsed.answer.is_none() {
                 return Err(cli_api_error(api, login, err_text, &stderr, status.code()));
             }
             tracing::warn!(
@@ -1163,15 +1182,6 @@ impl Summarizer {
                 error = %err_text,
                 "CLI reported an error line but also returned an answer"
             );
-        }
-        if !status.success() {
-            return Err(cli_api_error(
-                api,
-                login,
-                parsed.error_text.as_deref().unwrap_or(""),
-                &stderr,
-                status.code(),
-            ));
         }
         let answer = parsed.answer.context("the CLI wrote no answer on stdout")?;
         let digest = digest_from_cli_value(answer)?;
@@ -2045,5 +2055,19 @@ mod cli_tests {
         );
         let api = err.downcast_ref::<ApiError>().unwrap();
         assert_eq!(api.kind, ApiErrorKind::Limit);
+    }
+
+    #[test]
+    fn non_json_stderr_login_is_auth() {
+        let err = cli_api_error(
+            Cow::Borrowed("CLI claude"),
+            Some("claude setup-token".into()),
+            "",
+            "Error: not logged in",
+            Some(1),
+        );
+        let api = err.downcast_ref::<ApiError>().unwrap();
+        assert_eq!(api.kind, ApiErrorKind::Auth);
+        assert_eq!(api.login.as_deref(), Some("claude setup-token"));
     }
 }

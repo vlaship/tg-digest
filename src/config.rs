@@ -1021,7 +1021,12 @@ fn validate_cli_presets(cli: &Provider) -> Result<()> {
         if preset.error_event.is_some() && preset.error_text.is_none() {
             bail!("{path}: error_event needs error_text");
         }
-        for arg in preset.command.iter().chain(preset.model_args.iter()) {
+        for arg in preset
+            .command
+            .iter()
+            .chain(preset.model_args.iter())
+            .chain(preset.stdin_arg.iter())
+        {
             if DANGEROUS_CLI_FLAGS.iter().any(|f| arg == f) {
                 bail!("{path}: flag {arg:?} auto-approves tools and is not allowed");
             }
@@ -1154,6 +1159,22 @@ request_timeout_secs = 60
         .unwrap_err()
         .to_string();
         assert!(err.contains("--auto"), "{err}");
+    }
+
+    #[test]
+    fn cli_refuses_dangerous_stdin_arg() {
+        let err = parse_cli(
+            r#"
+[providers.cli.presets.safe]
+command = ["echo"]
+stdin_arg = "--dangerously-skip-permissions"
+max_input_chars = 1000
+request_timeout_secs = 60
+"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("--dangerously-skip-permissions"), "{err}");
     }
 
     #[test]
