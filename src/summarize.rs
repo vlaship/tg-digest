@@ -8,11 +8,13 @@ use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use chrono_tz::Tz;
 use serde_json::{json, Value};
+use std::borrow::Cow;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::cancel::Cancel;
-use crate::config::{ModelSpec, Prompts, ProviderKind};
+use crate::config::{CliOutput, CliPreset, ModelSpec, Prompts, ProviderKind};
 use crate::digest::{self, Digest, Post};
 
 pub const ANTHROPIC_VERSION: &str = "2023-06-01";
@@ -40,8 +42,12 @@ const STUB_ANSWER_TOKENS: u64 = 16_000;
 /// say in plain words what happened and what to do, not send a JSON dump.
 #[derive(Debug)]
 pub struct ApiError {
-    pub api: &'static str,
+    pub api: Cow<'static, str>,
     pub kind: ApiErrorKind,
+    /// Which provider raised it (`cli` gets a different Auth text).
+    pub provider: ProviderKind,
+    /// Login command from a CLI preset, when set.
+    pub login: Option<String>,
     /// The API answer, cut short: for the log and the database.
     pub details: String,
     /// The error text of the API (`error.message`), if it has one: it goes to the
@@ -55,18 +61,23 @@ pub enum ApiErrorKind {
     Limit,
     /// The server is overloaded or down (5xx), and the retries did not help.
     Unavailable,
-    /// The key is wrong or has no access (401, 403).
+    /// The key is wrong or has no access (401, 403). For `cli`: not logged in.
     Auth,
 }
 
 impl std::fmt::Display for ApiError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let what = match self.kind {
-            ApiErrorKind::Limit => "limit is used up",
-            ApiErrorKind::Unavailable => "is not available",
-            ApiErrorKind::Auth => "did not accept the key",
+        let what = match (self.kind, self.provider) {
+            (ApiErrorKind::Limit, _) => "limit is used up",
+            (ApiErrorKind::Unavailable, _) => "is not available",
+            (ApiErrorKind::Auth, ProviderKind::Cli) => "is not logged in",
+            (ApiErrorKind::Auth, _) => "did not accept the key",
         };
-        write!(f, "the {} API {what}: {}", self.api, self.details)
+        if self.provider == ProviderKind::Cli {
+            write!(f, "the {} {what}: {}", self.api, self.details)
+        } else {
+            write!(f, "the {} API {what}: {}", self.api, self.details)
+        }
     }
 }
 
@@ -249,6 +260,8 @@ pub struct Summarizer {
     /// `provider/model`, only for the log.
     model: String,
     limits: Limits,
+    /// Folder with state files; used for `agents.lock` when the model is `cli`.
+    data_dir: PathBuf,
     /// OpenRouter only: the model hosts do not support a strict JSON schema
     /// (`structured_outputs`), so we ask for `json_object` and put the schema in the
     /// system prompt. Found out on the first request and kept for the whole run.
@@ -287,9 +300,9 @@ impl Backend {
         json_object: bool,
         low_reasoning: bool,
         max_tokens: u32,
-    ) -> Value {
+    ) -> Result<Value> {
         let m = &self.0;
-        match m.kind {
+        Ok(match m.kind {
             // thinking is on by default on claude-opus-5 — we do not pass the parameter.
             // temperature and budget_tokens return 400 on this model.
             ProviderKind::Anthropic => json!({
@@ -314,13 +327,7 @@ impl Backend {
             // The OpenAI chat format.
             ProviderKind::OpenRouter => {
                 let (system, format) = if json_object {
-                    let system = format!(
-                        "{system}\n\nAnswer with JSON only, no other text. \
-                         The JSON must match this JSON schema:\n{}\n\n\
-                         The shape of the answer (the values here are not real):\n{}",
-                        digest::response_schema(),
-                        digest::ANSWER_SHAPE
-                    );
+                    let system = format!("{system}\n\n{}", digest::schema_in_prompt());
                     (system, json!({ "type": "json_object" }))
                 } else {
                     (system.to_string(), strict_format())
@@ -386,12 +393,15 @@ impl Backend {
                 }
                 body
             }
-        }
+            ProviderKind::Cli => {
+                bail!("internal error: the cli provider has no HTTP API")
+            }
+        })
     }
 
-    fn request(&self, http: &reqwest::Client) -> reqwest::RequestBuilder {
+    fn request(&self, http: &reqwest::Client) -> Result<reqwest::RequestBuilder> {
         let m = &self.0;
-        match m.kind {
+        Ok(match m.kind {
             ProviderKind::Anthropic => http
                 .post(&m.api_url)
                 .header("x-api-key", &m.api_key)
@@ -404,7 +414,10 @@ impl Backend {
                 .bearer_auth(&m.api_key)
                 .header("X-Title", "tg-digest"),
             ProviderKind::OpenAI => http.post(&m.api_url).bearer_auth(&m.api_key),
-        }
+            ProviderKind::Cli => {
+                bail!("internal error: the cli provider has no HTTP API")
+            }
+        })
     }
 
     fn parse(&self, response: Value) -> Result<Summary> {
@@ -413,6 +426,9 @@ impl Backend {
             ProviderKind::Gemini => parse_gemini(response),
             ProviderKind::OpenRouter => parse_chat(response, "OpenRouter"),
             ProviderKind::OpenAI => parse_chat(response, "OpenAI"),
+            ProviderKind::Cli => {
+                bail!("internal error: the cli provider has no HTTP API")
+            }
         }
     }
 }
@@ -430,7 +446,7 @@ pub struct Summary {
 }
 
 impl Summarizer {
-    pub fn new(model: &ModelSpec) -> Result<Self> {
+    pub fn new(model: &ModelSpec, data_dir: impl Into<PathBuf>) -> Result<Self> {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(model.request_timeout_secs))
             .build()
@@ -440,6 +456,7 @@ impl Summarizer {
             http,
             model: model.key.clone(),
             limits: Limits::new(model.max_input_chars),
+            data_dir: data_dir.into(),
             backend: Backend(model.clone()),
             // OpenRouter: a model without a strict JSON schema gets a JSON object at once.
             json_object: AtomicBool::new(!model.json_schema),
@@ -459,6 +476,20 @@ impl Summarizer {
         timezone: Tz,
         cancel: &Cancel,
     ) -> Result<Summary> {
+        // Keep the shared agents lock for the whole summarize step (all map-reduce
+        // CLI calls), so `agents update` cannot replace a binary between parts.
+        let _agents_lock = if self.backend.0.cli.is_some() {
+            Some(
+                agents_shared_lock(
+                    &self.data_dir,
+                    Duration::from_secs(self.backend.0.request_timeout_secs),
+                    cancel,
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
         let prompts = &with_rules(prompts);
         let now = Utc::now();
         let user_prompt = digest::render_user_prompt(
@@ -865,41 +896,53 @@ impl Summarizer {
                 low_reasoning,
                 "asking the model, this can take a few minutes"
             );
-            let body =
-                self.backend
-                    .body(system, &user_prompt, json_object, low_reasoning, max_tokens);
-            let started = std::time::Instant::now();
-            let result = tokio::select! {
-                _ = cancel.cancelled() => bail!("model request stopped by the shutdown signal"),
-                result = self.post_with_retries(&body) => result,
-            };
-            let response = match result {
-                Ok(response) => response,
-                Err(e)
-                    if self.backend.0.kind == ProviderKind::OpenRouter
-                        && !json_object
-                        && format!("{e:#}").contains(NO_ENDPOINTS) =>
-                {
-                    tracing::warn!(
-                        model = %self.model,
-                        "the model does not support a strict JSON schema, asking for a JSON object"
-                    );
-                    self.json_object.store(true, Ordering::Relaxed);
-                    continue;
+            let started = Instant::now();
+            let parsed = if self.backend.0.cli.is_some() {
+                self.run_cli(system, &user_prompt, cancel).await
+            } else {
+                let body = self.backend.body(
+                    system,
+                    &user_prompt,
+                    json_object,
+                    low_reasoning,
+                    max_tokens,
+                )?;
+                let result = tokio::select! {
+                    _ = cancel.cancelled() => bail!("model request stopped by the shutdown signal"),
+                    result = self.post_with_retries(&body) => result,
+                };
+                match result {
+                    Ok(response) => self.backend.parse(response),
+                    Err(e)
+                        if self.backend.0.kind == ProviderKind::OpenRouter
+                            && !json_object
+                            && format!("{e:#}").contains(NO_ENDPOINTS) =>
+                    {
+                        tracing::warn!(
+                            model = %self.model,
+                            "the model does not support a strict JSON schema, asking for a JSON object"
+                        );
+                        self.json_object.store(true, Ordering::Relaxed);
+                        continue;
+                    }
+                    Err(e) => return Err(e),
                 }
-                Err(e) => return Err(e),
             };
-            tracing::info!(
-                step,
-                seconds = started.elapsed().as_secs(),
-                "the model answered"
-            );
-            // Set when every topic was a stub and reasoning was almost the whole
-            // output. The retry then raises `max_tokens`. A broken JSON answer has
-            // no usage here, so it only lowers effort.
+            if parsed.is_ok()
+                || parsed
+                    .as_ref()
+                    .err()
+                    .is_some_and(|e| e.downcast_ref::<BrokenAnswer>().is_some())
+            {
+                tracing::info!(
+                    step,
+                    seconds = started.elapsed().as_secs(),
+                    "the model answered"
+                );
+            }
             let mut reasoning_ate = None;
             let mut too_few = false;
-            let defect = match self.backend.parse(response) {
+            let defect = match parsed {
                 Ok(mut summary) => {
                     let before = summary.digest.topics.len();
                     let dropped = summary.digest.strip_stubs();
@@ -981,7 +1024,7 @@ impl Summarizer {
             let api = self.backend.name();
             let result = self
                 .backend
-                .request(&self.http)
+                .request(&self.http)?
                 .header("content-type", "application/json")
                 .json(body)
                 .send()
@@ -1045,8 +1088,10 @@ impl Summarizer {
                 let details = format!("{status}: {short}");
                 let message = api_message(&text);
                 return Err(ApiError {
-                    api,
+                    api: Cow::Borrowed(api),
                     kind,
+                    provider: self.backend.0.kind,
+                    login: None,
                     details,
                     message,
                 }
@@ -1054,6 +1099,115 @@ impl Summarizer {
             }
             bail!("the {api} API returned {status}: {text}");
         }
+    }
+
+    /// Run the agent CLI once: prompt on stdin, parse stdout by the preset.
+    async fn run_cli(&self, system: &str, user: &str, cancel: &Cancel) -> Result<Summary> {
+        let call = self
+            .backend
+            .0
+            .cli
+            .as_ref()
+            .context("internal error: run_cli without cli call")?;
+        let preset = &call.config;
+        let work =
+            tempfile::TempDir::new().context("could not create a temp folder for the CLI")?;
+        let schema_json = digest::response_schema().to_string();
+        let schema_path = work.path().join("schema.json");
+        std::fs::write(&schema_path, &schema_json)
+            .context("could not write the schema file for the CLI")?;
+        let prompt = format!("{system}\n\n{user}\n\n{}", digest::schema_in_prompt());
+        let mut argv = expand_cli_args(
+            &preset.command,
+            &schema_json,
+            &schema_path,
+            call.model.as_deref(),
+        );
+        if call.model.is_some() {
+            argv.extend(expand_cli_args(
+                &preset.model_args,
+                &schema_json,
+                &schema_path,
+                call.model.as_deref(),
+            ));
+        }
+        if let Some(arg) = &preset.stdin_arg {
+            argv.push(arg.clone());
+        }
+        let (program, args) = argv.split_first().context("CLI command is empty")?;
+        let timeout = Duration::from_secs(self.backend.0.request_timeout_secs);
+        let api: Cow<'static, str> = Cow::Owned(format!("CLI {}", call.preset));
+        let login = preset.login.clone();
+
+        let mut child = start_cli(program, args, &preset.env, work.path())?;
+        let outcome = tokio::select! {
+            _ = cancel.cancelled() => {
+                kill_cli(&mut child);
+                let _ = child.wait().await;
+                bail!("CLI request stopped by the shutdown signal");
+            }
+            _ = tokio::time::sleep(timeout) => {
+                kill_cli(&mut child);
+                let _ = child.wait().await;
+                bail!(
+                    "the CLI {} timed out after {} seconds",
+                    call.preset,
+                    self.backend.0.request_timeout_secs
+                );
+            }
+            result = finish_cli(&mut child, &prompt) => result,
+        };
+
+        let (status, stdout, stderr) = outcome?;
+        // Drop the work dir only after the process ends (success, error, timeout, cancel).
+        drop(work);
+
+        // Non-zero exit: classify before treating stdout as digest text. Only the
+        // preset error fields may feed Auth/Limit words from stdout; raw event
+        // streams can contain the words `login` / `429` inside channel posts.
+        if !status.success() {
+            let parsed = parse_cli_output(preset, &stdout).ok();
+            let from_preset = parsed
+                .as_ref()
+                .and_then(|p| p.error_text.as_deref())
+                .unwrap_or("");
+            if parsed.is_none() && !stdout.trim().is_empty() {
+                tracing::warn!(
+                    preset = %call.preset,
+                    stdout_chars = stdout.chars().count(),
+                    "CLI exited with an error; stdout is not preset output (not used for Auth/Limit)"
+                );
+            }
+            return Err(cli_api_error(
+                api,
+                login,
+                from_preset,
+                &stderr,
+                status.code(),
+            ));
+        }
+
+        let parsed = parse_cli_output(preset, &stdout)?;
+        if let Some(err_text) = &parsed.error_text {
+            if parsed.answer.is_none() {
+                return Err(cli_api_error(api, login, err_text, &stderr, status.code()));
+            }
+            tracing::warn!(
+                preset = %call.preset,
+                error = %err_text,
+                "CLI reported an error line but also returned an answer"
+            );
+        }
+        let Some(answer) = parsed.answer else {
+            return Err(BrokenAnswer("the CLI wrote no answer on stdout".into()).into());
+        };
+        let digest = digest_from_cli_value(answer)?;
+        Ok(Summary {
+            digest,
+            input_tokens: parsed.input_tokens,
+            output_tokens: parsed.output_tokens,
+            reasoning_tokens: None,
+        })
     }
 }
 
@@ -1366,8 +1520,14 @@ fn parse_chat(response: Value, api: &'static str) -> Result<Summary> {
         };
         if let Some(kind) = kind {
             return Err(ApiError {
-                api,
+                api: Cow::Borrowed(api),
                 kind,
+                provider: if api == "OpenAI" {
+                    ProviderKind::OpenAI
+                } else {
+                    ProviderKind::OpenRouter
+                },
+                login: None,
                 details: format!("{code}: {message}"),
                 message: Some(message.chars().take(500).collect()),
             }
@@ -1507,4 +1667,655 @@ fn strip_code_fence(text: &str) -> &str {
     };
     let inner = inner.strip_prefix("json").unwrap_or(inner);
     inner.strip_suffix("```").unwrap_or(inner).trim()
+}
+
+fn extract_json_object(text: &str) -> &str {
+    let text = strip_code_fence(text);
+    match (text.find('{'), text.rfind('}')) {
+        (Some(a), Some(b)) if a <= b => &text[a..=b],
+        _ => text,
+    }
+}
+
+fn expand_cli_args(
+    args: &[String],
+    schema_json: &str,
+    schema_path: &Path,
+    model: Option<&str>,
+) -> Vec<String> {
+    let schema_file = schema_path.to_string_lossy();
+    args.iter()
+        .map(|arg| {
+            let mut out = arg.replace("{schema}", schema_json);
+            out = out.replace("{schema_file}", &schema_file);
+            if let Some(model) = model {
+                out = out.replace("{model}", model);
+            }
+            out
+        })
+        .collect()
+}
+
+fn start_cli(
+    program: &str,
+    args: &[String],
+    env: &std::collections::BTreeMap<String, String>,
+    workdir: &Path,
+) -> Result<tokio::process::Child> {
+    let mut cmd = tokio::process::Command::new(program);
+    cmd.args(args)
+        .current_dir(workdir)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    #[cfg(unix)]
+    {
+        // Own process group: on cancel/timeout we SIGKILL the whole group.
+        cmd.process_group(0);
+    }
+    cmd.spawn()
+        .with_context(|| format!("could not start CLI {program:?}"))
+}
+
+fn kill_cli(child: &mut tokio::process::Child) {
+    #[cfg(unix)]
+    {
+        if let Some(pid) = child.id() {
+            kill_cli_group(pid);
+            return;
+        }
+    }
+    let _ = child.start_kill();
+}
+
+/// Kill the CLI process group (parent + grandchildren that kept the pipes open).
+fn kill_cli_group(pid: u32) {
+    #[cfg(unix)]
+    {
+        // Safety: pid is the process-group id we set with process_group(0).
+        unsafe {
+            libc::kill(-(pid as i32), libc::SIGKILL);
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+    }
+}
+
+async fn finish_cli(
+    child: &mut tokio::process::Child,
+    prompt: &str,
+) -> Result<(std::process::ExitStatus, String, String)> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let pid = child.id();
+    let mut stdin = child.stdin.take().context("CLI stdin was not piped")?;
+    let mut stdout = child.stdout.take().context("CLI stdout was not piped")?;
+    let mut stderr = child.stderr.take().context("CLI stderr was not piped")?;
+    let prompt = prompt.to_owned();
+
+    let write_task = tokio::spawn(async move {
+        match stdin.write_all(prompt.as_bytes()).await {
+            Ok(()) => {
+                drop(stdin);
+                Ok(())
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+            Err(e) => Err(e),
+        }
+    });
+    let out_task = tokio::spawn(async move {
+        let mut buf = Vec::new();
+        stdout.read_to_end(&mut buf).await?;
+        Ok::<_, std::io::Error>(String::from_utf8_lossy(&buf).into_owned())
+    });
+    let err_task = tokio::spawn(async move {
+        let mut buf = Vec::new();
+        stderr.read_to_end(&mut buf).await?;
+        Ok::<_, std::io::Error>(String::from_utf8_lossy(&buf).into_owned())
+    });
+
+    // Wait for the CLI itself first. Grandchildren (e.g. opencode --standalone
+    // server) can keep the pipes open; after exit, kill the group so EOF arrives.
+    let status = child.wait().await.context("waiting for the CLI")?;
+    if let Some(pid) = pid {
+        kill_cli_group(pid);
+    }
+
+    let drain = async {
+        let stdout = out_task
+            .await
+            .context("CLI stdout reader task failed")?
+            .context("reading CLI stdout")?;
+        let stderr = err_task
+            .await
+            .context("CLI stderr reader task failed")?
+            .context("reading CLI stderr")?;
+        Ok::<_, anyhow::Error>((stdout, stderr))
+    };
+    let (stdout, stderr) = match tokio::time::timeout(Duration::from_secs(5), drain).await {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => return Err(e),
+        Err(_) => bail!("CLI pipes did not close within 5s after the process exited"),
+    };
+    match write_task.await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+        Ok(Err(e)) => return Err(e).context("writing CLI stdin"),
+        Err(e) if e.is_cancelled() => {}
+        Err(e) => return Err(e).context("CLI stdin writer task failed"),
+    }
+    Ok((status, stdout, stderr))
+}
+
+struct CliParsed {
+    answer: Option<Value>,
+    error_text: Option<String>,
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+}
+
+fn parse_cli_output(preset: &CliPreset, stdout: &str) -> Result<CliParsed> {
+    match preset.output {
+        CliOutput::Json => parse_cli_json(preset, stdout),
+        CliOutput::Events => parse_cli_events(preset, stdout),
+    }
+}
+
+fn parse_cli_json(preset: &CliPreset, stdout: &str) -> Result<CliParsed> {
+    let root: Value = serde_json::from_str(stdout.trim()).map_err(|e| {
+        BrokenAnswer(format!(
+            "{e}: {}",
+            stdout.chars().take(BROKEN_ANSWER_CHARS).collect::<String>()
+        ))
+    })?;
+    if let Some(ptr) = &preset.error {
+        if root.pointer(ptr).and_then(Value::as_bool) == Some(true) {
+            let text = preset
+                .error_text
+                .as_ref()
+                .and_then(|p| root.pointer(p))
+                .and_then(Value::as_str)
+                .unwrap_or("CLI reported an error")
+                .to_string();
+            return Ok(CliParsed {
+                answer: None,
+                error_text: Some(text),
+                input_tokens: pointer_u64(&root, preset.input_tokens.as_deref()),
+                output_tokens: pointer_u64(&root, preset.output_tokens.as_deref()),
+            });
+        }
+    }
+    let answer = match &preset.answer {
+        Some(ptr) => root
+            .pointer(ptr)
+            .cloned()
+            .ok_or_else(|| BrokenAnswer(format!("answer pointer {ptr} missing in CLI stdout")))?,
+        None => root.clone(),
+    };
+    Ok(CliParsed {
+        answer: Some(answer),
+        error_text: None,
+        input_tokens: pointer_u64(&root, preset.input_tokens.as_deref()),
+        output_tokens: pointer_u64(&root, preset.output_tokens.as_deref()),
+    })
+}
+
+fn parse_cli_events(preset: &CliPreset, stdout: &str) -> Result<CliParsed> {
+    let event_type = preset
+        .event_type
+        .as_deref()
+        .context("events output needs event_type")?;
+    let answer_event = preset
+        .answer_event
+        .as_deref()
+        .context("events output needs answer_event")?;
+    let answer_ptr = preset
+        .answer
+        .as_deref()
+        .context("events output needs answer")?;
+
+    let mut pieces = String::new();
+    let mut errors = Vec::new();
+    let mut input_tokens = 0u64;
+    let mut output_tokens = 0u64;
+    let mut saw_input = false;
+    let mut saw_output = false;
+
+    for line in stdout.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(row) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let Some(typ) = row.pointer(event_type).and_then(Value::as_str) else {
+            continue;
+        };
+        if typ == answer_event {
+            if let Some(part) = row.pointer(answer_ptr).and_then(Value::as_str) {
+                pieces.push_str(part);
+            }
+        }
+        if preset.usage_event.as_deref() == Some(typ) {
+            if let Some(n) = pointer_u64(&row, preset.input_tokens.as_deref()) {
+                input_tokens = input_tokens.saturating_add(n);
+                saw_input = true;
+            }
+            if let Some(n) = pointer_u64(&row, preset.output_tokens.as_deref()) {
+                output_tokens = output_tokens.saturating_add(n);
+                saw_output = true;
+            }
+        }
+        if preset.error_event.as_deref() == Some(typ) {
+            if let Some(ptr) = &preset.error_text {
+                if let Some(msg) = row.pointer(ptr).and_then(Value::as_str) {
+                    errors.push(msg.to_string());
+                }
+            }
+        }
+    }
+
+    let answer = if pieces.is_empty() {
+        None
+    } else {
+        Some(Value::String(pieces))
+    };
+    Ok(CliParsed {
+        answer,
+        error_text: errors.into_iter().next(),
+        input_tokens: if saw_input { Some(input_tokens) } else { None },
+        output_tokens: if saw_output {
+            Some(output_tokens)
+        } else {
+            None
+        },
+    })
+}
+
+fn pointer_u64(root: &Value, pointer: Option<&str>) -> Option<u64> {
+    let ptr = pointer?;
+    let v = root.pointer(ptr)?;
+    v.as_u64()
+        .or_else(|| v.as_f64().map(|f| f as u64))
+        .or_else(|| v.as_str()?.parse().ok())
+}
+
+fn digest_from_cli_value(value: Value) -> Result<Digest> {
+    match value {
+        Value::Object(_) | Value::Array(_) => {
+            serde_json::from_value(value).map_err(|e| BrokenAnswer(format!("{e}")).into())
+        }
+        Value::String(text) => {
+            let json = extract_json_object(&text);
+            parse_digest(json)
+        }
+        other => Err(BrokenAnswer(format!("CLI answer has unexpected JSON type: {other}")).into()),
+    }
+}
+
+fn cli_api_error(
+    api: Cow<'static, str>,
+    login: Option<String>,
+    stdout_err: &str,
+    stderr: &str,
+    code: Option<i32>,
+) -> anyhow::Error {
+    let details = [
+        stdout_err,
+        stderr,
+        &code.map(|c| format!("exit code {c}")).unwrap_or_default(),
+    ]
+    .into_iter()
+    .find(|s| !s.trim().is_empty())
+    .unwrap_or("CLI failed")
+    .chars()
+    .take(500)
+    .collect::<String>();
+    let lower = details.to_lowercase();
+    let kind = if [
+        "rate limit",
+        "usage limit",
+        "quota exceeded",
+        "429",
+        "limit reached",
+    ]
+    .iter()
+    .any(|s| lower.contains(s))
+    {
+        ApiErrorKind::Limit
+    } else if ["not logged in", "login", "unauthorized", "401", "expired"]
+        .iter()
+        .any(|s| lower.contains(s))
+    {
+        ApiErrorKind::Auth
+    } else {
+        // Plain CLI failure — not one of the actionable API kinds. Keep Auth/Limit
+        // only for the matched words; everything else is a normal anyhow error.
+        return anyhow::anyhow!("the {api} failed: {details}");
+    };
+    ApiError {
+        api,
+        kind,
+        provider: ProviderKind::Cli,
+        login,
+        details: details.clone(),
+        message: Some(details),
+    }
+    .into()
+}
+
+/// Shared lock so `agents update` waits until the summarize step ends.
+async fn agents_shared_lock(
+    data_dir: &Path,
+    timeout: Duration,
+    cancel: &Cancel,
+) -> Result<std::fs::File> {
+    use std::fs::{OpenOptions, TryLockError};
+
+    let path = data_dir.join("agents.lock");
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("could not open {}", path.display()))?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        match file.try_lock_shared() {
+            Ok(()) => return Ok(file),
+            Err(TryLockError::WouldBlock) => {
+                if cancel.is_cancelled() {
+                    bail!("stopped while waiting for agents.lock");
+                }
+                if Instant::now() >= deadline {
+                    bail!("timed out waiting for agents.lock (another process holds it)");
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+            Err(TryLockError::Error(e)) => {
+                return Err(e).with_context(|| format!("could not lock {}", path.display()));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+    use crate::config::CliOutput;
+
+    fn events_preset() -> CliPreset {
+        CliPreset {
+            command: vec!["opencode".into()],
+            model_args: vec!["--model".into(), "{model}".into()],
+            stdin_arg: None,
+            allowed_models: None,
+            output: CliOutput::Events,
+            answer: Some("/part/text".into()),
+            error: None,
+            error_text: Some("/error/message".into()),
+            input_tokens: Some("/part/tokens/input".into()),
+            output_tokens: Some("/part/tokens/output".into()),
+            event_type: Some("/type".into()),
+            answer_event: Some("text".into()),
+            usage_event: Some("step_finish".into()),
+            error_event: Some("error".into()),
+            login: None,
+            env: Default::default(),
+            settings: Default::default(),
+            models: Default::default(),
+        }
+    }
+
+    #[test]
+    fn events_joins_text_deltas_and_sums_usage() {
+        let stdout = r#"
+{"type":"text","part":{"text":"{\"topics\":["}}
+{"type":"text","part":{"text":"]}"}}
+{"type":"step_finish","part":{"tokens":{"input":10,"output":3}}}
+{"type":"step_finish","part":{"tokens":{"input":2,"output":1}}}
+"#;
+        let parsed = parse_cli_events(&events_preset(), stdout).unwrap();
+        assert_eq!(
+            parsed.answer.as_ref().and_then(Value::as_str),
+            Some("{\"topics\":[]}")
+        );
+        assert_eq!(parsed.input_tokens, Some(12));
+        assert_eq!(parsed.output_tokens, Some(4));
+    }
+
+    #[test]
+    fn events_usage_tracks_input_and_output_separately() {
+        let stdout = r#"{"type":"step_finish","part":{"tokens":{"input":7}}}"#;
+        let parsed = parse_cli_events(&events_preset(), stdout).unwrap();
+        assert_eq!(parsed.input_tokens, Some(7));
+        assert_eq!(parsed.output_tokens, None);
+    }
+
+    #[test]
+    fn events_error_line_gives_limit_text() {
+        let stdout =
+            r#"{"type":"error","error":{"message":"Free usage limit reached","status":429}}"#;
+        let parsed = parse_cli_events(&events_preset(), stdout).unwrap();
+        assert!(parsed.answer.is_none());
+        assert_eq!(
+            parsed.error_text.as_deref(),
+            Some("Free usage limit reached")
+        );
+        let err = cli_api_error(
+            Cow::Borrowed("CLI opencode"),
+            None,
+            parsed.error_text.as_deref().unwrap(),
+            "",
+            Some(1),
+        );
+        let api = err.downcast_ref::<ApiError>().unwrap();
+        assert_eq!(api.kind, ApiErrorKind::Limit);
+    }
+
+    #[test]
+    fn non_json_stderr_login_is_auth() {
+        let err = cli_api_error(
+            Cow::Borrowed("CLI claude"),
+            Some("claude setup-token".into()),
+            "",
+            "Error: not logged in",
+            Some(1),
+        );
+        let api = err.downcast_ref::<ApiError>().unwrap();
+        assert_eq!(api.kind, ApiErrorKind::Auth);
+        assert_eq!(api.login.as_deref(), Some("claude setup-token"));
+    }
+
+    #[test]
+    fn empty_preset_error_does_not_use_news_stdout_for_auth() {
+        // News text on stdout must not become Auth when the preset has no error field.
+        let err = cli_api_error(Cow::Borrowed("CLI stub"), None, "", "", Some(1));
+        assert!(
+            err.downcast_ref::<ApiError>().is_none(),
+            "exit-only failure must stay a plain error, not Auth/Limit"
+        );
+        let text = format!("{err:#}");
+        assert!(text.contains("exit code 1"), "{text}");
+    }
+
+    #[test]
+    fn cli_display_omits_api_word() {
+        let err = ApiError {
+            api: Cow::Borrowed("CLI claude"),
+            kind: ApiErrorKind::Auth,
+            provider: ProviderKind::Cli,
+            login: None,
+            details: "not logged in".into(),
+            message: None,
+        };
+        let text = err.to_string();
+        assert!(text.contains("the CLI claude is not logged in"), "{text}");
+        assert!(!text.contains("API"), "{text}");
+    }
+
+    fn stub_spec(command: Vec<String>, timeout_secs: u64) -> ModelSpec {
+        let preset = CliPreset {
+            command,
+            model_args: Vec::new(),
+            stdin_arg: None,
+            allowed_models: None,
+            output: CliOutput::Json,
+            answer: None,
+            error: None,
+            error_text: None,
+            input_tokens: None,
+            output_tokens: None,
+            event_type: None,
+            answer_event: None,
+            usage_event: None,
+            error_event: None,
+            login: Some("stub login".into()),
+            env: Default::default(),
+            settings: crate::config::ModelSettings {
+                max_input_chars: Some(10_000),
+                request_timeout_secs: Some(timeout_secs),
+                ..Default::default()
+            },
+            models: Default::default(),
+        };
+        ModelSpec {
+            key: "cli/stub".into(),
+            kind: ProviderKind::Cli,
+            api_key: String::new(),
+            api_url: String::new(),
+            id: "stub".into(),
+            max_tokens: 32_000,
+            max_input_chars: 10_000,
+            request_timeout_secs: timeout_secs,
+            effort: "high".into(),
+            effort_set: None,
+            reasoning: false,
+            can_reason: false,
+            reasoning_mandatory: false,
+            sort: None,
+            ignore: Vec::new(),
+            quantizations: Vec::new(),
+            json_schema: true,
+            cli: Some(crate::config::CliCall {
+                preset: "stub".into(),
+                model: None,
+                config: preset,
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn wrong_cli_command_fails_to_start() {
+        let data = tempfile::tempdir().unwrap();
+        let summarizer = Summarizer::new(
+            &stub_spec(vec!["tg-digest-no-such-cli-binary-xyz".into()], 30),
+            data.path(),
+        )
+        .unwrap();
+        let err = summarizer
+            .run_cli("sys", "user", &Cancel::never())
+            .await
+            .unwrap_err();
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("could not start CLI"),
+            "expected start failure, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stub_cli_json_digest_and_secret_scan() {
+        let data = tempfile::tempdir().unwrap();
+        let stub_dir = tempfile::tempdir().unwrap();
+        let secret = "123456:ABCDEFGHIJKLMNOPQRST";
+        #[cfg(windows)]
+        let (program, script) = {
+            let script = stub_dir.path().join("stub.ps1");
+            // Write JSON with the secret in the summary (stdin is ignored).
+            std::fs::write(
+                &script,
+                format!(
+                    r#"$ErrorActionPreference='Stop'; Write-Output '{{"topics":[{{"title":"Leak","summary":"token {secret} here","sources":[]}}]}}'"#
+                ),
+            )
+            .unwrap();
+            (
+                "powershell".to_string(),
+                vec![
+                    "-NoProfile".into(),
+                    "-ExecutionPolicy".into(),
+                    "Bypass".into(),
+                    "-File".into(),
+                    script.to_string_lossy().into_owned(),
+                ],
+            )
+        };
+        #[cfg(not(windows))]
+        let (program, script) = {
+            let script = stub_dir.path().join("stub.sh");
+            std::fs::write(
+                &script,
+                format!(
+                    "#!/bin/sh\nprintf '%s\\n' '{{\"topics\":[{{\"title\":\"Leak\",\"summary\":\"token {secret} here\",\"sources\":[]}}]}}'\n"
+                ),
+            )
+            .unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+            (script.to_string_lossy().into_owned(), Vec::<String>::new())
+        };
+        let mut command = vec![program];
+        command.extend(script);
+        let summarizer = Summarizer::new(&stub_spec(command, 30), data.path()).unwrap();
+        let summary = summarizer
+            .run_cli("sys", "user", &Cancel::never())
+            .await
+            .expect("stub CLI should return a digest");
+        assert_eq!(summary.digest.topics.len(), 1);
+        let secrets = vec![secret.to_string()];
+        assert_eq!(digest::find_secret(&summary.digest, &secrets), Some(0));
+    }
+
+    #[tokio::test]
+    async fn stub_cli_timeout_is_killed() {
+        let data = tempfile::tempdir().unwrap();
+        let stub_dir = tempfile::tempdir().unwrap();
+        #[cfg(windows)]
+        let command = {
+            let script = stub_dir.path().join("sleep.ps1");
+            std::fs::write(&script, "Start-Sleep -Seconds 30").unwrap();
+            vec![
+                "powershell".into(),
+                "-NoProfile".into(),
+                "-ExecutionPolicy".into(),
+                "Bypass".into(),
+                "-File".into(),
+                script.to_string_lossy().into_owned(),
+            ]
+        };
+        #[cfg(not(windows))]
+        let command = {
+            let script = stub_dir.path().join("sleep.sh");
+            std::fs::write(&script, "#!/bin/sh\nsleep 30\n").unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+            vec![script.to_string_lossy().into_owned()]
+        };
+        let summarizer = Summarizer::new(&stub_spec(command, 1), data.path()).unwrap();
+        let err = summarizer
+            .run_cli("sys", "user", &Cancel::never())
+            .await
+            .unwrap_err();
+        let text = format!("{err:#}");
+        assert!(text.contains("timed out"), "expected timeout, got: {text}");
+    }
 }

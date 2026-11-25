@@ -279,7 +279,10 @@ async fn dry_run_once(runner: &Runner, theme: &Theme, many: bool) -> Result<()> 
         return Ok(());
     }
 
-    let summarizer = Summarizer::new(&runner.catalog.spec(&runner.model().await).await?)?;
+    let summarizer = Summarizer::new(
+        &runner.catalog.spec(&runner.model().await).await?,
+        runner.cfg.data_dir.as_str(),
+    )?;
     let summary = summarizer
         .summarize(
             &prompts,
@@ -293,6 +296,9 @@ async fn dry_run_once(runner: &Runner, theme: &Theme, many: bool) -> Result<()> 
 
     let mut result = summary.digest;
     digest::drop_foreign_sources(&mut result, &collected.posts);
+    if digest::find_secret(&result, &cfg.secrets()).is_some() {
+        bail!("the answer contains a secret from config.toml; nothing is posted");
+    }
 
     let chunks = digest::render_html(
         &result,

@@ -200,6 +200,116 @@ request_timeout_secs = 1200
 # [providers.openai]
 # api_key = "sk-..."
 
+# ----------------------------------------------------------------- providers.cli --
+# Agent CLI by subscription (no API key). Model key: cli/<preset> or
+# cli/<preset>/<model>. Every enabled preset must turn off all tools of the CLI
+# (file read, shell, network, MCP). A read-only mode is not enough: a post can
+# ask the agent to read /data/tg.session. Presets that cannot do that stay
+# commented with a WARNING. Uncomment only the presets you need.
+#
+# Install CLIs into the volume (not the image):
+#   docker compose run --rm tg-digest agents install claude
+# Login example:
+#   docker compose run --rm -it tg-digest exec claude setup-token
+#
+# Risk: channel posts are foreign text. If tools stay on, a post can leak secrets
+# into the digest. A second check refuses a digest that contains a config secret.
+
+# # Tested with Claude Code 2.1.331.
+# # --tools "" turns off the built-in tools. --strict-mcp-config without
+# # --mcp-config turns off all MCP servers. Do not use --bare: it does not read
+# # the subscription (OAuth) login.
+# # Write "safe: all tools are off; the injection test passed with <version>"
+# # only after the injection test in the plan.
+# [providers.cli.presets.claude]
+# command = ["claude", "-p", "--output-format", "json",
+#            "--json-schema", "{schema}", "--tools", "", "--strict-mcp-config",
+#            "--no-session-persistence"]
+# model_args = ["--model", "{model}"]
+# allowed_models = ["opus", "sonnet", "haiku"]
+# output = "json"
+# answer = "/structured_output"
+# error = "/is_error"
+# error_text = "/result"
+# input_tokens = "/usage/input_tokens"
+# output_tokens = "/usage/output_tokens"
+# max_input_chars = 600000
+# request_timeout_secs = 1800
+# login = "claude setup-token"
+# env = { DISABLE_AUTOUPDATER = "1" }
+#
+# [providers.cli.presets.claude.models."haiku"]
+# max_input_chars = 300000
+
+# # Tested with codex-cli 0.172.0.
+# # WARNING: codex has no mode without tools. -s read-only still lets it read
+# # files, so a post in a channel can make it read /data/tg.session. Keep this
+# # preset off until codex has such a mode and the injection test passes.
+# # [providers.cli.presets.codex]
+# # command = ["codex", "exec", "--skip-git-repo-check", "-s", "read-only",
+# #            "--output-schema", "{schema_file}"]
+# # model_args = ["-m", "{model}"]
+# # max_input_chars = 600000
+# # request_timeout_secs = 1800
+# # login = "codex login --device-auth"
+
+# # Tested with agy 1.5.16.
+# # WARNING: agy has no flag that turns off its file-read tools. A post in a
+# # channel can make it read /data/tg.session. Keep this preset off until agy
+# # has such a mode (check --sandbox and --settings first).
+# # [providers.cli.presets.agy]
+# # command = ["agy", "--print", "--input-format", "text", "--disable-slash-commands",
+# #            "--output-format", "json", "--json-schema", "{schema}",
+# #            "--print-timeout", "1800s"]
+# # model_args = ["--model", "{model}"]
+# # answer = "/structured_output"
+# # input_tokens = "/usage/input_tokens"
+# # output_tokens = "/usage/output_tokens"
+# # max_input_chars = 600000
+# # request_timeout_secs = 1860
+
+# # Tested with cursor-agent 2026.11.22-e9042b2.
+# # WARNING: cursor-agent --print enables all tools (read, write, shell). It has
+# # no flag that turns them off; --mode ask|plan and --sandbox are read-only at
+# # most. A post in a channel can make it read /data/tg.session. Keep this preset
+# # off until a no-tools mode exists and the injection test passes.
+# # [providers.cli.presets.cursor]
+# # command = ["cursor-agent", "--print", "--output-format", "json",
+# #            "--trust", "--workspace", "."]
+# # model_args = ["--model", "{model}"]
+# # answer = "/result"
+# # max_input_chars = 600000
+# # request_timeout_secs = 1800
+# # login = "env NO_OPEN_BROWSER=1 cursor-agent login"
+# # env = { CURSOR_API_KEY = "..." }
+
+# # Tested with opencode 2.4.1.
+# # Agent "tg-digest-no-tools" denies every tool and stops after one step. It
+# # comes from OPENCODE_CONFIG_CONTENT below. The server reads that variable, not
+# # the client, so --standalone is required. Never add --auto.
+# # Write "safe: ..." only after the injection test.
+# [providers.cli.presets.opencode]
+# command = ["opencode", "run", "--standalone", "--agent", "tg-digest-no-tools",
+#            "--format", "json", "--archived"]
+# model_args = ["--model", "{model}"]
+# output = "events"
+# event_type = "/type"
+# answer_event = "text"
+# answer = "/part/text"
+# usage_event = "step_finish"
+# input_tokens = "/part/tokens/input"
+# output_tokens = "/part/tokens/output"
+# error_event = "error"
+# error_text = "/error/message"
+# max_input_chars = 600000
+# request_timeout_secs = 1800
+# login = "opencode auth login"
+# [providers.cli.presets.opencode.env]
+# OPENCODE_DISABLE_AUTOUPDATE = "1"
+# OPENCODE_CONFIG_CONTENT = '''{"agents":{"tg-digest-no-tools":{"mode":"primary","steps":1,
+#   "system":"You turn a Telegram feed into one JSON digest. Answer with JSON only.",
+#   "permissions":[{"action":"*","resource":"*","effect":"deny"}]}}}'''
+
 # ------------------------------------------------------------------ prompts --
 # Edit them here, no rebuild needed. Placeholders in user_template:
 #   {{now}} {{lookback_hours}} {{post_count}} {{channel_count}} {{posts}}

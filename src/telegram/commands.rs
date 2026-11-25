@@ -454,7 +454,8 @@ async fn model(runner: &Arc<Runner>, arg: &str) -> Result<String> {
 }
 
 /// `/models provider [word]`: the models from the provider API. The word keeps only
-/// the ids that have it; `free` keeps the free models.
+/// the ids that have it; `free` keeps the free models. For `cli`, presets from the
+/// config (with `allowed_models` or "any model of the CLI").
 async fn models(runner: &Arc<Runner>, arg: &str) -> Result<String> {
     let mut words = arg.split_whitespace();
     let Some(provider) = words.next() else {
@@ -468,6 +469,9 @@ async fn models(runner: &Arc<Runner>, arg: &str) -> Result<String> {
                 .join(" | ")
         ));
     };
+    if provider == "cli" {
+        return Ok(models_cli(runner));
+    }
     let filter = words.next().map(str::to_lowercase);
     let list = runner.catalog.refresh(provider).await?;
     let found: Vec<_> = list
@@ -509,6 +513,82 @@ async fn models(runner: &Arc<Runner>, arg: &str) -> Result<String> {
 /model {provider}/<id> — switch"
     ));
     Ok(out)
+}
+
+fn models_cli(runner: &Arc<Runner>) -> String {
+    let Some(cli) = runner.cfg.providers.get("cli") else {
+        return "cli: there is no [providers.cli]".into();
+    };
+    if cli.presets.is_empty() {
+        return "cli: no presets in the config".into();
+    }
+    let mut out = format!("cli: {} presets", cli.presets.len());
+    for (name, preset) in &cli.presets {
+        out.push_str(&format!("\n• `cli/{name}`"));
+        match &preset.allowed_models {
+            Some(models) if !models.is_empty() => {
+                for model in models {
+                    out.push_str(&format!("\n  • `cli/{name}/{model}`"));
+                }
+            }
+            _ if preset.model_args.is_empty() => {
+                out.push_str(" — default model only");
+            }
+            _ => out.push_str(" — any model of the CLI"),
+        }
+    }
+    out.push_str("\n\n/model cli/<preset>[/<model>] — switch");
+    out
+}
+
+/// `command[0] --version` for `/status`, or "version unknown" / "updating".
+async fn cli_version_line(runner: &Arc<Runner>, preset: &crate::config::CliPreset) -> String {
+    use std::fs::OpenOptions;
+    use std::fs::TryLockError;
+    use std::time::Duration;
+
+    let Some(bin) = preset.command.first() else {
+        return "version unknown".into();
+    };
+    let lock_path = runner.cfg.agents_lock_path();
+    let lock = match OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+    {
+        Ok(f) => f,
+        Err(_) => return "version unknown".into(),
+    };
+    match lock.try_lock_shared() {
+        Ok(()) => {}
+        Err(TryLockError::WouldBlock) => return "updating".into(),
+        Err(TryLockError::Error(_)) => return "version unknown".into(),
+    }
+    let mut cmd = tokio::process::Command::new(bin);
+    cmd.arg("--version")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    let result = tokio::time::timeout(Duration::from_secs(5), cmd.output()).await;
+    drop(lock);
+    match result {
+        Ok(Ok(out)) if out.status.success() => {
+            let text = if out.stdout.is_empty() {
+                String::from_utf8_lossy(&out.stderr)
+            } else {
+                String::from_utf8_lossy(&out.stdout)
+            };
+            let line = text.lines().next().unwrap_or("").trim();
+            if line.is_empty() {
+                "version unknown".into()
+            } else {
+                line.chars().take(120).collect()
+            }
+        }
+        _ => "version unknown".into(),
+    }
 }
 
 /// The owner agrees to the fallback model after an error notice: switch to the
@@ -625,6 +705,14 @@ async fn list(runner: &Arc<Runner>, arg: &str) -> Result<String> {
 
 async fn status(runner: &Arc<Runner>) -> Result<String> {
     let mut out = format!("version {}", crate::version());
+    let model = runner.model().await;
+    out.push_str(&format!("\nmodel `{model}`"));
+    if let Some(preset) = runner.cfg.cli_preset(&model) {
+        out.push_str(&format!(
+            "\nCLI: {}",
+            cli_version_line(runner, preset).await
+        ));
+    }
     let themes = runner.cfg.themes();
     let mut any = false;
     for theme in &themes {

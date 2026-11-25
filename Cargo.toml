@@ -13,7 +13,7 @@ grammers-client  = { version = "0.10", features = ["html", "parse_invite_link"] 
 grammers-session = "0.10"
 
 # Async runtime
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "fs", "signal", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "fs", "signal", "sync", "process", "io-util"] }
 # Reading several channels at once, results in the same order (`buffered`).
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 
@@ -45,6 +45,10 @@ rpassword          = "7"
 # QR code for `login --qr`, drawn in the terminal with text blocks (no image support).
 qrcode             = { version = "0.14", default-features = false }
 rand               = "0.10"
+tempfile           = "3"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [profile.release]
 lto = true
