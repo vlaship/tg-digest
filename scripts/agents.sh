@@ -29,15 +29,6 @@ npm_pkg() {
     esac
 }
 
-npm_bin() {
-    case "$1" in
-        claude) echo "claude" ;;
-        codex) echo "codex" ;;
-        opencode) echo "opencode" ;;
-        *) return 1 ;;
-    esac
-}
-
 install_npm() {
     name="$1"
     ver="${2:-latest}"
@@ -48,7 +39,12 @@ install_npm() {
 
 install_cursor() {
     echo "installing cursor-agent into ${LOCAL_BIN} (installer; version pin not supported)"
-    curl -fsS https://cursor.com/install | bash
+    tmp="$(mktemp)"
+    # Download first: without pipefail, a failed curl would still leave bash with
+    # empty stdin and exit 0.
+    curl -fsSo "$tmp" https://cursor.com/install
+    bash "$tmp"
+    rm -f "$tmp"
 }
 
 install_agy() {

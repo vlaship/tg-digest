@@ -93,9 +93,25 @@ docker compose run --rm tg-digest agents install claude
 docker compose run --rm -it tg-digest exec claude setup-token
 ```
 
-Put the token into the preset `env` when the CLI needs it (for example
-`CLAUDE_CODE_OAUTH_TOKEN`). Other CLIs store login files under `/data`. Those
-files give access to the subscription — keep them private like `tg.session`.
+Login per CLI (field `login` in the preset; run via `exec`):
+
+- Claude Code: `exec claude setup-token` → put the token in the preset
+  `env` as `CLAUDE_CODE_OAUTH_TOKEN`.
+- Codex: `exec codex login --device-auth` → `/data/.codex/auth.json`.
+- opencode: `exec opencode auth login` (needs `-it`) → SQLite
+  `/data/.local/share/opencode/opencode.db`.
+- Cursor: `exec env NO_OPEN_BROWSER=1 cursor-agent login` (open the link on
+  the host), or set `CURSOR_API_KEY` in the preset `env`.
+- Antigravity (`agy`): login is not documented in `--help`; try
+  `exec agy` interactively and look under `/data`.
+
+After login, check once: `exec <cli> … "answer ok"` (a short prompt) before
+the first `/run`. Those login files give access to the subscription — keep
+them private like `tg.session`.
+
+`agents install cursor` uses an installer that cannot pin a version (latest
+only). `agents install agy` has no installer yet — put the `agy` binary in
+`data/.local/bin` by hand. npm CLIs accept `agents install claude@2.1.331`.
 
 Every enabled preset must turn off all tools (file read, shell, network, MCP).
 A read-only mode is not enough: a channel post can ask the agent to read
@@ -110,7 +126,9 @@ server per request; map-reduce can use more memory and grows
 
 On Windows, a local `run --dry-run` that times out or is cancelled may leave
 child CLI processes; the supported path is the Linux container (process group
-kill).
+kill). Also, `command[0]` must be a real `.exe`: Rust does not run npm
+`.cmd` / `.ps1` shims. Use the container for npm CLIs (`claude`, `opencode`,
+`codex`).
 
 Stopping (`docker stop`) is safe. Collecting posts and the model request stop at
 once. The current part of the digest is sent to the end. Anything not delivered

@@ -73,7 +73,11 @@ impl std::fmt::Display for ApiError {
             (ApiErrorKind::Auth, ProviderKind::Cli) => "is not logged in",
             (ApiErrorKind::Auth, _) => "did not accept the key",
         };
-        write!(f, "the {} API {what}: {}", self.api, self.details)
+        if self.provider == ProviderKind::Cli {
+            write!(f, "the {} {what}: {}", self.api, self.details)
+        } else {
+            write!(f, "the {} API {what}: {}", self.api, self.details)
+        }
     }
 }
 
@@ -957,7 +961,9 @@ impl Summarizer {
                         too_few = true;
                         format!("only {kept} topic(s), at least {min_topics} are expected")
                     } else {
+                        // Every topic was a stub (or there were none, see below).
                         if before == 0 {
+                            // A real empty list: quiet day, not a stub.
                             return Ok(summary);
                         }
                         if let (Some(reasoning), Some(output)) =
@@ -970,6 +976,7 @@ impl Summarizer {
                         format!("all {before} topic(s) were stubs")
                     }
                 }
+                // Not a digest at all: the same as a stub, one more try.
                 Err(e) => match e.downcast_ref::<BrokenAnswer>() {
                     Some(broken) if attempt < MAX_BROKEN_ANSWERS => broken.to_string(),
                     _ => return Err(e),
@@ -979,6 +986,8 @@ impl Summarizer {
             if attempt >= MAX_BROKEN_ANSWERS {
                 bail!("the model answer is broken again ({defect}), nothing is posted");
             }
+            // OpenRouter: keep reasoning on, at low effort. When thinking used
+            // almost all output tokens, also raise `max_tokens` for the JSON.
             if self.backend.0.kind == ProviderKind::OpenRouter && self.backend.0.can_reason {
                 self.low_reasoning.store(true, Ordering::Relaxed);
                 if let Some((reasoning, output)) = reasoning_ate {
@@ -1153,20 +1162,26 @@ impl Summarizer {
         // Drop the work dir only after the process ends (success, error, timeout, cancel).
         drop(work);
 
-        // Non-zero exit: classify from stderr/stdout before JSON parse. A login or
-        // limit failure often has empty or non-JSON stdout; BrokenAnswer would hide it.
+        // Non-zero exit: classify before treating stdout as digest text. Only the
+        // preset error fields may feed Auth/Limit words from stdout; raw event
+        // streams can contain the words `login` / `429` inside channel posts.
         if !status.success() {
-            let parsed = parse_cli_output(preset, &stdout).unwrap_or(CliParsed {
-                answer: None,
-                error_text: None,
-                input_tokens: None,
-                output_tokens: None,
-            });
-            let from_stdout = parsed.error_text.as_deref().unwrap_or(stdout.trim());
+            let parsed = parse_cli_output(preset, &stdout).ok();
+            let from_preset = parsed
+                .as_ref()
+                .and_then(|p| p.error_text.as_deref())
+                .unwrap_or("");
+            if parsed.is_none() && !stdout.trim().is_empty() {
+                tracing::warn!(
+                    preset = %call.preset,
+                    stdout_chars = stdout.chars().count(),
+                    "CLI exited with an error; stdout is not preset output (not used for Auth/Limit)"
+                );
+            }
             return Err(cli_api_error(
                 api,
                 login,
-                from_stdout,
+                from_preset,
                 &stderr,
                 status.code(),
             ));
@@ -1183,7 +1198,9 @@ impl Summarizer {
                 "CLI reported an error line but also returned an answer"
             );
         }
-        let answer = parsed.answer.context("the CLI wrote no answer on stdout")?;
+        let Some(answer) = parsed.answer else {
+            return Err(BrokenAnswer("the CLI wrote no answer on stdout".into()).into());
+        };
         let digest = digest_from_cli_value(answer)?;
         Ok(Summary {
             digest,
@@ -1708,14 +1725,26 @@ fn kill_cli(child: &mut tokio::process::Child) {
     #[cfg(unix)]
     {
         if let Some(pid) = child.id() {
-            // Safety: pid is the process-group id we set with process_group(0).
-            unsafe {
-                libc::kill(-(pid as i32), libc::SIGKILL);
-            }
+            kill_cli_group(pid);
             return;
         }
     }
     let _ = child.start_kill();
+}
+
+/// Kill the CLI process group (parent + grandchildren that kept the pipes open).
+fn kill_cli_group(pid: u32) {
+    #[cfg(unix)]
+    {
+        // Safety: pid is the process-group id we set with process_group(0).
+        unsafe {
+            libc::kill(-(pid as i32), libc::SIGKILL);
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+    }
 }
 
 async fn finish_cli(
@@ -1724,11 +1753,13 @@ async fn finish_cli(
 ) -> Result<(std::process::ExitStatus, String, String)> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    let pid = child.id();
     let mut stdin = child.stdin.take().context("CLI stdin was not piped")?;
     let mut stdout = child.stdout.take().context("CLI stdout was not piped")?;
     let mut stderr = child.stderr.take().context("CLI stderr was not piped")?;
+    let prompt = prompt.to_owned();
 
-    let write_stdin = async {
+    let write_task = tokio::spawn(async move {
         match stdin.write_all(prompt.as_bytes()).await {
             Ok(()) => {
                 drop(stdin);
@@ -1737,20 +1768,48 @@ async fn finish_cli(
             Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
             Err(e) => Err(e),
         }
-    };
-    let read_stdout = async {
+    });
+    let out_task = tokio::spawn(async move {
         let mut buf = Vec::new();
         stdout.read_to_end(&mut buf).await?;
         Ok::<_, std::io::Error>(String::from_utf8_lossy(&buf).into_owned())
-    };
-    let read_stderr = async {
+    });
+    let err_task = tokio::spawn(async move {
         let mut buf = Vec::new();
         stderr.read_to_end(&mut buf).await?;
         Ok::<_, std::io::Error>(String::from_utf8_lossy(&buf).into_owned())
-    };
+    });
 
-    let (_, stdout, stderr) = tokio::try_join!(write_stdin, read_stdout, read_stderr)?;
+    // Wait for the CLI itself first. Grandchildren (e.g. opencode --standalone
+    // server) can keep the pipes open; after exit, kill the group so EOF arrives.
     let status = child.wait().await.context("waiting for the CLI")?;
+    if let Some(pid) = pid {
+        kill_cli_group(pid);
+    }
+
+    let drain = async {
+        let stdout = out_task
+            .await
+            .context("CLI stdout reader task failed")?
+            .context("reading CLI stdout")?;
+        let stderr = err_task
+            .await
+            .context("CLI stderr reader task failed")?
+            .context("reading CLI stderr")?;
+        Ok::<_, anyhow::Error>((stdout, stderr))
+    };
+    let (stdout, stderr) = match tokio::time::timeout(Duration::from_secs(5), drain).await {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => return Err(e),
+        Err(_) => bail!("CLI pipes did not close within 5s after the process exited"),
+    };
+    match write_task.await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+        Ok(Err(e)) => return Err(e).context("writing CLI stdin"),
+        Err(e) if e.is_cancelled() => {}
+        Err(e) => return Err(e).context("CLI stdin writer task failed"),
+    }
     Ok((status, stdout, stderr))
 }
 
@@ -1825,7 +1884,8 @@ fn parse_cli_events(preset: &CliPreset, stdout: &str) -> Result<CliParsed> {
     let mut errors = Vec::new();
     let mut input_tokens = 0u64;
     let mut output_tokens = 0u64;
-    let mut saw_usage = false;
+    let mut saw_input = false;
+    let mut saw_output = false;
 
     for line in stdout.lines() {
         let line = line.trim();
@@ -1846,11 +1906,11 @@ fn parse_cli_events(preset: &CliPreset, stdout: &str) -> Result<CliParsed> {
         if preset.usage_event.as_deref() == Some(typ) {
             if let Some(n) = pointer_u64(&row, preset.input_tokens.as_deref()) {
                 input_tokens = input_tokens.saturating_add(n);
-                saw_usage = true;
+                saw_input = true;
             }
             if let Some(n) = pointer_u64(&row, preset.output_tokens.as_deref()) {
                 output_tokens = output_tokens.saturating_add(n);
-                saw_usage = true;
+                saw_output = true;
             }
         }
         if preset.error_event.as_deref() == Some(typ) {
@@ -1870,12 +1930,8 @@ fn parse_cli_events(preset: &CliPreset, stdout: &str) -> Result<CliParsed> {
     Ok(CliParsed {
         answer,
         error_text: errors.into_iter().next(),
-        input_tokens: if saw_usage && preset.input_tokens.is_some() {
-            Some(input_tokens)
-        } else {
-            None
-        },
-        output_tokens: if saw_usage && preset.output_tokens.is_some() {
+        input_tokens: if saw_input { Some(input_tokens) } else { None },
+        output_tokens: if saw_output {
             Some(output_tokens)
         } else {
             None
@@ -2037,6 +2093,14 @@ mod cli_tests {
     }
 
     #[test]
+    fn events_usage_tracks_input_and_output_separately() {
+        let stdout = r#"{"type":"step_finish","part":{"tokens":{"input":7}}}"#;
+        let parsed = parse_cli_events(&events_preset(), stdout).unwrap();
+        assert_eq!(parsed.input_tokens, Some(7));
+        assert_eq!(parsed.output_tokens, None);
+    }
+
+    #[test]
     fn events_error_line_gives_limit_text() {
         let stdout =
             r#"{"type":"error","error":{"message":"Free usage limit reached","status":429}}"#;
@@ -2069,5 +2133,189 @@ mod cli_tests {
         let api = err.downcast_ref::<ApiError>().unwrap();
         assert_eq!(api.kind, ApiErrorKind::Auth);
         assert_eq!(api.login.as_deref(), Some("claude setup-token"));
+    }
+
+    #[test]
+    fn empty_preset_error_does_not_use_news_stdout_for_auth() {
+        // News text on stdout must not become Auth when the preset has no error field.
+        let err = cli_api_error(Cow::Borrowed("CLI stub"), None, "", "", Some(1));
+        assert!(
+            err.downcast_ref::<ApiError>().is_none(),
+            "exit-only failure must stay a plain error, not Auth/Limit"
+        );
+        let text = format!("{err:#}");
+        assert!(text.contains("exit code 1"), "{text}");
+    }
+
+    #[test]
+    fn cli_display_omits_api_word() {
+        let err = ApiError {
+            api: Cow::Borrowed("CLI claude"),
+            kind: ApiErrorKind::Auth,
+            provider: ProviderKind::Cli,
+            login: None,
+            details: "not logged in".into(),
+            message: None,
+        };
+        let text = err.to_string();
+        assert!(text.contains("the CLI claude is not logged in"), "{text}");
+        assert!(!text.contains("API"), "{text}");
+    }
+
+    fn stub_spec(command: Vec<String>, timeout_secs: u64) -> ModelSpec {
+        let preset = CliPreset {
+            command,
+            model_args: Vec::new(),
+            stdin_arg: None,
+            allowed_models: None,
+            output: CliOutput::Json,
+            answer: None,
+            error: None,
+            error_text: None,
+            input_tokens: None,
+            output_tokens: None,
+            event_type: None,
+            answer_event: None,
+            usage_event: None,
+            error_event: None,
+            login: Some("stub login".into()),
+            env: Default::default(),
+            settings: crate::config::ModelSettings {
+                max_input_chars: Some(10_000),
+                request_timeout_secs: Some(timeout_secs),
+                ..Default::default()
+            },
+            models: Default::default(),
+        };
+        ModelSpec {
+            key: "cli/stub".into(),
+            kind: ProviderKind::Cli,
+            api_key: String::new(),
+            api_url: String::new(),
+            id: "stub".into(),
+            max_tokens: 32_000,
+            max_input_chars: 10_000,
+            request_timeout_secs: timeout_secs,
+            effort: "high".into(),
+            effort_set: None,
+            reasoning: false,
+            can_reason: false,
+            reasoning_mandatory: false,
+            sort: None,
+            ignore: Vec::new(),
+            quantizations: Vec::new(),
+            json_schema: true,
+            cli: Some(crate::config::CliCall {
+                preset: "stub".into(),
+                model: None,
+                config: preset,
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn wrong_cli_command_fails_to_start() {
+        let data = tempfile::tempdir().unwrap();
+        let summarizer = Summarizer::new(
+            &stub_spec(vec!["tg-digest-no-such-cli-binary-xyz".into()], 30),
+            data.path(),
+        )
+        .unwrap();
+        let err = summarizer
+            .run_cli("sys", "user", &Cancel::never())
+            .await
+            .unwrap_err();
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("could not start CLI"),
+            "expected start failure, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stub_cli_json_digest_and_secret_scan() {
+        let data = tempfile::tempdir().unwrap();
+        let stub_dir = tempfile::tempdir().unwrap();
+        let secret = "123456:ABCDEFGHIJKLMNOPQRST";
+        #[cfg(windows)]
+        let (program, script) = {
+            let script = stub_dir.path().join("stub.ps1");
+            // Write JSON with the secret in the summary (stdin is ignored).
+            std::fs::write(
+                &script,
+                format!(
+                    r#"$ErrorActionPreference='Stop'; Write-Output '{{"topics":[{{"title":"Leak","summary":"token {secret} here","sources":[]}}]}}'"#
+                ),
+            )
+            .unwrap();
+            (
+                "powershell".to_string(),
+                vec![
+                    "-NoProfile".into(),
+                    "-ExecutionPolicy".into(),
+                    "Bypass".into(),
+                    "-File".into(),
+                    script.to_string_lossy().into_owned(),
+                ],
+            )
+        };
+        #[cfg(not(windows))]
+        let (program, script) = {
+            let script = stub_dir.path().join("stub.sh");
+            std::fs::write(
+                &script,
+                format!(
+                    "#!/bin/sh\nprintf '%s\\n' '{{\"topics\":[{{\"title\":\"Leak\",\"summary\":\"token {secret} here\",\"sources\":[]}}]}}'\n"
+                ),
+            )
+            .unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+            (script.to_string_lossy().into_owned(), Vec::<String>::new())
+        };
+        let mut command = vec![program];
+        command.extend(script);
+        let summarizer = Summarizer::new(&stub_spec(command, 30), data.path()).unwrap();
+        let summary = summarizer
+            .run_cli("sys", "user", &Cancel::never())
+            .await
+            .expect("stub CLI should return a digest");
+        assert_eq!(summary.digest.topics.len(), 1);
+        let secrets = vec![secret.to_string()];
+        assert_eq!(digest::find_secret(&summary.digest, &secrets), Some(0));
+    }
+
+    #[tokio::test]
+    async fn stub_cli_timeout_is_killed() {
+        let data = tempfile::tempdir().unwrap();
+        let stub_dir = tempfile::tempdir().unwrap();
+        #[cfg(windows)]
+        let command = {
+            let script = stub_dir.path().join("sleep.ps1");
+            std::fs::write(&script, "Start-Sleep -Seconds 30").unwrap();
+            vec![
+                "powershell".into(),
+                "-NoProfile".into(),
+                "-ExecutionPolicy".into(),
+                "Bypass".into(),
+                "-File".into(),
+                script.to_string_lossy().into_owned(),
+            ]
+        };
+        #[cfg(not(windows))]
+        let command = {
+            let script = stub_dir.path().join("sleep.sh");
+            std::fs::write(&script, "#!/bin/sh\nsleep 30\n").unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+            vec![script.to_string_lossy().into_owned()]
+        };
+        let summarizer = Summarizer::new(&stub_spec(command, 1), data.path()).unwrap();
+        let err = summarizer
+            .run_cli("sys", "user", &Cancel::never())
+            .await
+            .unwrap_err();
+        let text = format!("{err:#}");
+        assert!(text.contains("timed out"), "expected timeout, got: {text}");
     }
 }

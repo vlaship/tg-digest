@@ -44,7 +44,7 @@ Enforce strict Controlled Technical Language across all responses:
 ## Commands
 
 - `cargo build --release` — build the release binary. On Windows you need the MSVC build tools.
-- `cargo fmt`, `cargo clippy --all-targets` — format, lint.
+- `cargo fmt`, `cargo clippy --all-targets`, `cargo test` — format, lint, unit tests.
 - `Copy-Item config.example.toml config.toml` — create a local config in PowerShell.
 - `cargo run -- --config config.toml login` — log in to the Telegram account.
 - `cargo run -- --config config.toml preview` — see the collected posts, no Anthropic call.
@@ -60,7 +60,7 @@ locally, pass `--config` and set `data_dir` (for example `"data"`). The database
 and both sessions are file names inside it (`db_file`, `session_file`); without
 them the names are `digest.db`, `tg.session` and `bot.session`.
 
-**Check before every commit:** `cargo fmt && cargo clippy --all-targets`. The project has no tests.
+**Check before every commit:** `cargo fmt && cargo clippy --all-targets && cargo test`.
 
 ## Language
 

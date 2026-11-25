@@ -531,6 +531,9 @@ fn models_cli(runner: &Arc<Runner>) -> String {
                     out.push_str(&format!("\n  • `cli/{name}/{model}`"));
                 }
             }
+            _ if preset.model_args.is_empty() => {
+                out.push_str(" — default model only");
+            }
             _ => out.push_str(" — any model of the CLI"),
         }
     }
@@ -571,7 +574,7 @@ async fn cli_version_line(runner: &Arc<Runner>, preset: &crate::config::CliPrese
     let result = tokio::time::timeout(Duration::from_secs(5), cmd.output()).await;
     drop(lock);
     match result {
-        Ok(Ok(out)) => {
+        Ok(Ok(out)) if out.status.success() => {
             let text = if out.stdout.is_empty() {
                 String::from_utf8_lossy(&out.stderr)
             } else {

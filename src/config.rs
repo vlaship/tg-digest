@@ -171,7 +171,9 @@ const DANGEROUS_CLI_FLAGS: &[&str] = &[
     "--auto",
     "--yolo",
     "--force",
+    "--full-auto",
     "--dangerously-skip-permissions",
+    "--allow-dangerously-skip-permissions",
     "--dangerously-bypass-approvals-and-sandbox",
 ];
 
@@ -549,6 +551,9 @@ impl Config {
                 .get(preset)
                 .with_context(|| format!("there is no [providers.cli.presets.{preset}]"))?;
             if let Some(model) = model {
+                if model.is_empty() {
+                    bail!("{key:?}: model after the preset must not be empty");
+                }
                 if preset_cfg.model_args.is_empty() {
                     bail!(
                         "{key:?}: preset {preset:?} has empty model_args, so it cannot take a model"
@@ -1021,14 +1026,24 @@ fn validate_cli_presets(cli: &Provider) -> Result<()> {
         if preset.error_event.is_some() && preset.error_text.is_none() {
             bail!("{path}: error_event needs error_text");
         }
-        for arg in preset
+        let argv: Vec<&str> = preset
             .command
             .iter()
             .chain(preset.model_args.iter())
             .chain(preset.stdin_arg.iter())
-        {
-            if DANGEROUS_CLI_FLAGS.iter().any(|f| arg == f) {
+            .map(String::as_str)
+            .collect();
+        for (i, arg) in argv.iter().enumerate() {
+            if is_dangerous_cli_arg(arg) {
                 bail!("{path}: flag {arg:?} auto-approves tools and is not allowed");
+            }
+            if *arg == "--permission-mode"
+                && argv.get(i + 1).is_some_and(|v| *v == "bypassPermissions")
+            {
+                bail!(
+                    "{path}: --permission-mode bypassPermissions auto-approves tools \
+                     and is not allowed"
+                );
             }
         }
         if preset.model_args.is_empty() {
@@ -1043,6 +1058,21 @@ fn validate_cli_presets(cli: &Provider) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// True for a denylisted auto-approve flag, including `--flag=value` forms.
+fn is_dangerous_cli_arg(arg: &str) -> bool {
+    let base = arg.split_once('=').map(|(f, _)| f).unwrap_or(arg);
+    if DANGEROUS_CLI_FLAGS.contains(&base) {
+        return true;
+    }
+    // `--permission-mode=bypassPermissions` as one token.
+    if base == "--permission-mode" {
+        if let Some((_, value)) = arg.split_once('=') {
+            return value == "bypassPermissions";
+        }
+    }
+    false
 }
 
 /// RFC 6901: empty, or starts with `/`, and `~` only as `~0` / `~1`.
@@ -1178,6 +1208,36 @@ request_timeout_secs = 60
     }
 
     #[test]
+    fn cli_refuses_flag_equals_form() {
+        let err = parse_cli(
+            r#"
+[providers.cli.presets.safe]
+command = ["echo", "--yolo=true"]
+max_input_chars = 1000
+request_timeout_secs = 60
+"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("--yolo=true"), "{err}");
+    }
+
+    #[test]
+    fn cli_refuses_permission_mode_bypass() {
+        let err = parse_cli(
+            r#"
+[providers.cli.presets.safe]
+command = ["echo", "--permission-mode", "bypassPermissions"]
+max_input_chars = 1000
+request_timeout_secs = 60
+"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("bypassPermissions"), "{err}");
+    }
+
+    #[test]
     fn cli_requires_max_input_chars_on_preset() {
         let err = parse_cli(
             r#"
@@ -1245,6 +1305,13 @@ request_timeout_secs = 60
         let cfg = parse_cli(safe_preset()).unwrap();
         let err = cfg.model_id("cli/safe/haiku").unwrap_err().to_string();
         assert!(err.contains("allowed_models"), "{err}");
+    }
+
+    #[test]
+    fn cli_rejects_empty_model_after_slash() {
+        let cfg = parse_cli(safe_preset()).unwrap();
+        let err = cfg.model_id("cli/safe/").unwrap_err().to_string();
+        assert!(err.contains("must not be empty"), "{err}");
     }
 
     #[test]
