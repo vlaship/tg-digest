@@ -1118,6 +1118,7 @@ impl Summarizer {
         std::fs::write(&schema_path, &schema_json)
             .context("could not write the schema file for the CLI")?;
         let prompt = format!("{system}\n\n{user}\n\n{}", digest::schema_in_prompt());
+        let stdin_payload = format_cli_stdin(preset, &prompt)?;
         let mut argv = expand_cli_args(
             &preset.command,
             &schema_json,
@@ -1156,7 +1157,7 @@ impl Summarizer {
                     self.backend.0.request_timeout_secs
                 );
             }
-            result = finish_cli(&mut child, &prompt) => result,
+            result = finish_cli(&mut child, &stdin_payload) => result,
         };
 
         let (status, stdout, stderr) = outcome?;
@@ -1697,6 +1698,15 @@ fn expand_cli_args(
         .collect()
 }
 
+fn format_cli_stdin(preset: &CliPreset, prompt: &str) -> Result<String> {
+    let Some(template) = &preset.stdin_json else {
+        return Ok(prompt.to_owned());
+    };
+    let encoded =
+        serde_json::to_string(prompt).context("could not encode the CLI prompt as JSON")?;
+    Ok(format!("{}\n", template.replace("{prompt}", &encoded)))
+}
+
 fn start_cli(
     program: &str,
     args: &[String],
@@ -1882,6 +1892,7 @@ fn parse_cli_events(preset: &CliPreset, stdout: &str) -> Result<CliParsed> {
         .context("events output needs answer")?;
 
     let mut pieces = String::new();
+    let mut structured: Option<Value> = None;
     let mut errors = Vec::new();
     let mut input_tokens = 0u64;
     let mut output_tokens = 0u64;
@@ -1900,8 +1911,12 @@ fn parse_cli_events(preset: &CliPreset, stdout: &str) -> Result<CliParsed> {
             continue;
         };
         if typ == answer_event {
-            if let Some(part) = row.pointer(answer_ptr).and_then(Value::as_str) {
-                pieces.push_str(part);
+            match row.pointer(answer_ptr) {
+                Some(Value::String(part)) => pieces.push_str(part),
+                Some(val @ (Value::Object(_) | Value::Array(_))) => {
+                    structured = Some(val.clone());
+                }
+                _ => {}
             }
         }
         if preset.usage_event.as_deref() == Some(typ) {
@@ -1916,17 +1931,23 @@ fn parse_cli_events(preset: &CliPreset, stdout: &str) -> Result<CliParsed> {
         }
         if preset.error_event.as_deref() == Some(typ) {
             if let Some(ptr) = &preset.error_text {
-                if let Some(msg) = row.pointer(ptr).and_then(Value::as_str) {
+                if let Some(msg) = row
+                    .pointer(ptr)
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                {
                     errors.push(msg.to_string());
                 }
             }
         }
     }
 
-    let answer = if pieces.is_empty() {
-        None
-    } else {
+    let answer = if let Some(val) = structured {
+        Some(val)
+    } else if !pieces.is_empty() {
         Some(Value::String(pieces))
+    } else {
+        None
     };
     Ok(CliParsed {
         answer,
@@ -1991,9 +2012,16 @@ fn cli_api_error(
     .any(|s| lower.contains(s))
     {
         ApiErrorKind::Limit
-    } else if ["not logged in", "login", "unauthorized", "401", "expired"]
-        .iter()
-        .any(|s| lower.contains(s))
+    } else if [
+        "not logged in",
+        "login",
+        "unauthorized",
+        "401",
+        "expired",
+        "authentication required",
+    ]
+    .iter()
+    .any(|s| lower.contains(s))
     {
         ApiErrorKind::Auth
     } else {
@@ -2058,6 +2086,7 @@ mod cli_tests {
             command: vec!["opencode".into()],
             model_args: vec!["--model".into(), "{model}".into()],
             stdin_arg: None,
+            stdin_json: None,
             allowed_models: None,
             output: CliOutput::Events,
             answer: Some("/part/text".into()),
@@ -2168,6 +2197,7 @@ mod cli_tests {
             command,
             model_args: Vec::new(),
             stdin_arg: None,
+            stdin_json: None,
             allowed_models: None,
             output: CliOutput::Json,
             answer: None,
@@ -2318,5 +2348,80 @@ mod cli_tests {
             .unwrap_err();
         let text = format!("{err:#}");
         assert!(text.contains("timed out"), "expected timeout, got: {text}");
+    }
+
+    fn agy_preset() -> CliPreset {
+        CliPreset {
+            command: vec!["agy".into()],
+            model_args: vec!["--model".into(), "{model}".into()],
+            stdin_arg: None,
+            stdin_json: Some(r#"{"event":"user","message":{"content":{prompt}}}"#.into()),
+            allowed_models: None,
+            output: CliOutput::Events,
+            answer: Some("/result/structured_output".into()),
+            error: None,
+            error_text: Some("/result/error".into()),
+            input_tokens: Some("/result/usage/input_tokens".into()),
+            output_tokens: Some("/result/usage/output_tokens".into()),
+            event_type: Some("/event".into()),
+            answer_event: Some("result".into()),
+            usage_event: Some("result".into()),
+            error_event: Some("result".into()),
+            login: None,
+            env: Default::default(),
+            settings: Default::default(),
+            models: Default::default(),
+        }
+    }
+
+    #[test]
+    fn format_cli_stdin_encodes_json_line() {
+        let raw = format_cli_stdin(&events_preset(), "hello\nworld").unwrap();
+        assert_eq!(raw, "hello\nworld");
+
+        let prompt = "line1\n\"quoted\" \\ slash {prompt} Привет";
+        let formatted = format_cli_stdin(&agy_preset(), prompt).unwrap();
+        assert!(formatted.ends_with('\n'));
+        let line = formatted.trim_end_matches('\n');
+        assert!(!line.contains('\n'), "must be one NDJSON line: {line}");
+        let parsed: Value = serde_json::from_str(line).unwrap();
+        assert_eq!(parsed["event"], "user");
+        assert_eq!(parsed["message"]["content"], prompt);
+    }
+
+    #[test]
+    fn events_reads_agy_structured_output_and_usage() {
+        let stdout = r#"
+{"event":"init","conversation_id":"c1","init":{"cwd":"/tmp"}}
+{"event":"step_update","step_update":{"step_index":0,"state":"DONE","step_type":"user_input"}}
+{"event":"result","result":{"conversation_id":"c1","status":"SUCCESS","response":"{}","error":"","structured_output":{"topics":[{"title":"Story","summary":"Facts.","sources":[{"channel":"ch","url":"https://t.me/ch/1"}]}]},"usage":{"input_tokens":120,"output_tokens":45}}}
+"#;
+        let parsed = parse_cli_events(&agy_preset(), stdout).unwrap();
+        assert!(parsed.error_text.is_none());
+        assert_eq!(parsed.input_tokens, Some(120));
+        assert_eq!(parsed.output_tokens, Some(45));
+        let digest = digest_from_cli_value(parsed.answer.unwrap()).unwrap();
+        assert_eq!(digest.topics.len(), 1);
+        assert_eq!(digest.topics[0].title, "Story");
+    }
+
+    #[test]
+    fn events_reads_agy_error_result() {
+        let stdout = r#"{"event":"result","result":{"conversation_id":"","status":"ERROR","response":"","error":"authentication required","usage":{"input_tokens":0,"output_tokens":0}}}"#;
+        let parsed = parse_cli_events(&agy_preset(), stdout).unwrap();
+        assert!(parsed.answer.is_none());
+        assert_eq!(
+            parsed.error_text.as_deref(),
+            Some("authentication required")
+        );
+        let err = cli_api_error(
+            Cow::Borrowed("CLI agy"),
+            None,
+            parsed.error_text.as_deref().unwrap(),
+            "",
+            Some(1),
+        );
+        let api = err.downcast_ref::<ApiError>().unwrap();
+        assert_eq!(api.kind, ApiErrorKind::Auth);
     }
 }

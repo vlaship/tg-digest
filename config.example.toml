@@ -258,13 +258,20 @@ request_timeout_secs = 1200
 # # channel can make it read /data/tg.session. Keep this preset off until agy
 # # has such a mode (check --sandbox and --settings first).
 # # [providers.cli.presets.agy]
-# # command = ["agy", "--print", "--input-format", "text", "--disable-slash-commands",
-# #            "--output-format", "json", "--json-schema", "{schema}",
+# # command = ["agy", "--input-format", "stream-json", "--output-format", "stream-json",
+# #            "--disable-slash-commands", "--json-schema", "{schema}",
 # #            "--print-timeout", "1800s"]
 # # model_args = ["--model", "{model}"]
-# # answer = "/structured_output"
-# # input_tokens = "/usage/input_tokens"
-# # output_tokens = "/usage/output_tokens"
+# # stdin_json = '{"event":"user","message":{"content":{prompt}}}'
+# # output = "events"
+# # event_type = "/event"
+# # answer_event = "result"
+# # answer = "/result/structured_output"
+# # usage_event = "result"
+# # input_tokens = "/result/usage/input_tokens"
+# # output_tokens = "/result/usage/output_tokens"
+# # error_event = "result"
+# # error_text = "/result/error"
 # # max_input_chars = 600000
 # # request_timeout_secs = 1860
 
