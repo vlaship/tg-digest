@@ -267,6 +267,10 @@ pub struct CliPreset {
     /// Extra argv after `model_args` when the CLI wants a stdin marker (often `"-"`).
     #[serde(default)]
     pub stdin_arg: Option<String>,
+    /// Optional single-line JSON template written to stdin instead of raw text.
+    /// `{prompt}` is replaced with the prompt encoded as a JSON string, then `\n`.
+    #[serde(default)]
+    pub stdin_json: Option<String>,
     /// When set, `/model` and config checks refuse any other CLI model.
     #[serde(default)]
     pub allowed_models: Option<Vec<String>>,
@@ -1026,6 +1030,18 @@ fn validate_cli_presets(cli: &Provider) -> Result<()> {
         if preset.error_event.is_some() && preset.error_text.is_none() {
             bail!("{path}: error_event needs error_text");
         }
+        if let Some(template) = &preset.stdin_json {
+            if !template.contains("{prompt}") {
+                bail!("{path}: stdin_json must contain {{prompt}}");
+            }
+            if template.contains(['\n', '\r']) {
+                bail!("{path}: stdin_json must be a single line");
+            }
+            let sample = template.replace("{prompt}", "\"test\"");
+            if let Err(e) = serde_json::from_str::<serde_json::Value>(&sample) {
+                bail!("{path}: stdin_json is not valid JSON when {{prompt}} is a string: {e}");
+            }
+        }
         let argv: Vec<&str> = preset
             .command
             .iter()
@@ -1353,5 +1369,87 @@ env = { SHORT = "tiny", LONG = "sixteen-chars-ok" }
         cfg.validate().unwrap();
         assert!(cfg.theme("world").is_some());
         assert!(cfg.theme("dev").is_some());
+    }
+
+    #[test]
+    fn cli_stdin_json_validates_agy_preset() {
+        let cfg = parse_cli(
+            r#"
+[providers.cli.presets.safe]
+command = ["agy", "--input-format", "stream-json", "--output-format", "stream-json",
+           "--disable-slash-commands", "--json-schema", "{schema}",
+           "--print-timeout", "1800s"]
+model_args = ["--model", "{model}"]
+stdin_json = '{"event":"user","message":{"content":{prompt}}}'
+output = "events"
+event_type = "/event"
+answer_event = "result"
+answer = "/result/structured_output"
+usage_event = "result"
+input_tokens = "/result/usage/input_tokens"
+output_tokens = "/result/usage/output_tokens"
+error_event = "result"
+error_text = "/result/error"
+max_input_chars = 600000
+request_timeout_secs = 1860
+"#,
+        )
+        .unwrap();
+        let spec = cfg.model("cli/safe", None).unwrap();
+        assert_eq!(
+            spec.cli.unwrap().config.stdin_json.as_deref(),
+            Some(r#"{"event":"user","message":{"content":{prompt}}}"#)
+        );
+    }
+
+    #[test]
+    fn cli_stdin_json_requires_placeholder() {
+        let err = parse_cli(
+            r#"
+[providers.cli.presets.safe]
+command = ["echo"]
+stdin_json = '{"event":"user"}'
+max_input_chars = 1000
+request_timeout_secs = 60
+"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("stdin_json") && err.contains("{prompt}"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn cli_stdin_json_rejects_multiline() {
+        let err = parse_cli(
+            r#"
+[providers.cli.presets.safe]
+command = ["echo"]
+stdin_json = "{\"content\":{prompt}}\n"
+max_input_chars = 1000
+request_timeout_secs = 60
+"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("single line"), "{err}");
+    }
+
+    #[test]
+    fn cli_stdin_json_rejects_invalid_json() {
+        let err = parse_cli(
+            r#"
+[providers.cli.presets.safe]
+command = ["echo"]
+stdin_json = '{"event":"user","message":{"content":"{prompt}"}}'
+max_input_chars = 1000
+request_timeout_secs = 60
+"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("not valid JSON"), "{err}");
     }
 }
