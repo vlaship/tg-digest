@@ -127,7 +127,7 @@ pub fn response_schema() -> Value {
         "properties": {
             "topics": {
                 "type": "array",
-                "description": "One item per event or story, the most important first.",
+                "description": "One item per event or story (or a grouped list when the system prompt asks for one), in the order from the system prompt.",
                 "items": {
                     "type": "object",
                     "additionalProperties": false,
@@ -135,7 +135,7 @@ pub fn response_schema() -> Value {
                     "properties": {
                         "title": {
                             "type": "string",
-                            "description": "A short headline that names the event, not a category. Must not be empty."
+                            "description": "A short headline that names the event (or the group title from the system prompt), not a broad category. Must not be empty."
                         },
                         "summary": {
                             "type": "string",

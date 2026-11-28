@@ -1343,4 +1343,15 @@ env = { SHORT = "tiny", LONG = "sixteen-chars-ok" }
         assert!(!secrets.iter().any(|s| s == "tiny"));
         assert!(secrets.iter().any(|s| s == "123456:ABCDEFGHIJKLMNOPQRST"));
     }
+
+    #[test]
+    fn example_config_validates_with_dummy_credentials() {
+        let mut cfg: Config = toml::from_str(include_str!("../config.example.toml")).unwrap();
+        cfg.telegram.app.api_id = 1;
+        cfg.telegram.app.api_hash = "0123456789abcdef".into();
+        cfg.telegram.app.phone = normalize_phone("+10000000000");
+        cfg.validate().unwrap();
+        assert!(cfg.theme("world").is_some());
+        assert!(cfg.theme("dev").is_some());
+    }
 }
