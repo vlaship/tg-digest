@@ -501,30 +501,57 @@ How to work, step by step:
 5. Put posts about the same thing together. ONE NEWS ITEM = ONE TOPIC, also when
    several channels write about it. A post marked "repost from: …" and the
    original post are the same item.
-6. Write one topic for every useful item:
-   - title: names the thing. Good: "PostgreSQL 19 is released". Bad: "Database
-     news".
+6. Write one topic for every useful item that has details (except the two
+   grouped lists in steps 7 and 8):
+   - title: names the thing. Good: "PostgreSQL 19: faster vacuum and new JSON
+     functions". Bad: "Database news".
    - summary: 1–3 sentences: what is new, for whom it matters, versions and
      numbers. For an article or a tool: what it is about and what you learn.
    - sources: every post about this item.
-7. Put all CVE and vulnerability news into ONE topic (this is an exception to
-   the one-item rule). The title is "Уязвимости (CVE)" (or names the software
-   if there is only one CVE). The summary lists each CVE ID, the affected
-   software and versions, and the fix if known. Put all CVE posts in sources.
-8. A coding task (LeetCode and the like) is its own topic. The title starts with
+7. Put all bare version releases into ONE topic (this is an exception to the
+   one-item rule). A release is bare when the post — or a line in a release
+   roundup — only says that a new version, beta or RC came out, with NO details
+   about what changed or what is new in this version. Saying what kind of
+   program it is ("DNS server", "load balancer", "browser", "3D map package")
+   is NOT details of changes. Do not add details from outside the post.
+   - If a post explains what changed or what is new in this version, give it
+     its own topic as in step 6.
+   - Put all bare releases into ONE topic. The title is "Новые версии" (or
+     names the software and version if there is only one bare release).
+   - The summary lists the programs and versions in short form (for example:
+     "Вышли новые версии: Rayshader 1.0, HAProxy 3.4.9, Valkey 9.2.1.").
+   - Put all posts with these bare releases in sources.
+8. Put all short CVE and vulnerability notices into ONE separate topic (this is
+   also an exception to the one-item rule). A notice is short when the post —
+   or a line in a roundup — only says that a CVE or vulnerability was found or
+   fixed (CVE ID, affected software and versions, severity, fixed version),
+   with NO detailed technical story or breakdown.
+   - If a post explains a vulnerability in detail (how the bug works, what
+     happened in an incident, or how to defend against it — not an attack
+     walkthrough from step 4), give it its own topic as in step 6.
+   - Put all short CVE notices into ONE topic, separate from "Новые версии".
+     The title is "Уязвимости (CVE)" (or names the software if there is only
+     one CVE).
+   - The summary lists each CVE ID (if given), the affected software and
+     versions, and the fix if known.
+   - Put all posts with these short CVE notices in sources.
+9. A coding task (LeetCode and the like) is its own topic. The title starts with
    "Задача:" and has the name of the task. The summary gives the task in 1–2
    sentences, and the idea of the solution if the post has it.
-9. Order the topics: releases and important news first, then articles and tools,
-   then tasks.
+10. Order the topics: releases with details and important news first, then
+    articles and tools, then "Новые версии" and "Уязвимости (CVE)", then tasks.
 
 Rules:
-- A topic is one item, not a category. A Go release and a Rust release are two
-  topics, not one topic "Releases". Exception: all CVE and vulnerability news
-  go into one topic.
+- A topic is one item, not a category. A Go release with details of changes and
+  a Rust release with details of changes are two topics, not one topic
+  "Releases". Exceptions: bare version releases without details go into one
+  topic "Новые версии", and short CVE notices without details go into one
+  separate topic "Уязвимости (CVE)".
 - Never write an overview topic: "Main news of the day", "News in brief",
   "Summary of all posts" and the like. Such a topic has no real item, it only
-  collects the sources of other topics. Every topic is one item, and its
-  sources are only the posts about this item.
+  collects the sources of other topics. Every topic covers only its own item
+  (or one of the two grouped lists above), and its sources are only the posts
+  for it.
 - A channel with only thrown-away posts gets NO topic. Do not make an overview
   topic to cover such channels.
 - Do not cut the digest short: every useful item gets its topic.
